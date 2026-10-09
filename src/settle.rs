@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::error::Error;
+use std::fmt;
 
 use mint_core::MintLogic;
 use mint_types::{Amount, MintOutput, MintOutputError, MintOutputOutcome};
@@ -15,8 +17,32 @@ pub enum Rejection {
     BadPayload(DecodeError),
     UnknownDenomination(Amount),
     DuplicateBlindNonce,
+    BlindNonceAlreadyUsed,
     Overflow,
     OverRequest { requested: u64, allowed: u64 },
+}
+
+#[derive(Debug)]
+pub enum SettleError {
+    Processed(ProcessedError),
+    Mint(String),
+}
+
+impl fmt::Display for SettleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SettleError::Processed(e) => write!(f, "{e}"),
+            SettleError::Mint(e) => write!(f, "mint store: {e}"),
+        }
+    }
+}
+
+impl Error for SettleError {}
+
+impl From<ProcessedError> for SettleError {
+    fn from(e: ProcessedError) -> Self {
+        SettleError::Processed(e)
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -58,7 +84,7 @@ pub fn settle(
     logic: &MintLogic,
     processed: &mut Processed,
     received: &Received,
-) -> Result<Settlement, ProcessedError> {
+) -> Result<Settlement, SettleError> {
     if processed.contains(&received.txid) {
         return Ok(Settlement::AlreadyProcessed);
     }
@@ -81,6 +107,14 @@ pub fn settle(
         &payload.outputs,
     ) {
         return Ok(Settlement::Rejected(why));
+    }
+    for output in &payload.outputs {
+        let used = logic
+            .is_blind_nonce_used(&output.blind_nonce)
+            .map_err(|e| SettleError::Mint(e.to_string()))?;
+        if used {
+            return Ok(Settlement::Rejected(Rejection::BlindNonceAlreadyUsed));
+        }
     }
     processed.insert(&received.txid)?;
     let results = payload
@@ -254,16 +288,31 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn payload_bytes(outputs: &[(u64, u8)]) -> String {
+        let mut bytes = vec![0u8, outputs.len() as u8];
+        for &(units, i) in outputs {
+            bytes.extend_from_slice(&units.to_be_bytes());
+            bytes.extend_from_slice(&point(i).0.serialize());
+        }
+        hex::encode(bytes)
+    }
+
     #[test]
-    fn a_reused_blind_nonce_is_only_caught_at_issue_time() {
+    fn a_reused_blind_nonce_rejects_the_whole_payment_before_anything_is_issued() {
         let (logic, mut processed, dir) = fixture("reuse");
-        settle(&logic, &mut processed, &received("aa", 6, 1, Some(PAYLOAD_HEX))).unwrap();
-        let again = received("bb", 6, 1, Some(PAYLOAD_HEX));
+        let first = received("aa", 6, 1, Some(&payload_bytes(&[(4, 1), (1, 2)])));
+        assert!(matches!(
+            settle(&logic, &mut processed, &first).unwrap(),
+            Settlement::Issued(_)
+        ));
+        let second = received("bb", 6, 1, Some(&payload_bytes(&[(2, 3), (1, 2)])));
         assert_eq!(
-            settle(&logic, &mut processed, &again).unwrap(),
-            Settlement::Issued(vec![Err(MintOutputError::BlindNonceAlreadyUsed); 2])
+            settle(&logic, &mut processed, &second).unwrap(),
+            Settlement::Rejected(Rejection::BlindNonceAlreadyUsed)
         );
-        assert!(processed.contains("bb"));
+        assert!(!processed.contains("bb"));
+        assert!(!logic.is_blind_nonce_used(&point(3)).unwrap());
+        assert_eq!(logic.audit_totals().unwrap().0, Amount::from_units(5));
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }

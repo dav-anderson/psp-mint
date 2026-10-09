@@ -137,10 +137,10 @@ A payer buys PSP by sending a Bitcoin payment that carries a request in a data o
 - **Rate** is 100 PSP units per sat, a placeholder until the real rate is decided.
 - **Allowed amount** is the payment value in sats times the rate.
 - The sum of the requested output amounts must be less than or equal to the allowed amount, or nothing is issued.
-- Every output is validated before any is issued: the denomination exists and there are no duplicate blind nonces within the request. Whether a blind nonce was used by an earlier payment is not checked up front yet (see Left to do).
+- Every output is validated before any is issued: the denomination exists, there are no duplicate blind nonces within the request, and no blind nonce was used by an earlier payment.
 - Each transaction is processed once, keyed by txid. The processed txids are kept in a single JSON file, a sorted array of txid strings, rewritten in full after each addition (written to a temporary file, then renamed). A missing file means none processed yet, and an unreadable file is an error, never an empty set. This is a placeholder, and the state probably needs to eventually "live on the air".
 - The txid is recorded before anything is issued, so a payment is issued at most once. If the process dies after that and before the signatures are delivered, they are lost.
-- A payment that is rejected (bad payload, unknown denomination, duplicate blind nonce, or a request above the allowed amount) is not recorded and nothing is issued. It is reported again on every run.
+- A payment that is rejected (bad payload, unknown denomination, duplicate or already used blind nonce, or a request above the allowed amount) is not recorded and nothing is issued. It is reported again on every run.
 - Overpayment is kept by the PSP, so request outputs that use the whole payment.
 - Once payloads are encrypted (not yet implemented), a payload copied into someone else's transaction is harmless. The signatures go to the reply field inside the payload, which the copier cannot change, and only the payer holds the blinding factors that turn them into notes. The copier ends up paying for the payer's notes.
 
@@ -165,7 +165,6 @@ The payload is currently cleartext. It must be encrypted by the payer and decryp
 
 - **Payload encryption.** The payer must encrypt the payload and the PSP must decrypt it. This is not written into the PSP spec yet, and the payload is currently cleartext.
 - **Processed txids.** They are kept in a single JSON file as a placeholder. Replace it with a proper store. This state probably needs to eventually "live on the air".
-- **Blind nonce pre-check.** `MintLogic` has no read-only way to ask whether a blind nonce is already used. A payment that reuses one is recorded and then fails at issue time, for those outputs, with `BlindNonceAlreadyUsed`. Fixing this needs a small additive method in mint-core.
 - **Signature delivery.** The signatures are printed to the terminal. How they reach the payer is not designed.
 - **Mint key storage.** The keyfile is plain JSON with `0600` permissions in the data directory. How the real keys are protected is not decided.
 - **Exchange rate.** The rate needs to be finalized. It is currently a placeholder of 100 PSP units per sat.

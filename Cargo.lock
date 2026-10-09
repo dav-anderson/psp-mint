@@ -95,8 +95,8 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bdhke"
-version = "0.1.0"
-source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.0#1811e888f43ec85ea02fd7668f05d2e9fc6d9f8e"
+version = "0.1.1"
+source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.1#dbe99ee972669e9ee1eed5f8f0f36691a7750946"
 dependencies = [
  "rand",
  "secp256k1",
@@ -681,8 +681,8 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mint-core"
-version = "0.1.0"
-source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.0#1811e888f43ec85ea02fd7668f05d2e9fc6d9f8e"
+version = "0.1.1"
+source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.1#dbe99ee972669e9ee1eed5f8f0f36691a7750946"
 dependencies = [
  "anyhow",
  "bdhke",
@@ -695,8 +695,8 @@ dependencies = [
 
 [[package]]
 name = "mint-server"
-version = "0.1.0"
-source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.0#1811e888f43ec85ea02fd7668f05d2e9fc6d9f8e"
+version = "0.1.1"
+source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.1#dbe99ee972669e9ee1eed5f8f0f36691a7750946"
 dependencies = [
  "anyhow",
  "axum",
@@ -713,8 +713,8 @@ dependencies = [
 
 [[package]]
 name = "mint-types"
-version = "0.1.0"
-source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.0#1811e888f43ec85ea02fd7668f05d2e9fc6d9f8e"
+version = "0.1.1"
+source = "git+https://github.com/dav-anderson/mint-core?tag=v0.1.1#dbe99ee972669e9ee1eed5f8f0f36691a7750946"
 dependencies = [
  "hex",
  "secp256k1",
