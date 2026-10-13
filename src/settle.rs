@@ -117,6 +117,11 @@ pub fn settle(
         }
     }
     processed.insert(&received.txid)?;
+    // PSP uses MintLogic::issue, not issue_with_key. Every PSP note of a given
+    // amount is signed by the same key from the mint's fixed key table, and
+    // issue looks that key up by amount. issue_with_key is for mints whose key
+    // depends on more than the amount, such as the ESP, where it also depends
+    // on the note's terms. See the docs on MintLogic::issue in mint-core.
     let results = payload
         .outputs
         .iter()

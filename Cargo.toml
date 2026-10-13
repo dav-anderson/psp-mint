@@ -6,10 +6,10 @@ rust-version = "1.85"
 license = "MIT"
 
 [dependencies]
-mint-core = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.1" }
-mint-types = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.1" }
-bdhke = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.1" }
-mint-server = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.1" }
+mint-core = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+mint-types = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+bdhke = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
+mint-server = { git = "https://github.com/dav-anderson/mint-core", tag = "v0.1.2" }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand"] }
 hex = "0.4.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
