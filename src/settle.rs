@@ -9,7 +9,9 @@ use crate::payload::{self, DecodeError};
 use crate::processed::{Processed, ProcessedError};
 use crate::scan::Received;
 
-pub const UNITS_PER_SAT: u64 = 100;
+/// PSP units are US dollars: 1 PSP = 1 USD, paid in BTC.
+const SATS_PER_BTC: u128 = 100_000_000;
+const CENTS_PER_USD: u128 = 100;
 pub const MIN_CONFIRMATIONS: u32 = 6;
 
 #[derive(Debug, PartialEq)]
@@ -51,39 +53,46 @@ pub enum Settlement {
     AlreadyProcessed,
     NoPayload,
     Rejected(Rejection),
+    /// No usable BTC/USD price this run. The payment is left unprocessed and
+    /// is tried again on the next run.
+    PriceUnavailable(String),
     Issued(Vec<Result<MintOutputOutcome, MintOutputError>>),
 }
 
+/// Whole PSP units a payment buys: floor(sats * usd_cents_per_btc / 10^10).
+pub fn allowed_units(value_sats: u64, usd_cents_per_btc: u64) -> u64 {
+    let units = u128::from(value_sats) * u128::from(usd_cents_per_btc)
+        / (SATS_PER_BTC * CENTS_PER_USD);
+    u64::try_from(units).unwrap_or(u64::MAX)
+}
+
+/// Checks the requested outputs on their own (denominations, duplicate blind
+/// nonces, total overflow) and returns the total requested.
 pub fn check(
     is_denomination: impl Fn(Amount) -> bool,
-    value_sats: u64,
     outputs: &[MintOutput],
-) -> Option<Rejection> {
+) -> Result<u64, Rejection> {
     let mut seen = HashSet::new();
     let mut requested: u64 = 0;
     for output in outputs {
         if !is_denomination(output.amount) {
-            return Some(Rejection::UnknownDenomination(output.amount));
+            return Err(Rejection::UnknownDenomination(output.amount));
         }
         if !seen.insert(&output.blind_nonce) {
-            return Some(Rejection::DuplicateBlindNonce);
+            return Err(Rejection::DuplicateBlindNonce);
         }
-        requested = match requested.checked_add(output.amount.units) {
-            Some(total) => total,
-            None => return Some(Rejection::Overflow),
-        };
+        requested = requested
+            .checked_add(output.amount.units)
+            .ok_or(Rejection::Overflow)?;
     }
-    let allowed = value_sats.saturating_mul(UNITS_PER_SAT);
-    if requested > allowed {
-        return Some(Rejection::OverRequest { requested, allowed });
-    }
-    None
+    Ok(requested)
 }
 
 pub fn settle(
     logic: &MintLogic,
     processed: &mut Processed,
     received: &Received,
+    price: &mut dyn FnMut() -> Result<u64, String>,
 ) -> Result<Settlement, SettleError> {
     if processed.contains(&received.txid) {
         return Ok(Settlement::AlreadyProcessed);
@@ -101,13 +110,10 @@ pub fn settle(
         Err(e) => return Ok(Settlement::Rejected(Rejection::BadPayload(e))),
     };
     let keys = logic.public_keys();
-    if let Some(why) = check(
-        |amount| keys.contains_key(&amount),
-        received.value_sats,
-        &payload.outputs,
-    ) {
-        return Ok(Settlement::Rejected(why));
-    }
+    let requested = match check(|amount| keys.contains_key(&amount), &payload.outputs) {
+        Ok(requested) => requested,
+        Err(why) => return Ok(Settlement::Rejected(why)),
+    };
     for output in &payload.outputs {
         let used = logic
             .is_blind_nonce_used(&output.blind_nonce)
@@ -115,6 +121,20 @@ pub fn settle(
         if used {
             return Ok(Settlement::Rejected(Rejection::BlindNonceAlreadyUsed));
         }
+    }
+    // The price is asked for only now, once the payment is otherwise good, and
+    // the caller fetches it at most once per run. It is the price at run time,
+    // not at the 6th confirmation.
+    let usd_cents_per_btc = match price() {
+        Ok(cents) => cents,
+        Err(why) => return Ok(Settlement::PriceUnavailable(why)),
+    };
+    let allowed = allowed_units(received.value_sats, usd_cents_per_btc);
+    if requested > allowed {
+        return Ok(Settlement::Rejected(Rejection::OverRequest {
+            requested,
+            allowed,
+        }));
     }
     processed.insert(&received.txid)?;
     // PSP uses MintLogic::issue, not issue_with_key. Every PSP note of a given
@@ -137,7 +157,14 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    const PAYLOAD_HEX: &str = "0a7265706c792d7465737402000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
+    // DID 0279be66..1798, then outputs 4 -> 3G and 1 -> 5G (5 units in all)
+    const PAYLOAD_HEX: &str = "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179802000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
+    // The previous layout: a 10-byte reply ("reply-test") instead of a DID
+    const OLD_REPLY_PAYLOAD_HEX: &str = "0a7265706c792d7465737402000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
+
+    /// $100,000 per BTC, in cents. Then 100,000 sats is exactly 100 units and
+    /// 1,000 sats is exactly 1 unit.
+    const BTC_100K: u64 = 10_000_000;
 
     fn point(i: u8) -> mint_types::BlindNonce {
         let sk = SecretKey::from_slice(&[i; 32]).unwrap();
@@ -156,58 +183,57 @@ mod tests {
     }
 
     #[test]
-    fn within_allowed_passes() {
-        assert_eq!(check(any, 1, &[out(4, 1), out(1, 2)]), None);
+    fn allowed_units_is_one_usd_per_unit() {
+        assert_eq!(allowed_units(100_000, BTC_100K), 100);
+        assert_eq!(allowed_units(5_000, BTC_100K), 5);
+        assert_eq!(allowed_units(100_000_000, BTC_100K), 100_000);
+        assert_eq!(allowed_units(100_000_000, 8_167_355), 81_673);
     }
 
     #[test]
-    fn exactly_the_allowed_amount_passes() {
-        assert_eq!(check(any, 1, &[out(64, 1), out(32, 2), out(4, 3)]), None);
+    fn allowed_units_rounds_down_to_whole_units() {
+        assert_eq!(allowed_units(4_999, BTC_100K), 4);
+        assert_eq!(allowed_units(999, BTC_100K), 0);
+        assert_eq!(allowed_units(0, BTC_100K), 0);
+        assert_eq!(allowed_units(5_000, 0), 0);
     }
 
     #[test]
-    fn one_unit_over_is_rejected() {
+    fn allowed_units_does_not_overflow() {
+        assert_eq!(allowed_units(u64::MAX, u64::MAX), u64::MAX);
+        // all 21 million BTC at $1,000,000,000 per BTC
         assert_eq!(
-            check(any, 1, &[out(64, 1), out(32, 2), out(4, 3), out(1, 4)]),
-            Some(Rejection::OverRequest {
-                requested: 101,
-                allowed: 100
-            })
+            allowed_units(2_100_000_000_000_000, 100_000_000_000),
+            21_000_000_000_000_000
         );
     }
 
     #[test]
-    fn nothing_paid_allows_nothing() {
-        assert_eq!(
-            check(any, 0, &[out(1, 1)]),
-            Some(Rejection::OverRequest {
-                requested: 1,
-                allowed: 0
-            })
-        );
+    fn check_returns_the_total_requested() {
+        assert_eq!(check(any, &[out(4, 1), out(1, 2)]), Ok(5));
     }
 
     #[test]
     fn unknown_denomination_is_rejected() {
         assert_eq!(
-            check(|a| a.units != 3, 10, &[out(4, 1), out(3, 2)]),
-            Some(Rejection::UnknownDenomination(Amount::from_units(3)))
+            check(|a| a.units != 3, &[out(4, 1), out(3, 2)]),
+            Err(Rejection::UnknownDenomination(Amount::from_units(3)))
         );
     }
 
     #[test]
     fn duplicate_blind_nonce_is_rejected() {
         assert_eq!(
-            check(any, 10, &[out(4, 1), out(1, 1)]),
-            Some(Rejection::DuplicateBlindNonce)
+            check(any, &[out(4, 1), out(1, 1)]),
+            Err(Rejection::DuplicateBlindNonce)
         );
     }
 
     #[test]
     fn request_total_overflow_is_rejected() {
         assert_eq!(
-            check(any, u64::MAX, &[out(u64::MAX, 1), out(1, 2)]),
-            Some(Rejection::Overflow)
+            check(any, &[out(u64::MAX, 1), out(1, 2)]),
+            Err(Rejection::Overflow)
         );
     }
 
@@ -228,11 +254,48 @@ mod tests {
         }
     }
 
+    /// A price source for tests that counts how often it is asked.
+    struct Price {
+        result: Result<u64, String>,
+        asked: u32,
+    }
+
+    impl Price {
+        fn at(cents: u64) -> Self {
+            Price {
+                result: Ok(cents),
+                asked: 0,
+            }
+        }
+
+        fn down() -> Self {
+            Price {
+                result: Err("only 1 usable price".to_string()),
+                asked: 0,
+            }
+        }
+
+        fn ask(&mut self) -> Result<u64, String> {
+            self.asked += 1;
+            self.result.clone()
+        }
+    }
+
+    fn run(
+        logic: &MintLogic,
+        processed: &mut Processed,
+        r: &Received,
+        price: &mut Price,
+    ) -> Settlement {
+        settle(logic, processed, r, &mut || price.ask()).unwrap()
+    }
+
     #[test]
     fn issues_once_and_records_the_txid() {
         let (logic, mut processed, dir) = fixture("issue");
-        let r = received("aa", 6, 1, Some(PAYLOAD_HEX));
-        match settle(&logic, &mut processed, &r).unwrap() {
+        let mut price = Price::at(BTC_100K);
+        let r = received("aa", 6, 5_000, Some(PAYLOAD_HEX));
+        match run(&logic, &mut processed, &r, &mut price) {
             Settlement::Issued(results) => {
                 assert_eq!(results.len(), 2);
                 assert!(results.iter().all(|x| x.is_ok()));
@@ -242,24 +305,50 @@ mod tests {
         assert!(processed.contains("aa"));
         assert_eq!(logic.audit_totals().unwrap().0, Amount::from_units(5));
         assert_eq!(
-            settle(&logic, &mut processed, &r).unwrap(),
+            run(&logic, &mut processed, &r, &mut price),
             Settlement::AlreadyProcessed
         );
         assert_eq!(logic.audit_totals().unwrap().0, Amount::from_units(5));
+        assert_eq!(price.asked, 1);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn waits_for_six_confirmations() {
+    fn waits_for_six_confirmations_without_asking_for_a_price() {
         let (logic, mut processed, dir) = fixture("wait");
-        let r = received("aa", 5, 1, Some(PAYLOAD_HEX));
+        let mut price = Price::at(BTC_100K);
+        let r = received("aa", 5, 5_000, Some(PAYLOAD_HEX));
         assert_eq!(
-            settle(&logic, &mut processed, &r).unwrap(),
+            run(&logic, &mut processed, &r, &mut price),
             Settlement::Waiting { confirmations: 5 }
         );
         assert!(!processed.contains("aa"));
         assert_eq!(logic.audit_totals().unwrap().0, Amount::ZERO);
+        assert_eq!(price.asked, 0);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_price_decides_how_much_a_payment_buys() {
+        let (logic, mut processed, dir) = fixture("rate");
+        // 5,000 sats buys 5 units at $100,000 but only 2 at $40,000.
+        let mut low = Price::at(4_000_000);
+        let r = received("aa", 6, 5_000, Some(PAYLOAD_HEX));
+        assert_eq!(
+            run(&logic, &mut processed, &r, &mut low),
+            Settlement::Rejected(Rejection::OverRequest {
+                requested: 5,
+                allowed: 2
+            })
+        );
+        assert!(!processed.contains("aa"));
+        let mut high = Price::at(BTC_100K);
+        assert!(matches!(
+            run(&logic, &mut processed, &r, &mut high),
+            Settlement::Issued(_)
+        ));
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -267,22 +356,24 @@ mod tests {
     #[test]
     fn rejected_payments_are_not_recorded() {
         let (logic, mut processed, dir) = fixture("reject");
-        let over = received("aa", 6, 0, Some(PAYLOAD_HEX));
+        let mut price = Price::at(BTC_100K);
+        // 4,999 sats buys 4 units, one short of the 5 requested.
+        let over = received("aa", 6, 4_999, Some(PAYLOAD_HEX));
         assert_eq!(
-            settle(&logic, &mut processed, &over).unwrap(),
+            run(&logic, &mut processed, &over, &mut price),
             Settlement::Rejected(Rejection::OverRequest {
                 requested: 5,
-                allowed: 0
+                allowed: 4
             })
         );
-        let none = received("bb", 6, 1, None);
+        let none = received("bb", 6, 5_000, None);
         assert_eq!(
-            settle(&logic, &mut processed, &none).unwrap(),
+            run(&logic, &mut processed, &none, &mut price),
             Settlement::NoPayload
         );
-        let garbage = received("cc", 6, 1, Some("00"));
+        let garbage = received("cc", 6, 5_000, Some("00"));
         assert!(matches!(
-            settle(&logic, &mut processed, &garbage).unwrap(),
+            run(&logic, &mut processed, &garbage, &mut price),
             Settlement::Rejected(Rejection::BadPayload(_))
         ));
         assert!(!processed.contains("aa"));
@@ -293,8 +384,47 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn a_reply_that_is_not_a_did_is_rejected_without_asking_for_a_price() {
+        let (logic, mut processed, dir) = fixture("didlen");
+        let mut price = Price::at(BTC_100K);
+        let r = received("aa", 6, 5_000, Some(OLD_REPLY_PAYLOAD_HEX));
+        assert_eq!(
+            run(&logic, &mut processed, &r, &mut price),
+            Settlement::Rejected(Rejection::BadPayload(DecodeError::WrongReplyLength))
+        );
+        assert!(!processed.contains("aa"));
+        assert_eq!(price.asked, 0);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn no_usable_price_leaves_the_payment_for_the_next_run() {
+        let (logic, mut processed, dir) = fixture("noprice");
+        let r = received("aa", 6, 5_000, Some(PAYLOAD_HEX));
+        let mut down = Price::down();
+        assert_eq!(
+            run(&logic, &mut processed, &r, &mut down),
+            Settlement::PriceUnavailable("only 1 usable price".to_string())
+        );
+        assert!(!processed.contains("aa"));
+        assert_eq!(logic.audit_totals().unwrap().0, Amount::ZERO);
+        // next run, the price is back
+        let mut up = Price::at(BTC_100K);
+        assert!(matches!(
+            run(&logic, &mut processed, &r, &mut up),
+            Settlement::Issued(_)
+        ));
+        assert!(processed.contains("aa"));
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn payload_bytes(outputs: &[(u64, u8)]) -> String {
-        let mut bytes = vec![0u8, outputs.len() as u8];
+        let mut bytes = vec![33u8];
+        bytes.extend_from_slice(&[7u8; 33]);
+        bytes.push(outputs.len() as u8);
         for &(units, i) in outputs {
             bytes.extend_from_slice(&units.to_be_bytes());
             bytes.extend_from_slice(&point(i).0.serialize());
@@ -305,16 +435,19 @@ mod tests {
     #[test]
     fn a_reused_blind_nonce_rejects_the_whole_payment_before_anything_is_issued() {
         let (logic, mut processed, dir) = fixture("reuse");
-        let first = received("aa", 6, 1, Some(&payload_bytes(&[(4, 1), (1, 2)])));
+        let mut price = Price::at(BTC_100K);
+        let first = received("aa", 6, 5_000, Some(&payload_bytes(&[(4, 1), (1, 2)])));
         assert!(matches!(
-            settle(&logic, &mut processed, &first).unwrap(),
+            run(&logic, &mut processed, &first, &mut price),
             Settlement::Issued(_)
         ));
-        let second = received("bb", 6, 1, Some(&payload_bytes(&[(2, 3), (1, 2)])));
+        let asked = price.asked;
+        let second = received("bb", 6, 5_000, Some(&payload_bytes(&[(2, 3), (1, 2)])));
         assert_eq!(
-            settle(&logic, &mut processed, &second).unwrap(),
+            run(&logic, &mut processed, &second, &mut price),
             Settlement::Rejected(Rejection::BlindNonceAlreadyUsed)
         );
+        assert_eq!(price.asked, asked);
         assert!(!processed.contains("bb"));
         assert!(!logic.is_blind_nonce_used(&point(3)).unwrap());
         assert_eq!(logic.audit_totals().unwrap().0, Amount::from_units(5));
