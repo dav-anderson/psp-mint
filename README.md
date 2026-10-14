@@ -89,7 +89,7 @@ $CLI -rpcwallet=psp gettransaction $TXID | grep confirmations
 $CLI -rpcwallet=psp gettransaction $TXID true true | grep -B6 nulldata
 ```
 
-The confirmations are `1` and then `6`. The `nulldata` output has an `asm` of `OP_RETURN` followed by the payload hex, identical to what was sent. The raw `hex` of that output is `6a4c75` followed by the payload: `OP_RETURN`, `OP_PUSHDATA1`, then the length byte.
+The confirmations are `1` and then `6`. To watch the price lock, run `cargo run` (step 7) between the two `generatetoaddress` commands, once after the first confirmation and again after the sixth. The `nulldata` output has an `asm` of `OP_RETURN` followed by the payload hex, identical to what was sent. The raw `hex` of that output is `6a4c75` followed by the payload: `OP_RETURN`, `OP_PUSHDATA1`, then the length byte.
 
 ### 7. Run the PSP
 
@@ -100,19 +100,25 @@ cargo test
 cargo run
 ```
 
-Each run scans the `psp` wallet once, settles every payment that is ready, and exits. For the step 5 payment it prints the txid with `confirmations=6` and `value_sats=100000`, then the BTC/USD price it used, then one `signature` line per requested output (two, for the 4 and 1 unit outputs). Run it again and it prints `already processed`. A payment with fewer than 6 confirmations prints `waiting`.
+Each run scans the `psp` wallet once, moves every payment as far as it can go, and exits.
 
-The run needs internet access, because the price comes from three live exchanges even on regtest. A regtest coin is priced like a real one, so 100,000 sats buys about 80 PSP units at current prices. If no price can be taken it prints `waiting: no price this run` and the payment is tried again on the next run.
+- A payment with 1 to 5 confirmations that has no record yet gets one. The run takes the BTC/USD price, stores it, and prints `price locked at ... USD/BTC, waiting: 1 of 6 confirmations`.
+- A payment with 6 confirmations is settled with the stored price. For the step 5 payment (`value_sats=100000`) it prints the over/under in basis points and one `signature` line per signed output (two, for the 4 and 1 unit outputs). Its record in `settlements.json` then shows `issued: true`.
+- A payment that is already settled prints `already settled`. A payment with 0 confirmations prints `waiting`.
+
+If you run it for the first time when the payment already has 6 confirmations, it locks the price in that run and settles in the same run. The record is marked `late`.
+
+The run needs internet access, because the price comes from three live exchanges even on regtest. A regtest coin is priced like a real one, so 100,000 sats buys about 80 PSP units at current prices, and the 5 units in the step 5 payload cost far less than that. The payment is overpaid by a wide margin, and the over/under shows it (well over +10%, so a credit is recorded). If no price can be taken it prints `waiting: no price this run` and the payment is tried again on the next run.
 
 A payment made before the reply became a 33-byte DID (a different reply length) is rejected as `BadPayload(WrongReplyLength)`. To test again after this change, repeat steps 5 and 6 to send and confirm a new payment.
 
 Notes on running it:
 
-- **It runs once.** Run it again as payments reach 6 confirmations. There is no loop yet.
+- **It runs once, and must be run every few minutes.** Each payment has to be seen at 1 confirmation so its price is locked then. There is no loop or scheduler yet (see Left to do). Run it by hand, or from `cron` or `launchd`.
 - **It sees the last 1000 wallet transactions.** Older ones are not scanned.
-- **Data directory.** State lives in `~/.psp-mint` (override with `PSP_DATA_DIR`): `mint_keys.json` (the mint's secret keys, created on first run), `db/` (the mint's store) and `processed_txids.json`. Do not delete it. Without the keys, notes already issued cannot be redeemed.
+- **Data directory.** State lives in `~/.psp-mint` (override with `PSP_DATA_DIR`): `mint_keys.json` (the mint's secret keys, created on first run), `db/` (the mint's store) and `settlements.json` (one record per payment). Do not delete it. Without the keys, notes already issued cannot be redeemed. An old `processed_txids.json` is imported into `settlements.json` on the first run, as issued records with no stored price, and left in place.
 - **Denominations.** Notes are powers of two from 1 to 1,048,576 units. A request must use those, so 5 units is a 4 and a 1.
-- **Data outputs.** A transaction needs exactly one data output. With none, or with more than one, it is skipped and nothing is issued.
+- **Data outputs.** A transaction needs exactly one data output. With none, or with more than one, it is recorded as rejected and nothing is issued.
 - **Signatures.** They are printed once, at issue time, and are not stored anywhere (see Left to do).
 
 Settings are environment variables:
@@ -134,26 +140,65 @@ A payer buys PSP by sending a Bitcoin payment that carries a request in a data o
 
 1. The payer builds blinded outputs, each an amount and a blind nonce, for the PSP they want.
 2. The payer packs them into a payload (below) and creates a transaction that pays the PSP's address and has one data output holding the payload.
-3. The PSP does nothing with the transaction until it has 6 confirmations. Nothing is read before that.
-4. At 6 confirmations the PSP decodes the payload, checks it against the payment, issues, and delivers the signatures to the DID in the reply field.
+3. At 1 confirmation the PSP takes the BTC/USD price and locks it in a settlement record for the transaction. Nothing else is read yet.
+4. At 6 confirmations the PSP decodes the payload, compares the payment with the request at the locked price, issues, and delivers the signatures to the DID in the reply field.
+
+### Settlement records
+
+The PSP keeps one record per transaction, created when the payment is first seen with 1 confirmation. Records are kept in `settlements.json` in the data directory, a JSON object from txid to record. The file is a placeholder store. It is rewritten in full on every change: written to a temporary file, fsynced, renamed over the old file, and the directory fsynced. A missing file means no records yet, and an unreadable file is an error, never an empty store. This state probably needs to eventually "live on the air".
+
+| Field | Meaning |
+|---|---|
+| `locked_price_cents` | USD per BTC in whole cents, taken at the first sighting and never refreshed. Null only for records imported from the old `processed_txids.json`. |
+| `issued` | True once at least one note was signed. |
+| `over_under_bps` | Paid versus requested, in basis points of the requested total. Positive is overpaid, negative underpaid: `1250` is 12.50% over and `-80` is 0.80% under. It is (paid value minus requested value) divided by requested value, using the exact USD value at the locked price (not rounded down to whole units), truncated toward zero. Null when there is no valid request to compare with (no data output, undecodable payload, unknown denomination or duplicate blind nonce). |
+| `status` | `locked` (waiting for 6 confirmations), `issued`, or `rejected`. |
+| `late` | True if the payment was first seen with more than 1 confirmation, so the lock was taken later than intended. |
+| `skipped_units` | Requested units that were not signed because of a large underpayment. |
+| `credit_cents` | Overpayment of 10% or more, in USD cents. |
+| `reason` | Why nothing was signed, when `status` is `rejected`. |
+
+Rejected and underpaid payments are recorded too, not dropped. A payment that has reached `issued` or `rejected` is final and is not looked at again. Rejected payments are not refunded (see Not decided yet).
+
+The transaction is marked `issued` before anything is signed, so a payment is issued at most once. If the process dies after that and before the signatures are delivered, they are lost.
 
 ### Settlement rules
 
 - **Payment value** is the sum of the outputs in that transaction that pay the PSP's address. It is read from the chain, never from the payload.
-- **Rate** is 1 PSP = 1 USD, paid in BTC. The BTC/USD price is taken as described under Price below.
-- **Allowed amount** is the payment value in USD at that price, in whole PSP units, rounded down: `floor(sats * usd_cents_per_btc / 10^10)`. For example, 100,000 sats at $100,000 per BTC is 100 units.
-- The sum of the requested output amounts must be less than or equal to the allowed amount, or nothing is issued.
-- Every output is validated before any is issued: the denomination exists, there are no duplicate blind nonces within the request, and no blind nonce was used by an earlier payment.
-- Each transaction is processed once, keyed by txid. The processed txids are kept in a single JSON file, a sorted array of txid strings, rewritten in full after each addition (written to a temporary file, then renamed). A missing file means none processed yet, and an unreadable file is an error, never an empty set. This is a placeholder, and the state probably needs to eventually "live on the air".
-- The txid is recorded before anything is issued, so a payment is issued at most once. If the process dies after that and before the signatures are delivered, they are lost.
-- A payment that is rejected (bad payload, unknown denomination, duplicate or already used blind nonce, or a request above the allowed amount) is not recorded and nothing is issued. It is reported again on every run.
-- A payment with no usable price this run is also not recorded. It is tried again on the next run.
-- Overpayment is kept by the PSP for now (see Not decided yet), so request outputs that use the whole payment.
+- **Rate** is 1 PSP = 1 USD, paid in BTC, at the price locked at 1 confirmation (see Price below).
+- **Amounts** are `u64`. Sums of amounts are checked, and a request whose total overflows is rejected. Conversions between sats, cents and units use `u128`. Tests cover the limits.
+- **Requested** is the sum of the requested output amounts. It is compared with the payment value in USD at the locked price.
+- Every output is validated before any is issued: the denomination exists, there are no duplicate blind nonces within the request, and no blind nonce was used by an earlier payment. A failure rejects the whole payment.
+- A payment with no data output or an undecodable payload is rejected.
+- A payment with no usable price at its first sighting gets no record. It is tried again on the next run.
 - Once payloads are encrypted (not yet implemented), a payload copied into someone else's transaction is harmless. The signatures go to the DID inside the payload, which the copier cannot change, and only the payer holds the blinding factors that turn them into notes. The copier ends up paying for the payer's notes.
+
+#### Underpayment
+
+- **Short by up to 1%.** Every requested output is signed. The mint absorbs the shortfall.
+- **Short by more than 1%.** The mint signs the largest outputs whose total fits what was paid and skips the rest. It goes through the outputs from largest to smallest and signs each one only if the running total still fits in the whole units the payment buys (the payment value in USD, rounded down). Smaller outputs are still tried after a larger one is skipped.
+- **The skipped value is kept by the mint and is not refunded or credited.** Buyers lose it. For example, 4,900 sats at $100,000 per BTC is $4.90 and buys 4 whole units. A request for a 4 and a 1 gets the 4 signed and the 1 skipped, and the mint keeps the rest. A payment that buys no whole unit gets nothing signed and is recorded as rejected.
+
+Buyers should pay a little over the request, not under it. A payment more than 1% short loses value.
+
+#### Overpayment
+
+- **Below 10% over.** The mint keeps the excess.
+- **10% or more over.** The mint issues the requested outputs and records the excess as credit (`credit_cents`) against the transaction.
+
+The procedure for credit, a **placeholder that is not built**: the mint sends a message to the payer's DID over JAMJAR, signed with the mint's DID key, saying how much credit there is for the txid and asking for a new request for the remainder. The payer answers with a new request to be filled against the credit. The reply is a JAMJAR message, paid for by the payer in JAMJAR currency (PSP, ESP or FSP). JAMJAR messaging does not exist yet, so today the credit is only recorded and printed.
+
+### Signature delivery
+
+The mint sends the signatures to the DID in the reply field over JAMJAR, and the mint pays for sending them. The payer needs no balance to receive them. JAMJAR messaging does not exist yet, so this is **not built**: today the signatures are printed to the terminal once, at issue time, and are not stored.
+
+### Fees
+
+The PSP has no fee of its own besides the BTC purchase. Fees at the later layers (exchange to ESP, transfer, and FSP use) are paid in JAMJAR currency and charged by JAMJAR messaging, not by the mints. The only explicit mint fees are the BTC at PSP purchase and the ESP redeem fee. A separate fee on top of the 1 USD rate is not defined or implemented.
 
 ### Price
 
-The price is fetched only when a payment is ready to settle: 6 or more confirmations, not processed, and the payload decodes and validates. It is fetched at most once per run, never polled.
+The price is locked when a payment is first seen with 1 confirmation or more and has no record yet. The first run that sees the transaction fetches the price, once per run, and stores it in the record. Settlement at 6 confirmations uses the stored price and never a live one. The PSP does not poll the exchanges.
 
 | Source | Endpoint | Price | Quote time |
 |---|---|---|---|
@@ -169,7 +214,7 @@ All three are public, need no key, and the price used is the last trade. Gemini'
 - 1 or 0 usable prices: wait and retry on the next run. The PSP never issues on a single feed.
 - Prices are whole US cents per BTC. Decimal strings are parsed to cents with no floating point, and anything past the second decimal is dropped.
 
-The price is taken at run time, not exactly at the 6th confirmation. A confirmed payment waits for the next run, so the price can differ from the price at the 6th confirmation. Waiting for a price adds the same kind of delay. The rule is in `src/price.rs`, with the aggregation as a pure tested function.
+The price is a live ticker price taken when the run sees the payment, not a block-time price. The PSP does not use block timestamps or historical candles, because miners can skew a block's timestamp by about 2 hours. This is why the PSP must run every few minutes: the price is taken at the first run that sees the payment at 1 confirmation, and a run that comes late locks a later price and marks the record `late`. The rule is in `src/price.rs`, with the aggregation as a pure tested function.
 
 ### Payload format
 
@@ -201,31 +246,12 @@ Expected encrypted sizes, at 1 sat/vB and BTC at $81,672:
 ### Left to do
 
 - **Payload encryption.** The payer must encrypt the payload and the PSP must decrypt it, with ECIES as above. This is not written into the PSP spec yet, and the payload is currently cleartext.
-- **Processed txids.** They are kept in a single JSON file as a placeholder. Replace it with a proper store. This state probably needs to eventually "live on the air".
-- **Signature delivery.** The signatures are printed to the terminal. How they reach the DID in the reply field is not designed (see Not decided yet).
+- **Settlement records.** They are kept in a single JSON file as a placeholder. Replace it with a proper store. This state probably needs to eventually "live on the air".
+- **Running every few minutes.** The PSP is a one-shot process and nothing schedules it yet. Until a scheduler or loop exists, a payment is only priced when someone runs it.
+- **JAMJAR messaging for credit.** Overpayments of 10% or more are recorded as credit only. The message to the payer's DID is not built.
+- **Signature delivery.** The signatures are printed to the terminal. Sending them to the DID over JAMJAR, paid by the mint, is not built.
 - **Mint key storage.** The keyfile is plain JSON with `0600` permissions in the data directory. How the real keys are protected is not decided.
 
 ### Not decided yet
 
-Three decisions are open. Options are listed, none is chosen.
-
-**1. Overpayment leftover.** A payment buys whole units at the run-time price, and the rest is kept by the PSP today. Options:
-
-- Keep it. Nothing to build. The payer loses the leftover.
-- Refund it in BTC. The payload would need a refund address, and the on-chain fee to send it can be larger than a small leftover.
-- Credit it to the DID, to be used on a later purchase. The mint would need state per DID.
-
-**2. BTC/USD price timing and source.** The source is set (three exchanges, median). The timing is open. Today it is the price at run time. Options:
-
-- Price at run time (current). Simple, but it depends on when the run happens.
-- Price when the payment is first seen. Needs the run to see it before it confirms, and a stored price.
-- Price at the 6th confirmation block's time. Closest to the intended moment, but the ticker endpoints only give the current price, so it needs a historical price source or prices recorded at the time.
-
-**3. Signature delivery when the payer has no AIR balance.** Options:
-
-- The mint pays the delivery cost.
-- A fixed delivery fee is taken out of each purchase.
-- The payer fetches the signatures from the mint by txid or DID, which means the mint stores them.
-- A public feed keyed by txid. The signatures are of no use without the payer's blinding factors, but the feed grows without bound.
-
-Also not decided: what happens to a payment the PSP rejects, and the fee.
+Whether a rejected payment (bad payload, reused blind nonce, or too small to buy any output) is ever refunded.

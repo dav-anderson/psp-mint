@@ -5,9 +5,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mint_types::Amount;
 use psp_mint::price::{self, Aggregate, Config, Lazy};
-use psp_mint::processed::Processed;
+use psp_mint::records::Records;
 use psp_mint::rpc::Rpc;
-use psp_mint::settle::{MIN_CONFIRMATIONS, Settlement};
+use psp_mint::settle::{LOCK_CONFIRMATIONS, MIN_CONFIRMATIONS, Rejection, Settlement};
 use psp_mint::{mint, scan, settle};
 
 const MAX_DENOMINATION_UNITS: u64 = 1_048_576;
@@ -70,7 +70,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     fs::create_dir_all(&data_dir)?;
     let logic = mint::open(&data_dir, Amount::from_units(MAX_DENOMINATION_UNITS))?;
-    let mut processed = Processed::open(&data_dir.join("processed_txids.json"))?;
+    let mut records = Records::open_with_legacy(
+        &data_dir.join("settlements.json"),
+        &data_dir.join("processed_txids.json"),
+    )?;
     let rpc = Rpc::from_cookie(&format!("{base}/wallet/{wallet}"), Path::new(&cookie))?;
 
     let mut price = Lazy::new(|| btc_usd_cents(price_config));
@@ -84,18 +87,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "{} confirmations={} value_sats={}",
             r.txid, r.confirmations, r.value_sats
         );
-        match settle::settle(&logic, &mut processed, r, &mut || price.get())? {
+        match settle::settle(&logic, &mut records, r, &mut || price.get())? {
             Settlement::Waiting { confirmations } => {
-                println!("  waiting: {confirmations} of {MIN_CONFIRMATIONS} confirmations")
+                println!("  waiting: {confirmations} of {LOCK_CONFIRMATIONS} confirmation to lock the price")
             }
-            Settlement::AlreadyProcessed => println!("  already processed"),
-            Settlement::NoPayload => println!("  skipped: no single data output"),
-            Settlement::Rejected(why) => println!("  rejected: {why:?}"),
+            Settlement::Locked {
+                confirmations,
+                price_cents,
+            } => println!(
+                "  price locked at {} USD/BTC, waiting: {confirmations} of {MIN_CONFIRMATIONS} confirmations",
+                cents_text(price_cents)
+            ),
+            Settlement::AlreadySettled(status) => println!("  already settled ({status:?})"),
             Settlement::PriceUnavailable(why) => {
                 println!("  waiting: no price this run ({why}); will retry next run")
             }
-            Settlement::Issued(results) => {
-                for result in results {
+            Settlement::Rejected(Rejection::NoDataOutput) => {
+                println!("  rejected: no single data output")
+            }
+            Settlement::Rejected(why) => println!("  rejected: {why:?}"),
+            Settlement::Issued(issue) => {
+                println!("  over/under: {} bps", issue.over_under_bps);
+                if issue.skipped_units > 0 {
+                    println!(
+                        "  underpaid by more than 1%: {} units not signed, kept by the mint",
+                        issue.skipped_units
+                    );
+                }
+                if issue.credit_cents > 0 {
+                    // The JAMJAR message asking the payer's DID for a new request
+                    // is not built yet. The credit is only recorded.
+                    println!(
+                        "  overpaid by 10% or more: credit {} USD recorded (JAMJAR message to the payer not built)",
+                        cents_text(issue.credit_cents)
+                    );
+                }
+                for result in issue.results {
                     match result {
                         Ok(signature) => println!("  signature {}", signature.0),
                         Err(e) => println!("  not issued: {e}"),
