@@ -4,4 +4,6 @@ pub mod price;
 pub mod records;
 pub mod rpc;
 pub mod scan;
+pub mod server;
+pub mod service;
 pub mod settle;

@@ -904,15 +904,18 @@ dependencies = [
 name = "psp-mint"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bdhke",
  "hex",
  "mint-core",
  "mint-server",
  "mint-types",
+ "rand 0.8.8",
  "reqwest",
  "secp256k1",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

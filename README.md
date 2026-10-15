@@ -91,9 +91,9 @@ $CLI -rpcwallet=psp gettransaction $TXID true true | grep -B6 nulldata
 
 The confirmations are `1` and then `6`. To watch the price lock, run `cargo run` (step 7) between the two `generatetoaddress` commands, once after the first confirmation and again after the sixth. The `nulldata` output has an `asm` of `OP_RETURN` followed by the payload hex, identical to what was sent. The raw `hex` of that output is `6a4c75` followed by the payload: `OP_RETURN`, `OP_PUSHDATA1`, then the length byte.
 
-### 7. Run the PSP
+### 7. Run the PSP once
 
-With the node running, from the `psp-mint` directory:
+This is the one-shot run, for testing. With the node running, from the `psp-mint` directory:
 
 ```
 cargo test
@@ -114,7 +114,7 @@ A payment made before the reply became a 33-byte DID (a different reply length) 
 
 Notes on running it:
 
-- **It runs once, and must be run every few minutes.** Each payment has to be seen at 1 confirmation so its price is locked then. There is no loop or scheduler yet (see Left to do). Run it by hand, or from `cron` or `launchd`.
+- **The one-shot run runs once.** Each payment has to be seen at 1 confirmation so its price is locked then, so in real use run `serve` (step 8), which rescans on its own. The one-shot run cannot run while `serve` is up, because the mint's database can only be opened by one process.
 - **It sees the last 1000 wallet transactions.** Older ones are not scanned.
 - **Data directory.** State lives in `~/.psp-mint` (override with `PSP_DATA_DIR`): `mint_keys.json` (the mint's secret keys, created on first run), `db/` (the mint's store) and `settlements.json` (one record per payment). Do not delete it. Without the keys, notes already issued cannot be redeemed. An old `processed_txids.json` is imported into `settlements.json` on the first run, as issued records with no stored price, and left in place.
 - **Denominations.** Notes are powers of two from 1 to 1,048,576 units. A request must use those, so 5 units is a 4 and a 1.
@@ -129,8 +129,51 @@ Settings are environment variables:
 | `PSP_WALLET` | `psp` |
 | `PSP_COOKIE` | `~/Library/Application Support/Bitcoin/regtest/.cookie` |
 | `PSP_DATA_DIR` | `~/.psp-mint` |
+| `PSP_BIND` | `127.0.0.1:3000` (serve only) |
+| `PSP_SCAN_INTERVAL_SECS` | `120` (serve only) |
 | `PSP_PRICE_MAX_AGE_SECS` | `120` |
 | `PSP_PRICE_MAX_SPREAD_BPS` | `200` (2%) |
+
+### 8. Run the PSP server
+
+`serve` runs the HTTP API and rescans the wallet on a timer, in one process. Stop the one-shot run first if it is going. For testing, use a short interval:
+
+```
+PSP_SCAN_INTERVAL_SECS=10 cargo run -- serve
+```
+
+It prints `scanning wallet psp every 10 s` and `psp-mint api listening on http://127.0.0.1:3000`. In another terminal:
+
+```
+curl -s http://127.0.0.1:3000/keys
+curl -s http://127.0.0.1:3000/audit
+curl -s http://127.0.0.1:3000/health
+```
+
+`/keys` lists a public key for each denomination (1 to 1,048,576). `/audit` shows `issued`, `redeemed` and `outstanding`. To watch a payment move through, send one (step 5), mine 1 block (step 6) and wait for a scan: the server prints `price locked at ... USD/BTC, waiting: 1 of 6 confirmations`. Mine 5 more blocks and after the next scan it settles and prints the signatures. `/audit` then shows the issued total. Stop it with Ctrl-C.
+
+Scan failures (for example the node being down) are printed and retried on the next interval. Payments that are already settled are not printed again.
+
+## HTTP API
+
+The API is mint-server's handlers, the same ones `mintd` uses, mounted over the PSP's own mint in the same process. The scanner and the API share the mint behind one mutex. The scanner locks it once per payment and never while it waits on the exchanges for a price.
+
+| Route | What it does |
+|---|---|
+| `GET /keys` | The public key for each denomination. |
+| `POST /melt` | Burns notes. Body: `{"inputs": [...], "memo": "..."}`. Every input's spend signature covers the memo, so the burn is bound to it. Returns `{"burned": ...}`. The ESP mint uses this to burn PSP in an exchange, with the memo it computes from the request. |
+| `POST /check-state` | Body: `{"nonces": [...]}`. Returns which are spent. |
+| `GET /audit` | `issued`, `redeemed`, `outstanding`. |
+| `GET /health` | `200` with `status` `ok` (or `starting`, before the first scan finishes), `503` with `scan_stale` or `mint_lock_poisoned`. The body also has `last_scan_unix`, `seconds_since_last_scan` (both null until a scan succeeds) and `stale_after_secs`. A scan counts when the wallet was read and every payment was processed as far as it could go, so a payment waiting on confirmations or a price is not a failure. `scan_stale` means no successful scan for three intervals plus 60 s. |
+
+Not mounted, on purpose:
+
+- **`/admin/issue`.** The PSP issues only from confirmed BTC payments. There is no unilateral issuance.
+- **`/swap`.** PSP to FSP is out of scope, and pints are not exchanged peer to peer.
+
+`serve` also exits (status 1, with a message on stderr) if the scan thread panics or a thread panics while holding the mint, since either leaves a process that answers but is broken. A supervisor should restart it.
+
+There is no authentication and no TLS, and `/health` is open like the rest. A note authorizes its own spend, so a caller can only burn notes they hold. The default bind is localhost. Do not expose it to a network without TLS in front.
 
 ## Using BTC to buy PSP
 
@@ -214,7 +257,7 @@ All three are public, need no key, and the price used is the last trade. Gemini'
 - 1 or 0 usable prices: wait and retry on the next run. The PSP never issues on a single feed.
 - Prices are whole US cents per BTC. Decimal strings are parsed to cents with no floating point, and anything past the second decimal is dropped.
 
-The price is a live ticker price taken when the run sees the payment, not a block-time price. The PSP does not use block timestamps or historical candles, because miners can skew a block's timestamp by about 2 hours. This is why the PSP must run every few minutes: the price is taken at the first run that sees the payment at 1 confirmation, and a run that comes late locks a later price and marks the record `late`. The rule is in `src/price.rs`, with the aggregation as a pure tested function.
+The price is a live ticker price taken when the run sees the payment, not a block-time price. The PSP does not use block timestamps or historical candles, because miners can skew a block's timestamp by about 2 hours. This is why the PSP must scan every few minutes (`serve` does, every 120 seconds by default): the price is taken at the first scan that sees the payment at 1 confirmation, and a run that comes late locks a later price and marks the record `late`. The rule is in `src/price.rs`, with the aggregation as a pure tested function.
 
 ### Payload format
 
@@ -247,7 +290,9 @@ Expected encrypted sizes, at 1 sat/vB and BTC at $81,672:
 
 - **Payload encryption.** The payer must encrypt the payload and the PSP must decrypt it, with ECIES as above. This is not written into the PSP spec yet, and the payload is currently cleartext.
 - **Settlement records.** They are kept in a single JSON file as a placeholder. Replace it with a proper store. This state probably needs to eventually "live on the air".
-- **Running every few minutes.** The PSP is a one-shot process and nothing schedules it yet. Until a scheduler or loop exists, a payment is only priced when someone runs it.
+- **Local store is for development.** The mint's database (`db/`, sled) and the settlement records are on local disk only while the other pieces are built. They will eventually be stored in the JAMJAR. Until then: only one process can open the mint (so `serve` and the one-shot run cannot overlap, and there is one instance, with an outage while it restarts), a live `db/` must not be copied as a backup (stop the process first, or the copy may be inconsistent), and everything about the data directory above applies. The `serve` design, with the API and the scanner sharing one process and one mutex, assumes this local store and will change with it.
+- **Running as a service.** `serve` exits with a non-zero status if the scan thread dies or the mint lock is poisoned, but nothing restarts it. A payment is only priced when a scan sees it at 1 confirmation or later, so downtime can cost a price lock. Something like `launchd` or `systemd` should restart it, and a monitor should poll `/health`.
+- **API hardening.** The HTTP API has no TLS and no authentication, and binds to localhost. Rate limiting is not built.
 - **JAMJAR messaging for credit.** Overpayments of 10% or more are recorded as credit only. The message to the payer's DID is not built.
 - **Signature delivery.** The signatures are printed to the terminal. Sending them to the DID over JAMJAR, paid by the mint, is not built.
 - **Mint key storage.** The keyfile is plain JSON with `0600` permissions in the data directory. How the real keys are protected is not decided.
