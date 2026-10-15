@@ -288,14 +288,16 @@ Expected encrypted sizes, at 1 sat/vB and BTC at $81,672:
 
 ### Left to do
 
-- **Payload encryption.** The payer must encrypt the payload and the PSP must decrypt it, with ECIES as above. This is not written into the PSP spec yet, and the payload is currently cleartext.
-- **Settlement records.** They are kept in a single JSON file as a placeholder. Replace it with a proper store. This state probably needs to eventually "live on the air".
+- **Payload encryption (deferred to the AIR).** The payer must encrypt the whole payload to the issuer's DID public key and the PSP must decrypt it, with ECIES as above. The payload is cleartext today, so the payer's DID is visible on chain. That is an accepted interim for development and a privacy leak, not a design goal.
+- **Settlement records (deferred to the AIR).** They are kept in a single local JSON file as a placeholder. The processed-transaction store moves into the AIR, with the mint's database.
 - **Local store is for development.** The mint's database (`db/`, sled) and the settlement records are on local disk only while the other pieces are built. They will eventually be stored in the JAMJAR. Until then: only one process can open the mint (so `serve` and the one-shot run cannot overlap, and there is one instance, with an outage while it restarts), a live `db/` must not be copied as a backup (stop the process first, or the copy may be inconsistent), and everything about the data directory above applies. The `serve` design, with the API and the scanner sharing one process and one mutex, assumes this local store and will change with it.
 - **Running as a service.** `serve` exits with a non-zero status if the scan thread dies or the mint lock is poisoned, but nothing restarts it. A payment is only priced when a scan sees it at 1 confirmation or later, so downtime can cost a price lock. Something like `launchd` or `systemd` should restart it, and a monitor should poll `/health`.
 - **API hardening.** The HTTP API has no TLS and no authentication, and binds to localhost. Rate limiting is not built.
 - **JAMJAR messaging for credit.** Overpayments of 10% or more are recorded as credit only. The message to the payer's DID is not built.
-- **Signature delivery.** The signatures are printed to the terminal. Sending them to the DID over JAMJAR, paid by the mint, is not built.
-- **Mint key storage.** The keyfile is plain JSON with `0600` permissions in the data directory. How the real keys are protected is not decided.
+- **Signature delivery (deferred to the AIR).** The signatures are printed to the terminal, as a temporary development stand-in. They will be sent to the DID as an AIR DID message, paid for by the mint. Not built.
+- **API over the AIR (deferred).** All mint API calls will travel over the AIR. The HTTP API is the development transport.
+- **Silent payments (deferred).** The PSP will switch to silent payments: a static address, with the scanner using a scan key. Today it scans a normal wallet address.
+- **Mint key storage (deferred to the AIR).** The keyfile is plain JSON with `0600` permissions in the data directory. The mint keystore moves into the AIR, and how the keys are protected there is not decided.
 
 ### Not decided yet
 
