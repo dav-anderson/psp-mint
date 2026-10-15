@@ -6,13 +6,14 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
+use air::names::secp256k1::SecretKey;
 use mint_server::state::AppState;
 use mint_types::Amount;
 use psp_mint::price::{self, Config, Lazy};
 use psp_mint::records::Records;
 use psp_mint::rpc::Rpc;
 use psp_mint::settle::Settlement;
-use psp_mint::{mint, scan, server, service};
+use psp_mint::{mint, scan, seal, server, service};
 
 const MAX_DENOMINATION_UNITS: u64 = 1_048_576;
 
@@ -57,6 +58,13 @@ impl Settings {
         })
     }
 
+    /// The mint's DID key, made on first use. Payloads are sealed to its public
+    /// half.
+    fn did_key(&self) -> Result<SecretKey, Box<dyn Error>> {
+        fs::create_dir_all(&self.data_dir)?;
+        seal::load_or_generate(&self.data_dir.join(seal::KEY_FILENAME))
+    }
+
     fn records(&self) -> Result<Records, Box<dyn Error>> {
         Ok(Records::open_with_legacy(
             &self.data_dir.join("settlements.json"),
@@ -66,16 +74,25 @@ impl Settings {
 
     /// Scan the wallet once and move every payment as far as it can go.
     /// `quiet` leaves out payments that are already settled.
+    ///
+    /// Payloads are opened with the mint's DID key first. A payment whose data
+    /// does not open is not for this mint and is ignored, not rejected.
     fn cycle(
         &self,
         state: &AppState,
         records: &mut Records,
+        did: &SecretKey,
         quiet: bool,
     ) -> Result<(), Box<dyn Error>> {
         let rpc = Rpc::from_cookie(&self.rpc_url, Path::new(&self.cookie))?;
-        let found = scan::received(&rpc, 1000)?;
-        if found.is_empty() && !quiet {
-            println!("no payments received by wallet {}", self.wallet);
+        let (found, ignored) = seal::open_payloads(did, scan::received(&rpc, 1000)?);
+        if !quiet {
+            if found.is_empty() && ignored == 0 {
+                println!("no payments received by wallet {}", self.wallet);
+            }
+            if ignored > 0 {
+                println!("ignored {ignored} payment(s) whose data is not encrypted to this mint");
+            }
         }
         let mut price = Lazy::new(|| service::btc_usd_cents(self.price));
         service::run_once(
@@ -102,7 +119,8 @@ fn run_once(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let logic = mint::open(&settings.data_dir, Amount::from_units(MAX_DENOMINATION_UNITS))?;
     let state = server::app_state(logic);
     let mut records = settings.records()?;
-    settings.cycle(&state, &mut records, false)
+    let did = settings.did_key()?;
+    settings.cycle(&state, &mut records, &did, false)
 }
 
 /// Run the HTTP API and rescan the wallet every `PSP_SCAN_INTERVAL_SECS`, in one
@@ -116,6 +134,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     let logic = mint::open(&settings.data_dir, Amount::from_units(MAX_DENOMINATION_UNITS))?;
     let state = server::app_state(logic);
     let mut records = settings.records()?;
+    let did = settings.did_key()?;
 
     // How long without a successful pass before `/health` fails: three
     // intervals, plus a minute for a slow price fetch.
@@ -132,7 +151,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
             interval.as_secs()
         );
         loop {
-            match settings.cycle(&scan_state, &mut records, true) {
+            match settings.cycle(&scan_state, &mut records, &did, true) {
                 Ok(()) => scan_health.record_scan(),
                 Err(e) => eprintln!("scan failed, will retry: {e}"),
             }
@@ -170,11 +189,36 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     })
 }
 
+/// Print the mint's DID public key, the one wallets seal payloads to.
+fn pubkey(settings: &Settings) -> Result<(), Box<dyn Error>> {
+    println!("{}", seal::public_key_hex(&settings.did_key()?));
+    Ok(())
+}
+
+/// Seal a payload to a mint's DID public key and print the result as hex, for
+/// the OP_RETURN. This stands in for a wallet until there is one.
+fn encrypt(mint_key: &str, payload_hex: &str) -> Result<(), Box<dyn Error>> {
+    let key = seal::parse_public_key(mint_key)?;
+    let payload = hex::decode(payload_hex.trim()).map_err(|_| "the payload must be hex")?;
+    println!("{}", hex::encode(seal::encrypt(&key, &payload)?));
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let [cmd, key, payload] = args.as_slice() {
+        if cmd == "encrypt" {
+            return encrypt(key, payload);
+        }
+    }
     let settings = Settings::from_env()?;
-    match env::args().nth(1).as_deref() {
+    match args.first().map(String::as_str) {
         None | Some("run") => run_once(&settings),
         Some("serve") => serve(settings),
-        Some(other) => Err(format!("unknown command {other:?}. Use `serve`, or no command to run once").into()),
+        Some("pubkey") => pubkey(&settings),
+        Some(other) => Err(format!(
+            "unknown command {other:?}. Use `serve`, `pubkey`, `encrypt <mint pubkey hex> <payload hex>`, or no command to run once"
+        )
+        .into()),
     }
 }

@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt;
 
 use mint_core::MintLogic;
-use mint_types::{Amount, MintOutput, MintOutputError, MintOutputOutcome};
+use mint_types::{Amount, BlindNonce, MintOutput, MintOutputError, MintOutputOutcome};
 
 use crate::payload::{self, DecodeError};
 use crate::records::{Record, Records, RecordsError, Status};
@@ -65,6 +65,10 @@ impl From<RecordsError> for SettleError {
 pub struct Issue {
     /// One result per signed output, in payload order.
     pub results: Vec<Result<MintOutputOutcome, MintOutputError>>,
+    /// The blind nonce of each signed output, parallel to `results`, so a payer
+    /// can match a signature to the output it asked for even when some outputs
+    /// were not signed.
+    pub blind_nonces: Vec<BlindNonce>,
     /// Requested units that were not signed because of a large underpayment.
     pub skipped_units: u64,
     /// Overpayment of 10% or more, in USD cents, owed back to the payer.
@@ -335,8 +339,14 @@ pub fn settle(
         .iter()
         .map(|&i| logic.issue(&payload.outputs[i]))
         .collect();
+    let blind_nonces = plan
+        .sign
+        .iter()
+        .map(|&i| payload.outputs[i].blind_nonce)
+        .collect();
     Ok(Settlement::Issued(Issue {
         results,
+        blind_nonces,
         skipped_units: plan.skipped_units,
         credit_cents: assessment.credit_cents,
         over_under_bps: assessment.over_under_bps,

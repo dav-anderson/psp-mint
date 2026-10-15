@@ -3,7 +3,7 @@ use std::fmt;
 use mint_types::{Amount, BlindNonce, MintOutput};
 use secp256k1::PublicKey;
 
-/// Length of the reply field: the payer's JAMJAR DID, a 33-byte value. The
+/// Length of the reply field: the payer's AIR DID, a 33-byte value. The
 /// mint treats it as opaque bytes and does not check that it is a curve point.
 pub const DID_LEN: usize = 33;
 const POINT_LEN: usize = 33;
@@ -85,6 +85,47 @@ pub fn decode(bytes: &[u8]) -> Result<Payload, DecodeError> {
     Ok(Payload { did, outputs })
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EncodeError {
+    NoOutputs,
+    /// The output count is one byte.
+    TooManyOutputs,
+    ZeroAmount,
+}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EncodeError::NoOutputs => write!(f, "payload has no outputs"),
+            EncodeError::TooManyOutputs => write!(f, "payload has more than 255 outputs"),
+            EncodeError::ZeroAmount => write!(f, "an output has amount zero"),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+/// Write a payload in the wire format (the plaintext, before encryption). The
+/// wallet uses this, and `decode` reads it back.
+pub fn encode(payload: &Payload) -> Result<Vec<u8>, EncodeError> {
+    if payload.outputs.is_empty() {
+        return Err(EncodeError::NoOutputs);
+    }
+    let count = u8::try_from(payload.outputs.len()).map_err(|_| EncodeError::TooManyOutputs)?;
+    let mut out = Vec::with_capacity(2 + DID_LEN + payload.outputs.len() * (8 + POINT_LEN));
+    out.push(DID_LEN as u8);
+    out.extend_from_slice(&payload.did);
+    out.push(count);
+    for output in &payload.outputs {
+        if output.amount.units == 0 {
+            return Err(EncodeError::ZeroAmount);
+        }
+        out.extend_from_slice(&output.amount.units.to_be_bytes());
+        out.extend_from_slice(&output.blind_nonce.0.serialize());
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +167,31 @@ mod tests {
             out.extend_from_slice(&output.blind_nonce.0.serialize());
         }
         out
+    }
+
+    #[test]
+    fn the_public_encode_reproduces_the_known_answer_and_round_trips() {
+        let bytes = super::encode(&sample()).unwrap();
+        assert_eq!(hex::encode(&bytes), KAT_PLAINTEXT_HEX);
+        assert_eq!(decode(&bytes), Ok(sample()));
+    }
+
+    #[test]
+    fn the_public_encode_refuses_what_decode_would_refuse() {
+        let none = Payload { did: did(7), outputs: vec![] };
+        assert_eq!(super::encode(&none), Err(EncodeError::NoOutputs));
+        let zero = Payload { did: did(7), outputs: vec![output(0, POINT_3G)] };
+        assert_eq!(super::encode(&zero), Err(EncodeError::ZeroAmount));
+        let many = Payload {
+            did: did(7),
+            outputs: (0..256).map(|_| output(1, POINT_3G)).collect(),
+        };
+        assert_eq!(super::encode(&many), Err(EncodeError::TooManyOutputs));
+        let max = Payload {
+            did: did(7),
+            outputs: (0..255).map(|_| output(1, POINT_3G)).collect(),
+        };
+        assert_eq!(super::encode(&max).unwrap().len(), 35 + 41 * 255);
     }
 
     #[test]

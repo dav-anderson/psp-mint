@@ -110,17 +110,21 @@ pub fn describe(received: &Received, settlement: &Settlement) -> Vec<String> {
                 ));
             }
             if issue.credit_cents > 0 {
-                // The JAMJAR message asking the payer's DID for a new request
+                // The AIR message asking the payer's DID for a new request
                 // is not built yet. The credit is only recorded.
                 lines.push(format!(
-                    "  overpaid by 10% or more: credit {} USD recorded (JAMJAR message to the payer not built)",
+                    "  overpaid by 10% or more: credit {} USD recorded (AIR message to the payer not built)",
                     cents_text(issue.credit_cents)
                 ));
             }
-            for result in &issue.results {
+            // "signature <blind nonce> <signature>", so the payer can pair each
+            // signature with the output it blinded.
+            for (blind_nonce, result) in issue.blind_nonces.iter().zip(&issue.results) {
                 match result {
-                    Ok(signature) => lines.push(format!("  signature {}", signature.0)),
-                    Err(e) => lines.push(format!("  not issued: {e}")),
+                    Ok(signature) => {
+                        lines.push(format!("  signature {} {}", blind_nonce.0, signature.0))
+                    }
+                    Err(e) => lines.push(format!("  not issued: {blind_nonce:?}: {e}")),
                 }
             }
         }
@@ -243,6 +247,52 @@ mod tests {
     }
 
     #[test]
+    fn sealed_payments_settle_and_payments_sealed_to_another_key_leave_no_trace() {
+        use crate::seal;
+        use air::names::secp256k1::SecretKey;
+
+        let (logic, mut records, dir) = fixture("sealed");
+        let mint = SecretKey::new();
+        let other = SecretKey::new();
+        let plain = hex::decode(PAYLOAD_HEX).unwrap();
+        // first seen with 6 confirmations, so it locks and settles in one run
+        let mut ours = received("ours", 6);
+        ours.payload = Some(seal::encrypt(&mint.public_key(), &plain).unwrap());
+        let mut theirs = received("theirs", 6);
+        theirs.payload = Some(seal::encrypt(&other.public_key(), &plain).unwrap());
+        let mut cleartext = received("cleartext", 6);
+        cleartext.payload = Some(plain.clone());
+
+        let (found, dropped) = seal::open_payloads(&mint, vec![ours, theirs, cleartext]);
+        assert_eq!(dropped, 2);
+
+        let mut asked = 0;
+        run_once(
+            &logic,
+            &mut records,
+            &found,
+            &mut || {
+                asked += 1;
+                Ok(BTC_100K)
+            },
+            &mut |_, _| {},
+        )
+        .unwrap();
+
+        // only the payment sealed to this mint was priced, recorded and issued
+        assert_eq!(asked, 1);
+        assert_eq!(records.get("ours").unwrap().status, Status::Issued);
+        assert!(records.get("theirs").is_none());
+        assert!(records.get("cleartext").is_none());
+        assert_eq!(
+            logic.lock().unwrap().audit_totals().unwrap().0,
+            Amount::from_units(5)
+        );
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn describe_lists_signatures_and_the_over_under() {
         let (logic, mut records, dir) = fixture("describe");
         let r = received("aa", 6);
@@ -257,7 +307,16 @@ mod tests {
         .unwrap();
         assert_eq!(lines[0], "aa confirmations=6 value_sats=5000");
         assert_eq!(lines[1], "  over/under: 0 bps");
-        assert_eq!(lines.iter().filter(|l| l.starts_with("  signature ")).count(), 2);
+        let signature_lines: Vec<&String> =
+            lines.iter().filter(|l| l.starts_with("  signature ")).collect();
+        assert_eq!(signature_lines.len(), 2);
+        // each line is the blind nonce then the signature, both 33-byte points
+        for line in signature_lines {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(parts.len(), 3);
+            assert_eq!(parts[1].len(), 66);
+            assert_eq!(parts[2].len(), 66);
+        }
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }

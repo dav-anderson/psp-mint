@@ -17,7 +17,7 @@
 //! Not mounted, on purpose:
 //!
 //! - `/admin/issue`: the PSP issues only from confirmed BTC payments.
-//! - `/swap`: PSP to FSP is out of scope, and pints are not exchanged peer to
+//! - `/swap`: PSP to FSP is out of scope, and Service Points are not exchanged peer to
 //!   peer.
 //!
 //! There is no authentication and no TLS. A note authorizes its own spend, so a
