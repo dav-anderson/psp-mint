@@ -7,11 +7,18 @@ use secp256k1::PublicKey;
 /// mint treats it as opaque bytes and does not check that it is a curve point.
 pub const DID_LEN: usize = 33;
 const POINT_LEN: usize = 33;
+/// A keyset ID on the wire: 8 bytes.
+pub const KEYSET_LEN: usize = 8;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Payload {
     pub did: [u8; DID_LEN],
     pub outputs: Vec<MintOutput>,
+    /// The keyset the outputs were blinded for (`GET /keysets`), as 16 hex
+    /// characters; 8 bytes after the outputs on the wire. Optional, so older
+    /// payloads still decode. The mint signs a claim with its current keyset
+    /// and prints that keyset's ID with the signatures.
+    pub keyset: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -57,7 +64,9 @@ pub fn decode(bytes: &[u8]) -> Result<Payload, DecodeError> {
     if reply_len != DID_LEN {
         return Err(DecodeError::WrongReplyLength);
     }
-    let did: [u8; DID_LEN] = take(&mut rest, DID_LEN)?.try_into().expect("length checked");
+    let did: [u8; DID_LEN] = take(&mut rest, DID_LEN)?
+        .try_into()
+        .expect("length checked");
 
     let count = take(&mut rest, 1)?[0];
     if count == 0 {
@@ -79,10 +88,16 @@ pub fn decode(bytes: &[u8]) -> Result<Payload, DecodeError> {
         });
     }
 
-    if !rest.is_empty() {
-        return Err(DecodeError::TrailingBytes);
-    }
-    Ok(Payload { did, outputs })
+    let keyset = match rest.len() {
+        0 => None,
+        KEYSET_LEN => Some(hex::encode(rest)),
+        _ => return Err(DecodeError::TrailingBytes),
+    };
+    Ok(Payload {
+        did,
+        outputs,
+        keyset,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -91,6 +106,8 @@ pub enum EncodeError {
     /// The output count is one byte.
     TooManyOutputs,
     ZeroAmount,
+    /// The keyset is not 16 hex characters.
+    BadKeyset,
 }
 
 impl fmt::Display for EncodeError {
@@ -99,6 +116,7 @@ impl fmt::Display for EncodeError {
             EncodeError::NoOutputs => write!(f, "payload has no outputs"),
             EncodeError::TooManyOutputs => write!(f, "payload has more than 255 outputs"),
             EncodeError::ZeroAmount => write!(f, "an output has amount zero"),
+            EncodeError::BadKeyset => write!(f, "the keyset is not 16 hex characters"),
         }
     }
 }
@@ -122,6 +140,12 @@ pub fn encode(payload: &Payload) -> Result<Vec<u8>, EncodeError> {
         }
         out.extend_from_slice(&output.amount.units.to_be_bytes());
         out.extend_from_slice(&output.blind_nonce.0.serialize());
+    }
+    if let Some(k) = &payload.keyset {
+        match hex::decode(k) {
+            Ok(b) if b.len() == KEYSET_LEN => out.extend_from_slice(&b),
+            _ => return Err(EncodeError::BadKeyset),
+        }
     }
     Ok(out)
 }
@@ -151,8 +175,23 @@ mod tests {
         [byte; DID_LEN]
     }
 
+    #[test]
+    fn a_keyset_after_the_outputs_round_trips_and_other_trailing_bytes_do_not() {
+        let mut p = sample();
+        p.keyset = Some("0123456789abcdef".into());
+        let bytes = super::encode(&p).unwrap();
+        assert_eq!(decode(&bytes).unwrap(), p);
+        assert_eq!(
+            decode(&bytes[..bytes.len() - 1]),
+            Err(DecodeError::TrailingBytes)
+        );
+        p.keyset = Some("zz".into());
+        assert_eq!(super::encode(&p), Err(EncodeError::BadKeyset));
+    }
+
     fn sample() -> Payload {
         Payload {
+            keyset: None,
             did: hex::decode(DID_HEX).unwrap().try_into().unwrap(),
             outputs: vec![output(4, POINT_3G), output(1, POINT_5G)],
         }
@@ -178,16 +217,26 @@ mod tests {
 
     #[test]
     fn the_public_encode_refuses_what_decode_would_refuse() {
-        let none = Payload { did: did(7), outputs: vec![] };
+        let none = Payload {
+            keyset: None,
+            did: did(7),
+            outputs: vec![],
+        };
         assert_eq!(super::encode(&none), Err(EncodeError::NoOutputs));
-        let zero = Payload { did: did(7), outputs: vec![output(0, POINT_3G)] };
+        let zero = Payload {
+            keyset: None,
+            did: did(7),
+            outputs: vec![output(0, POINT_3G)],
+        };
         assert_eq!(super::encode(&zero), Err(EncodeError::ZeroAmount));
         let many = Payload {
+            keyset: None,
             did: did(7),
             outputs: (0..256).map(|_| output(1, POINT_3G)).collect(),
         };
         assert_eq!(super::encode(&many), Err(EncodeError::TooManyOutputs));
         let max = Payload {
+            keyset: None,
             did: did(7),
             outputs: (0..255).map(|_| output(1, POINT_3G)).collect(),
         };
@@ -208,6 +257,7 @@ mod tests {
     #[test]
     fn the_did_is_carried_through_unchecked() {
         let payload = Payload {
+            keyset: None,
             did: did(7),
             outputs: vec![output(1, POINT_3G)],
         };
@@ -232,6 +282,7 @@ mod tests {
     #[test]
     fn rejects_zero_amount() {
         let payload = Payload {
+            keyset: None,
             did: did(7),
             outputs: vec![output(0, POINT_3G)],
         };

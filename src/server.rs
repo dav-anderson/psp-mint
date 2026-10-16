@@ -1,6 +1,6 @@
 //! The PSP's HTTP API.
 //!
-//! The handlers are mint-server's, the same ones `mintd` uses, mounted over the
+//! Most handlers are mint-server's, the same ones `mintd` uses, mounted over the
 //! PSP's own `MintLogic` in the same process. One process owns the database, so
 //! the API and the payment scanner share the mint behind one mutex.
 //!
@@ -8,11 +8,21 @@
 //!
 //! - `GET /keys`: the public key for each denomination.
 //! - `POST /melt`: burn notes, bound to a memo that every input signs. The ESP
-//!   mint uses this to burn PSP in an exchange.
+//!   mint uses this to burn PSP in an exchange. This is the PSP's own handler,
+//!   which records the memo of each burn (see `melts`) and otherwise does what
+//!   mint-server's does.
+//! - `POST /burns`: for each nonce, whether it is spent and the memo it was burned
+//!   under. The ESP mint uses this to tell, on a retry, a note it burned itself
+//!   from a note that was burned by someone else.
 //! - `POST /check-state`: which nonces are spent.
 //! - `GET /audit`: issued, redeemed and outstanding totals.
 //! - `GET /health`: `200` while the scanner is keeping up and the mint lock is
 //!   sound, `503` otherwise, with the time of the last successful scan.
+//!
+//! Every route that takes a body has a ceiling (`server.*_max_request_bytes`,
+//! 1 MiB by default). A body over it is refused with `413` before it is
+//! parsed, with `error`, `code: "request_too_large"`, `size_bytes` (when the
+//! request said its size) and `limit_bytes`. Nothing is burned.
 //!
 //! Not mounted, on purpose:
 //!
@@ -28,13 +38,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::body::Body;
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use mint_core::MintLogic;
-use mint_server::api;
+use mint_server::api::{self, MeltRequest, MeltResponse};
 use mint_server::state::AppState;
+use mint_types::{Amount, MintInput, Nonce};
+use serde::{Deserialize, Serialize};
+
+use crate::melts::MeltLog;
+use crate::rotation::{RolloverError, RolloverRequest, Rollovers, Rotor};
+
+/// Key rotation, when the mint has it: the previous generation and the
+/// rollover answers. Always locked while holding the mint lock, so they
+/// cannot deadlock with each other or the burn memos.
+pub struct Rotating {
+    pub rotor: Mutex<Rotor>,
+    pub rollovers: Mutex<Rollovers>,
+}
+pub type SharedRotating = Arc<Rotating>;
+
+impl Rotating {
+    pub fn new(rotor: Rotor, rollovers: Rollovers) -> SharedRotating {
+        Arc::new(Rotating {
+            rotor: Mutex::new(rotor),
+            rollovers: Mutex::new(rollovers),
+        })
+    }
+}
+
+/// The burn memos, shared by the handlers. Lock order: the mint first, then this.
+pub type SharedMelts = Arc<Mutex<MeltLog>>;
 
 /// Wrap a mint for the API and the scanner to share.
 pub fn app_state(logic: MintLogic) -> Arc<AppState> {
@@ -63,6 +102,7 @@ pub struct Health {
     started: u64,
     last_scan: AtomicU64,
     stale_after_secs: u64,
+    network: Option<String>,
 }
 
 impl Health {
@@ -73,7 +113,23 @@ impl Health {
             started: now_secs(),
             last_scan: AtomicU64::new(0),
             stale_after_secs,
+            network: None,
         })
+    }
+
+    /// As [`Health::new`], for a mint on `network`. `/health` and `/audit` then
+    /// report it as `"network"`.
+    pub fn for_network(stale_after_secs: u64, network: &str) -> Arc<Self> {
+        Arc::new(Health {
+            started: now_secs(),
+            last_scan: AtomicU64::new(0),
+            stale_after_secs,
+            network: Some(network.to_string()),
+        })
+    }
+
+    pub fn network(&self) -> Option<&str> {
+        self.network.as_deref()
     }
 
     pub fn record_scan(&self) {
@@ -112,15 +168,16 @@ impl Health {
             "ok" | "starting" => StatusCode::OK,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
-        (
-            code,
-            serde_json::json!({
-                "status": status,
-                "last_scan_unix": last,
-                "seconds_since_last_scan": age,
-                "stale_after_secs": self.stale_after_secs,
-            }),
-        )
+        let mut body = serde_json::json!({
+            "status": status,
+            "last_scan_unix": last,
+            "seconds_since_last_scan": age,
+            "stale_after_secs": self.stale_after_secs,
+        });
+        if let Some(n) = &self.network {
+            body["network"] = serde_json::Value::String(n.clone());
+        }
+        (code, body)
     }
 }
 
@@ -147,16 +204,611 @@ async fn health_handler(
     (code, Json(body))
 }
 
-pub fn router(state: Arc<AppState>, health: Arc<Health>) -> Router {
+/// Add `"network"` to a JSON object reply (`/audit`), when the mint has one.
+async fn add_network(
+    State(network): State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    let Some(network) = network else {
+        return response;
+    };
+    let (mut parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("network".into(), serde_json::Value::String(network));
+            let text = serde_json::Value::Object(map).to_string();
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(text))
+        }
+        _ => Response::from_parts(parts, Body::from(bytes)),
+    }
+}
+
+/// Why a burn did not happen.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MeltFailure {
+    /// The mint refused the burn (`400`). Nothing was burned.
+    Rejected(String),
+    /// A fault, such as a failed write (`500`). A retry is safe.
+    Internal(String),
+}
+
+/// Burn `inputs` bound to `memo`, and keep the memo of the burn.
+///
+/// The memo is written, and synced, for every input that is not yet spent,
+/// before the mint burns anything. The caller holds the mint lock across the
+/// whole call, so no other burn can come between the record and the burn.
+pub fn melt_recording(
+    logic: &MintLogic,
+    log: &mut MeltLog,
+    inputs: &[MintInput],
+    memo: &str,
+) -> Result<Amount, MeltFailure> {
+    melt_recording_gens(logic, None, log, inputs, memo, &vec![false; inputs.len()])
+}
+
+/// [`melt_recording`] over the current generation and, when the mint rotates,
+/// the previous one. A melt whose notes are all current is mint-core's
+/// `melt`. One with notes of the previous set is checked whole first (each note
+/// against its own set and spent list, every spend signature over the one
+/// `melt_sighash`), then each note is burned in its own set.
+pub fn melt_recording_gens(
+    logic: &MintLogic,
+    previous: Option<(
+        &crate::rotation::GenKeys,
+        &crate::rotation::GenKeys,
+        &MintLogic,
+    )>,
+    log: &mut MeltLog,
+    inputs: &[MintInput],
+    memo: &str,
+    on_previous: &[bool],
+) -> Result<Amount, MeltFailure> {
+    let internal = |e: String| MeltFailure::Internal(e);
+    // Each input is on the generation its keyset names.
+    let in_prev: Vec<bool> = on_previous.to_vec();
+    let gen_of = |k: usize| {
+        if in_prev[k] {
+            previous.expect("checked").2
+        } else {
+            logic
+        }
+    };
+    let mut unspent = Vec::with_capacity(inputs.len());
+    for (k, input) in inputs.iter().enumerate() {
+        let nonce = input.note.nonce;
+        if !gen_of(k)
+            .is_spent(nonce)
+            .map_err(|e| internal(e.to_string()))?
+        {
+            unspent.push(nonce);
+        }
+    }
+    if !in_prev.iter().any(|p| *p) {
+        log.record(&unspent, memo)
+            .map_err(|e| internal(e.to_string()))?;
+        return logic
+            .melt(inputs, memo.as_bytes())
+            .map_err(|e| MeltFailure::Rejected(e.to_string()));
+    }
+    let (ckeys, pkeys, _) = previous.expect("some input is on it");
+    let sighash = mint_types::melt_sighash(inputs, memo.as_bytes());
+    let mut seen = std::collections::HashSet::new();
+    let mut total = Amount::ZERO;
+    for (k, input) in inputs.iter().enumerate() {
+        let g = gen_of(k);
+        g.verify_note(input)
+            .map_err(|e| MeltFailure::Rejected(e.to_string()))?;
+        g.verify_spend_authorization(input, sighash)
+            .map_err(|e| MeltFailure::Rejected(e.to_string()))?;
+        if !seen.insert(input.note.nonce) || !unspent.contains(&input.note.nonce) {
+            return Err(MeltFailure::Rejected(
+                mint_types::MintInputError::SpentCoin.to_string(),
+            ));
+        }
+        total += input.amount;
+    }
+    log.record(&unspent, memo)
+        .map_err(|e| internal(e.to_string()))?;
+    for (k, input) in inputs.iter().enumerate() {
+        let (g, keys) = if in_prev[k] {
+            (gen_of(k), pkeys)
+        } else {
+            (logic, ckeys)
+        };
+        let sk = keys.sk.get(&input.amount).ok_or_else(|| {
+            MeltFailure::Rejected(
+                mint_types::MintInputError::InvalidAmountTier(input.amount).to_string(),
+            )
+        })?;
+        g.redeem_with_key(sk, input, sighash)
+            .map_err(|e| MeltFailure::Rejected(e.to_string()))?;
+    }
+    Ok(total)
+}
+
+/// What the PSP says about one note.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Burn {
+    /// Whether the note is spent.
+    pub spent: bool,
+    /// The memo the note was burned under. `None` if it is not spent, or if it
+    /// was spent with no memo on record.
+    pub memo: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BurnsRequest {
+    pub nonces: Vec<Nonce>,
+}
+
+/// In the order of the request.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BurnsResponse {
+    pub burns: Vec<Burn>,
+}
+
+/// The state of each note, for `POST /burns`. The caller holds the mint lock.
+pub fn burns(logic: &MintLogic, log: &MeltLog, nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
+    burns_gens(logic, None, log, nonces)
+}
+
+/// Spent in the current or the previous set.
+fn spent_in(logic: &MintLogic, prev: Option<&MintLogic>, nonce: Nonce) -> Result<bool, String> {
+    Ok(logic.is_spent(nonce).map_err(|e| e.to_string())?
+        || match prev {
+            Some(p) => p.is_spent(nonce).map_err(|e| e.to_string())?,
+            None => false,
+        })
+}
+
+/// [`burns`] over both live generations.
+pub fn burns_gens(
+    logic: &MintLogic,
+    prev: Option<&MintLogic>,
+    log: &MeltLog,
+    nonces: &[Nonce],
+) -> Result<Vec<Burn>, String> {
+    nonces
+        .iter()
+        .map(|nonce| {
+            let spent = spent_in(logic, prev, *nonce)?;
+            let memo = if spent {
+                log.get(nonce).map(str::to_string)
+            } else {
+                None
+            };
+            Ok(Burn { spent, memo })
+        })
+        .collect()
+}
+
+type ApiFailure = (StatusCode, Json<serde_json::Value>);
+
+fn failure(status: StatusCode, message: impl ToString) -> ApiFailure {
+    (
+        status,
+        Json(serde_json::json!({ "error": message.to_string() })),
+    )
+}
+
+fn coded(status: StatusCode, code: &str, message: impl ToString) -> ApiFailure {
+    (
+        status,
+        Json(serde_json::json!({ "error": message.to_string(), "code": code })),
+    )
+}
+
+type MeltState = (Arc<AppState>, SharedMelts, Option<SharedRotating>);
+
+fn poisoned() -> ApiFailure {
+    failure(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the mint lock is poisoned",
+    )
+}
+
+/// Lock the rotor (after the mint) and rotate as far as the clock says.
+fn rotor_of<'a>(
+    rot: &'a Option<SharedRotating>,
+    logic: &mut MintLogic,
+) -> Result<Option<std::sync::MutexGuard<'a, Rotor>>, ApiFailure> {
+    let Some(rot) = rot else { return Ok(None) };
+    let mut g = rot.rotor.lock().map_err(|_| poisoned())?;
+    g.refresh(logic).map_err(|e| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("key rotation failed: {e}"),
+        )
+    })?;
+    Ok(Some(g))
+}
+
+/// `POST /melt`: mint-core's melt request plus the keyset of each input.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct PspMeltRequest {
+    #[serde(flatten)]
+    pub melt: MeltRequest,
+    /// The keyset each input note carries, in order. Each note is verified,
+    /// and looked up in the spent list, of the keyset it names.
+    #[serde(default)]
+    pub keysets: Vec<String>,
+}
+
+async fn melt_handler(
+    State((state, melts, rot)): State<MeltState>,
+    Json(req): Json<PspMeltRequest>,
+) -> Result<Json<MeltResponse>, ApiFailure> {
+    let PspMeltRequest { melt: req, keysets } = req;
+    let mut logic = state.logic.lock().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the mint lock is poisoned",
+        )
+    })?;
+    let mut log = melts.lock().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the burn memos lock is poisoned",
+        )
+    })?;
+    let rotor = rotor_of(&rot, &mut logic)?;
+    if keysets.len() != req.inputs.len() {
+        return Err(coded(
+            StatusCode::BAD_REQUEST,
+            "missing_keyset",
+            "every input needs its keyset (keysets, in order)",
+        ));
+    }
+    let mut on_previous = Vec::with_capacity(keysets.len());
+    for (i, k) in keysets.iter().enumerate() {
+        let side = match &rotor {
+            Some(r) => r.resolve(k).map_err(|e| {
+                coded(
+                    StatusCode::BAD_REQUEST,
+                    e.code(),
+                    e.why(&format!("input {i}")),
+                )
+            })?,
+            None if *k == crate::rotation::keyset_id(logic.public_keys()) => {
+                crate::rotation::Side::Current
+            }
+            None => {
+                let e = crate::rotation::KeysetError::Unknown(k.clone());
+                return Err(coded(
+                    StatusCode::BAD_REQUEST,
+                    e.code(),
+                    e.why(&format!("input {i}")),
+                ));
+            }
+        };
+        on_previous.push(side == crate::rotation::Side::Previous);
+    }
+    // A note a pending rollover holds is that rollover's to burn.
+    if let Some(r) = &rot {
+        let held = r.rollovers.lock().map_err(|_| poisoned())?.held_nonces("");
+        if let Some(i) = req
+            .inputs
+            .iter()
+            .position(|n| held.contains(&hex::encode(n.note.nonce.0.serialize())))
+        {
+            return Err(coded(
+                StatusCode::BAD_REQUEST,
+                "note_held",
+                format!("input {i} is held by an unfinished rollover. Nothing was burned"),
+            ));
+        }
+    }
+    let prev = rotor
+        .as_ref()
+        .and_then(|r| r.previous.as_ref().map(|(k, l)| (&r.current, k, l)));
+    match melt_recording_gens(&logic, prev, &mut log, &req.inputs, &req.memo, &on_previous) {
+        Ok(burned) => Ok(Json(MeltResponse { burned })),
+        Err(MeltFailure::Rejected(e)) => Err(failure(StatusCode::BAD_REQUEST, e)),
+        Err(MeltFailure::Internal(e)) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+async fn burns_handler(
+    State((state, melts, rot)): State<MeltState>,
+    Json(req): Json<BurnsRequest>,
+) -> Result<Json<BurnsResponse>, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the mint lock is poisoned",
+        )
+    })?;
+    let log = melts.lock().map_err(|_| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the burn memos lock is poisoned",
+        )
+    })?;
+    let rotor = rotor_of(&rot, &mut logic)?;
+    let prev = rotor
+        .as_ref()
+        .and_then(|r| r.previous.as_ref().map(|(_, l)| l));
+    burns_gens(&logic, prev, &log, &req.nonces)
+        .map(|burns| Json(BurnsResponse { burns }))
+        .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// The ceilings on request bodies, one for each route that takes a body
+/// (`server.*_max_request_bytes` in the config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub melt_bytes: usize,
+    pub burns_bytes: usize,
+    pub check_state_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        let bytes = crate::config::DEFAULT_MAX_REQUEST_BYTES;
+        Limits {
+            melt_bytes: bytes,
+            burns_bytes: bytes,
+            check_state_bytes: bytes,
+        }
+    }
+}
+
+/// The body of a `413`. Like every other error here it has `error`; it also has
+/// a `code` and the sizes, as the ESP mint's `413` does.
+fn too_large(size: Option<u64>, limit: usize) -> Response {
+    let said = match size {
+        Some(size) => format!("the request is {size} bytes"),
+        None => "the request is larger than the ceiling".to_string(),
+    };
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(serde_json::json!({
+            "error": format!(
+                "{said}, and this route accepts at most {limit} bytes. Nothing was parsed or burned"
+            ),
+            "code": "request_too_large",
+            "size_bytes": size,
+            "limit_bytes": limit as u64,
+        })),
+    )
+        .into_response()
+}
+
+/// Read a request body, but only up to `limit` bytes, before the handler parses
+/// it. A body that says it is too large is refused without reading any of it,
+/// and one that does not say is read only as far as the limit.
+async fn limit_body(State(limit): State<usize>, request: Request, next: Next) -> Response {
+    let declared = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|n| n > limit as u64) {
+        return too_large(declared, limit);
+    }
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.to_string().contains("length limit") => return too_large(None, limit),
+        Err(e) => {
+            return failure(
+                StatusCode::BAD_REQUEST,
+                format!("the body could not be read: {e}"),
+            )
+            .into_response();
+        }
+    };
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
+/// A route with its body ceiling in front of it. The ceiling also replaces
+/// axum's own default (2 MB) for the extractor behind it.
+fn limited<S: Clone + Send + Sync + 'static>(
+    route: MethodRouter<S>,
+    limit: usize,
+) -> MethodRouter<S> {
+    route
+        .layer(DefaultBodyLimit::max(limit))
+        .layer(middleware::from_fn_with_state(limit, limit_body))
+}
+
+type RotState = (Arc<AppState>, SharedRotating);
+
+async fn keys_handler(
+    State((state, rot)): State<RotState>,
+) -> Result<Json<api::KeysResponse>, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let rot = Some(rot);
+    let _r = rotor_of(&rot, &mut logic)?;
+    Ok(Json(api::KeysResponse {
+        keys: logic.public_keys().clone(),
+    }))
+}
+
+async fn check_state_handler(
+    State((state, rot)): State<RotState>,
+    Json(req): Json<api::CheckStateRequest>,
+) -> Result<Json<api::CheckStateResponse>, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let rot = Some(rot);
+    let rotor = rotor_of(&rot, &mut logic)?;
+    let prev = rotor
+        .as_ref()
+        .and_then(|r| r.previous.as_ref().map(|(_, l)| l));
+    let mut spent = Vec::with_capacity(req.nonces.len());
+    for n in req.nonces {
+        spent.push(
+            spent_in(&logic, prev, n).map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))?,
+        );
+    }
+    Ok(Json(api::CheckStateResponse { spent }))
+}
+
+/// Issued and redeemed over every generation, the deleted ones included.
+async fn audit_handler(
+    State((state, rot)): State<RotState>,
+) -> Result<Json<api::AuditResponse>, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let rot = Some(rot);
+    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
+    let int = |e| failure(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"));
+    let (mut i, mut d) = logic.audit_totals().map_err(int)?;
+    if let Some((_, p)) = &rotor.previous {
+        let (pi, pd) = p.audit_totals().map_err(int)?;
+        i += pi;
+        d += pd;
+    }
+    let (ri, rd) = rotor.retired_totals();
+    i += Amount::from_units(ri);
+    d += Amount::from_units(rd);
+    Ok(Json(api::AuditResponse {
+        issued: i,
+        redeemed: d,
+        outstanding: Amount::from_units(i.units.saturating_sub(d.units)),
+    }))
+}
+
+/// `GET /keysets`: every live keyset's public keys by ID, current and
+/// previous, as fsp-mint's `/keys` gives them. A wallet unblinds with the
+/// keys of the keyset named in a reply (or printed with claim signatures).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KeysetsResponse {
+    pub current: String,
+    pub previous: Option<String>,
+    pub keysets:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, secp256k1::PublicKey>>,
+}
+
+async fn keysets_handler(
+    State((state, rot)): State<RotState>,
+) -> Result<Json<KeysetsResponse>, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let rot = Some(rot);
+    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
+    let units = |pk: &std::collections::BTreeMap<Amount, secp256k1::PublicKey>| {
+        pk.iter().map(|(a, k)| (a.units, *k)).collect()
+    };
+    let mut keysets = std::collections::BTreeMap::new();
+    keysets.insert(rotor.current.id.clone(), units(&rotor.current.pk));
+    if let Some((k, _)) = &rotor.previous {
+        keysets.insert(k.id.clone(), units(&k.pk));
+    }
+    Ok(Json(KeysetsResponse {
+        current: rotor.current.id.clone(),
+        previous: rotor.previous.as_ref().map(|(k, _)| k.id.clone()),
+        keysets,
+    }))
+}
+
+/// `GET /rotation`: public and read-only, the same shape as fsp-mint's.
+async fn rotation_handler(
+    State((state, rot)): State<RotState>,
+) -> Result<Json<crate::rotation::RotationResponse>, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let rot = Some(rot);
+    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
+    Ok(Json(rotor.window()))
+}
+
+/// `POST /rollover`: move notes of the previous (or current) keyset to fresh
+/// notes of the same amounts on the current keyset. Stored by request hash.
+async fn rollover_handler(
+    State((state, rot)): State<RotState>,
+    Json(req): Json<RolloverRequest>,
+) -> Result<Json<crate::rotation::RolloverResponse>, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let r2 = Some(Arc::clone(&rot));
+    let rotor = rotor_of(&r2, &mut logic)?.expect("rotating");
+    let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
+    match crate::rotation::rollover(&logic, &rotor, &mut store, &req) {
+        Ok(a) => Ok(Json(a)),
+        Err(RolloverError::Refused(e)) => Err(coded(StatusCode::BAD_REQUEST, "refused", e)),
+        Err(RolloverError::Keyset(code, e)) => Err(coded(StatusCode::BAD_REQUEST, code, e)),
+        Err(RolloverError::Spent(i)) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("input {i}: the note is already spent"),
+                "code": "note_spent_elsewhere",
+                "spent": [i],
+            })),
+        )),
+        Err(RolloverError::Internal(e)) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+/// The API with the default ceilings.
+pub fn router(state: Arc<AppState>, health: Arc<Health>, melts: SharedMelts) -> Router {
+    router_with(state, health, melts, Limits::default())
+}
+
+pub fn router_with(
+    state: Arc<AppState>,
+    health: Arc<Health>,
+    melts: SharedMelts,
+    limits: Limits,
+) -> Router {
+    router_full(state, health, melts, limits, None)
+}
+
+/// The API, with key rotation when `rot` is given: then `/keys`,
+/// `/check-state` and `/audit` span both live key sets, and `GET /rotation`
+/// and `POST /rollover` are mounted.
+pub fn router_full(
+    state: Arc<AppState>,
+    health: Arc<Health>,
+    melts: SharedMelts,
+    limits: Limits,
+    rot: Option<SharedRotating>,
+) -> Router {
+    let audit_network = health.network().map(str::to_string);
     let health_routes = Router::new()
         .route("/health", get(health_handler))
         .with_state((Arc::clone(&state), health));
+    let melt_routes = Router::new()
+        .route("/melt", limited(post(melt_handler), limits.melt_bytes))
+        .route("/burns", limited(post(burns_handler), limits.burns_bytes))
+        .with_state((Arc::clone(&state), melts, rot.clone()));
+    if let Some(rot) = rot {
+        return Router::new()
+            .route("/keys", get(keys_handler))
+            .route("/rotation", get(rotation_handler))
+            .route("/keysets", get(keysets_handler))
+            .route(
+                "/rollover",
+                limited(post(rollover_handler), limits.melt_bytes),
+            )
+            .route(
+                "/check-state",
+                limited(post(check_state_handler), limits.check_state_bytes),
+            )
+            .route(
+                "/audit",
+                get(audit_handler)
+                    .layer(middleware::from_fn_with_state(audit_network, add_network)),
+            )
+            .with_state((Arc::clone(&state), rot))
+            .merge(melt_routes)
+            .merge(health_routes);
+    }
     Router::new()
         .route("/keys", get(api::get_keys))
-        .route("/melt", post(api::melt))
-        .route("/check-state", post(api::check_state))
-        .route("/audit", get(api::audit))
+        .route(
+            "/check-state",
+            limited(post(api::check_state), limits.check_state_bytes),
+        )
+        .route(
+            "/audit",
+            get(api::audit).layer(middleware::from_fn_with_state(audit_network, add_network)),
+        )
         .with_state(state)
+        .merge(melt_routes)
         .merge(health_routes)
 }
 

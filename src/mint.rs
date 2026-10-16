@@ -50,7 +50,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("psp-mint-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("psp-mint-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         dir
     }

@@ -52,14 +52,27 @@ pub struct Rpc {
     client: reqwest::blocking::Client,
 }
 
+/// How long one RPC call may take, in seconds.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
 pub fn parse_cookie(text: &str) -> Option<(&str, &str)> {
     text.trim().split_once(':')
 }
 
 impl Rpc {
     pub fn new(url: &str, user: &str, pass: &str) -> Result<Rpc, RpcError> {
+        Rpc::with_timeout(url, user, pass, DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// `new`, with each call allowed `timeout_secs`.
+    pub fn with_timeout(
+        url: &str,
+        user: &str,
+        pass: &str,
+        timeout_secs: u64,
+    ) -> Result<Rpc, RpcError> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()?;
         Ok(Rpc {
             url: url.to_string(),
@@ -70,12 +83,24 @@ impl Rpc {
     }
 
     pub fn from_cookie(url: &str, cookie_path: &Path) -> Result<Rpc, RpcError> {
+        Rpc::from_cookie_with_timeout(url, cookie_path, DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// `from_cookie`, with each call allowed `timeout_secs`.
+    pub fn from_cookie_with_timeout(
+        url: &str,
+        cookie_path: &Path,
+        timeout_secs: u64,
+    ) -> Result<Rpc, RpcError> {
         let text = fs::read_to_string(cookie_path)
             .map_err(|e| RpcError::Cookie(format!("{}: {e}", cookie_path.display())))?;
         let (user, pass) = parse_cookie(&text).ok_or_else(|| {
-            RpcError::Cookie(format!("{}: not in user:password form", cookie_path.display()))
+            RpcError::Cookie(format!(
+                "{}: not in user:password form",
+                cookie_path.display()
+            ))
         })?;
-        Rpc::new(url, user, pass)
+        Rpc::with_timeout(url, user, pass, timeout_secs)
     }
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {

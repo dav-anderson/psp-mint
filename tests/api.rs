@@ -2,21 +2,38 @@
 //! by the mint and unblinded the way a wallet would, then burned over HTTP.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mint_server::api::{
     AuditResponse, CheckStateRequest, CheckStateResponse, KeysResponse, MeltRequest, MeltResponse,
 };
 use mint_server::state::AppState;
-use psp_mint::server::{Health, fatal};
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
+use psp_mint::melts::MeltLog;
+use psp_mint::server::{Burn, BurnsRequest, BurnsResponse, Health, fatal};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 
 fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("psp-mint-api-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("psp-mint-api-{}-{name}", {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        format!(
+            "{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }));
     let _ = std::fs::remove_dir_all(&dir);
     dir
+}
+
+/// The melt with every input's keyset named (the mint's one keyset).
+fn ks(state: &AppState, melt: MeltRequest) -> psp_mint::server::PspMeltRequest {
+    let id = psp_mint::rotation::keyset_id(state.logic.lock().unwrap().public_keys());
+    psp_mint::server::PspMeltRequest {
+        keysets: vec![id; melt.inputs.len()],
+        melt,
+    }
 }
 
 async fn start(name: &str) -> (String, Arc<AppState>) {
@@ -25,12 +42,16 @@ async fn start(name: &str) -> (String, Arc<AppState>) {
 }
 
 async fn start_with_health(name: &str) -> (String, Arc<AppState>, Arc<Health>) {
-    let logic = psp_mint::mint::open(&scratch(name), Amount::from_units(1024)).unwrap();
+    let dir = scratch(name);
+    let logic = psp_mint::mint::open(&dir, Amount::from_units(1024)).unwrap();
     let state = psp_mint::server::app_state(logic);
+    let melts = Arc::new(Mutex::new(
+        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let health = Health::new(100);
-    let app = psp_mint::server::router(Arc::clone(&state), Arc::clone(&health));
+    let app = psp_mint::server::router(Arc::clone(&state), Arc::clone(&health), melts);
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -49,7 +70,8 @@ fn issued_note(state: &AppState, amount: Amount) -> (Note, Keypair) {
             blind_nonce: BlindNonce(blind_point),
         })
         .unwrap();
-    let signature = bdhke::unblind_message(&outcome.0, &blinding_key, &logic.public_keys()[&amount]);
+    let signature =
+        bdhke::unblind_message(&outcome.0, &blinding_key, &logic.public_keys()[&amount]);
     (Note { nonce, signature }, keypair)
 }
 
@@ -91,10 +113,13 @@ async fn a_note_can_be_burned_once_over_http() {
     let amount = Amount::from_units(4);
     let (note, keypair) = issued_note(&state, amount);
     let memo = "esp-mint exchange test";
-    let request = MeltRequest {
-        inputs: vec![melt_input(note, &keypair, amount, memo)],
-        memo: memo.to_string(),
-    };
+    let request = ks(
+        &state,
+        MeltRequest {
+            inputs: vec![melt_input(note, &keypair, amount, memo)],
+            memo: memo.to_string(),
+        },
+    );
 
     let melted: MeltResponse = http
         .post(format!("{base}/melt"))
@@ -149,10 +174,13 @@ async fn a_burn_is_bound_to_its_memo() {
     let amount = Amount::from_units(2);
     let (note, keypair) = issued_note(&state, amount);
     // signed for one memo, presented with another
-    let request = MeltRequest {
-        inputs: vec![melt_input(note, &keypair, amount, "the signed memo")],
-        memo: "a different memo".to_string(),
-    };
+    let request = ks(
+        &state,
+        MeltRequest {
+            inputs: vec![melt_input(note, &keypair, amount, "the signed memo")],
+            memo: "a different memo".to_string(),
+        },
+    );
     let response = http
         .post(format!("{base}/melt"))
         .json(&request)
@@ -169,16 +197,259 @@ async fn a_burn_is_bound_to_its_memo() {
     assert_eq!(audit.redeemed, Amount::ZERO);
 }
 
+async fn burns(base: &str, nonces: Vec<Nonce>) -> Vec<Burn> {
+    let response: BurnsResponse = reqwest::Client::new()
+        .post(format!("{base}/burns"))
+        .json(&BurnsRequest { nonces })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    response.burns
+}
+
+#[tokio::test]
+async fn a_burn_keeps_its_memo_and_burns_reports_it() {
+    let (base, state) = start("burn-memo").await;
+    let http = reqwest::Client::new();
+    let amount = Amount::from_units(4);
+    let (spent_note, spent_key) = issued_note(&state, amount);
+    let (fresh_note, _fresh_key) = issued_note(&state, amount);
+    let memo = "the exchange memo";
+    http.post(format!("{base}/melt"))
+        .json(&ks(
+            &state,
+            MeltRequest {
+                inputs: vec![melt_input(spent_note, &spent_key, amount, memo)],
+                memo: memo.to_string(),
+            },
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+
+    let reported = burns(&base, vec![spent_note.nonce, fresh_note.nonce]).await;
+    assert_eq!(
+        reported,
+        vec![
+            Burn {
+                spent: true,
+                memo: Some(memo.to_string())
+            },
+            Burn {
+                spent: false,
+                memo: None
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_burn_that_fails_leaves_the_note_unspent_and_without_a_memo() {
+    let (base, state) = start("burn-failed").await;
+    let amount = Amount::from_units(2);
+    let (note, _owner) = issued_note(&state, amount);
+    let thief = Keypair::new(&SECP256K1, &mut OsRng);
+    let response = reqwest::Client::new()
+        .post(format!("{base}/melt"))
+        .json(&ks(
+            &state,
+            MeltRequest {
+                inputs: vec![melt_input(note, &thief, amount, "thief memo")],
+                memo: "thief memo".to_string(),
+            },
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        burns(&base, vec![note.nonce]).await,
+        vec![Burn {
+            spent: false,
+            memo: None
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_second_burn_does_not_change_the_memo_on_record() {
+    // A holder tries to burn a note under a second memo after the first burn.
+    // The second is a double spend, and the memo on record stays the first.
+    let (base, state) = start("burn-relabel").await;
+    let http = reqwest::Client::new();
+    let amount = Amount::from_units(2);
+    let (note, keypair) = issued_note(&state, amount);
+    for (memo, expect_ok) in [("first", true), ("second", false)] {
+        let response = http
+            .post(format!("{base}/melt"))
+            .json(&ks(
+                &state,
+                MeltRequest {
+                    inputs: vec![melt_input(note, &keypair, amount, memo)],
+                    memo: memo.to_string(),
+                },
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().is_success(), expect_ok, "{memo}");
+    }
+    assert_eq!(
+        burns(&base, vec![note.nonce]).await,
+        vec![Burn {
+            spent: true,
+            memo: Some("first".to_string())
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_note_spent_with_no_memo_on_record_reports_spent_and_no_memo() {
+    // Spent some other way than through /melt, such as before the log existed.
+    let (base, state) = start("burn-unrecorded").await;
+    let amount = Amount::from_units(2);
+    let (note, keypair) = issued_note(&state, amount);
+    {
+        let logic = state.logic.lock().unwrap();
+        logic
+            .melt(&[melt_input(note, &keypair, amount, "direct")], b"direct")
+            .unwrap();
+    }
+    assert_eq!(
+        burns(&base, vec![note.nonce]).await,
+        vec![Burn {
+            spent: true,
+            memo: None
+        }]
+    );
+}
+
+#[tokio::test]
+async fn every_note_in_one_burn_is_recorded_under_the_one_memo() {
+    let (base, state) = start("burn-many").await;
+    let amount = Amount::from_units(2);
+    let (a, ka) = issued_note(&state, amount);
+    let (b, kb) = issued_note(&state, amount);
+    let memo = "two notes";
+    // both inputs sign over the whole input list, so sign the pair together
+    let unsigned = |note: Note| MintInput {
+        amount,
+        note,
+        spend_signature: secp256k1::schnorr::Signature::from_slice(&[0u8; 64]).unwrap(),
+    };
+    let mut inputs = vec![unsigned(a), unsigned(b)];
+    let sighash = melt_sighash(&inputs, memo.as_bytes());
+    inputs[0].spend_signature = SECP256K1.sign_schnorr(&sighash, &ka);
+    inputs[1].spend_signature = SECP256K1.sign_schnorr(&sighash, &kb);
+    reqwest::Client::new()
+        .post(format!("{base}/melt"))
+        .json(&ks(
+            &state,
+            MeltRequest {
+                inputs,
+                memo: memo.to_string(),
+            },
+        ))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let reported = burns(&base, vec![a.nonce, b.nonce]).await;
+    assert!(
+        reported
+            .iter()
+            .all(|r| r.spent && r.memo.as_deref() == Some(memo))
+    );
+}
+
+#[tokio::test]
+async fn one_spent_note_among_several_leaves_the_others_unburned() {
+    // mint-core's melt checks every input before it burns any; this holds the
+    // PSP to that: a melt of three notes, one already spent, burns nothing.
+    let (base, state) = start("burn-partial").await;
+    let http = reqwest::Client::new();
+    let amount = Amount::from_units(2);
+    let (a, ka) = issued_note(&state, amount);
+    let (b, kb) = issued_note(&state, amount);
+    let (c, kc) = issued_note(&state, amount);
+    let first = http
+        .post(format!("{base}/melt"))
+        .json(&ks(
+            &state,
+            MeltRequest {
+                inputs: vec![melt_input(a, &ka, amount, "first")],
+                memo: "first".to_string(),
+            },
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert!(first.status().is_success());
+    let memo = "all three";
+    let unsigned = |note: Note| MintInput {
+        amount,
+        note,
+        spend_signature: secp256k1::schnorr::Signature::from_slice(&[0u8; 64]).unwrap(),
+    };
+    let mut inputs = vec![unsigned(b), unsigned(a), unsigned(c)];
+    let sighash = melt_sighash(&inputs, memo.as_bytes());
+    inputs[0].spend_signature = SECP256K1.sign_schnorr(&sighash, &kb);
+    inputs[1].spend_signature = SECP256K1.sign_schnorr(&sighash, &ka);
+    inputs[2].spend_signature = SECP256K1.sign_schnorr(&sighash, &kc);
+    let all = http
+        .post(format!("{base}/melt"))
+        .json(&ks(
+            &state,
+            MeltRequest {
+                inputs,
+                memo: memo.to_string(),
+            },
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(all.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(
+        burns(&base, vec![a.nonce, b.nonce, c.nonce]).await,
+        vec![
+            Burn {
+                spent: true,
+                memo: Some("first".to_string())
+            },
+            Burn {
+                spent: false,
+                memo: None
+            },
+            Burn {
+                spent: false,
+                memo: None
+            },
+        ],
+        "only the first, separate burn happened"
+    );
+}
+
 #[tokio::test]
 async fn a_note_signed_by_someone_else_cannot_be_burned() {
     let (base, state) = start("thief").await;
     let amount = Amount::from_units(2);
     let (note, _owner) = issued_note(&state, amount);
     let thief = Keypair::new(&SECP256K1, &mut OsRng);
-    let request = MeltRequest {
-        inputs: vec![melt_input(note, &thief, amount, "memo")],
-        memo: "memo".to_string(),
-    };
+    let request = ks(
+        &state,
+        MeltRequest {
+            inputs: vec![melt_input(note, &thief, amount, "memo")],
+            memo: "memo".to_string(),
+        },
+    );
     let response = reqwest::Client::new()
         .post(format!("{base}/melt"))
         .json(&request)

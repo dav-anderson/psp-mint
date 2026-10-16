@@ -25,6 +25,8 @@ use serde::Deserialize;
 pub const DEFAULT_MAX_AGE_SECS: u64 = 120;
 /// 2%, in basis points.
 pub const DEFAULT_MAX_SPREAD_BPS: u64 = 200;
+/// How long one ticker request may take.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Config {
@@ -33,6 +35,8 @@ pub struct Config {
     /// With two usable quotes, wait if they differ by more than this many basis
     /// points of the lower one.
     pub max_spread_bps: u64,
+    /// How long one ticker request may take, in seconds.
+    pub timeout_secs: u64,
 }
 
 impl Default for Config {
@@ -40,6 +44,7 @@ impl Default for Config {
         Config {
             max_age_secs: DEFAULT_MAX_AGE_SECS,
             max_spread_bps: DEFAULT_MAX_SPREAD_BPS,
+            timeout_secs: DEFAULT_TIMEOUT_SECS,
         }
     }
 }
@@ -54,11 +59,19 @@ pub struct Quote {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Aggregate {
-    Price { cents: u64, sources: usize },
+    Price {
+        cents: u64,
+        sources: usize,
+    },
     /// Fewer than two usable prices. Do not issue on one feed.
-    TooFewSources { usable: usize },
+    TooFewSources {
+        usable: usize,
+    },
     /// Two usable prices that differ by more than the allowed spread.
-    Disagree { low: u64, high: u64 },
+    Disagree {
+        low: u64,
+        high: u64,
+    },
 }
 
 /// Pure combination rule over the usable (already filtered) prices.
@@ -198,7 +211,11 @@ pub fn parse_iso8601_utc(s: &str) -> Result<u64, String> {
     } else if b.len() != 20 {
         return Err(bad());
     }
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
     {
         return Err(bad());
     }
@@ -296,8 +313,13 @@ const SOURCES: [(&str, &str, Parser); 3] = [
 /// Fetch all three tickers. A failure of one source is reported for that source
 /// and does not stop the others.
 pub fn fetch_all() -> Vec<(&'static str, Result<Quote, String>)> {
+    fetch_all_with(DEFAULT_TIMEOUT_SECS)
+}
+
+/// `fetch_all` with each request allowed `timeout_secs`.
+pub fn fetch_all_with(timeout_secs: u64) -> Vec<(&'static str, Result<Quote, String>)> {
     let client = match Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(timeout_secs))
         .user_agent("psp-mint")
         .build()
     {
@@ -358,7 +380,13 @@ mod tests {
     fn three_prices_take_the_median() {
         for order in [[1, 2, 3], [3, 1, 2], [2, 3, 1]] {
             let v: Vec<u64> = order.iter().map(|x| x * 1_000_000).collect();
-            assert_eq!(p(&v), Aggregate::Price { cents: 2_000_000, sources: 3 });
+            assert_eq!(
+                p(&v),
+                Aggregate::Price {
+                    cents: 2_000_000,
+                    sources: 3
+                }
+            );
         }
     }
 
@@ -366,7 +394,10 @@ mod tests {
     fn three_prices_ignore_an_outlier_even_a_wild_one() {
         assert_eq!(
             p(&[8_000_000, 8_010_000, 1]),
-            Aggregate::Price { cents: 8_000_000, sources: 3 }
+            Aggregate::Price {
+                cents: 8_000_000,
+                sources: 3
+            }
         );
     }
 
@@ -374,11 +405,17 @@ mod tests {
     fn two_close_prices_are_averaged() {
         assert_eq!(
             p(&[8_000_000, 8_100_000]),
-            Aggregate::Price { cents: 8_050_000, sources: 2 }
+            Aggregate::Price {
+                cents: 8_050_000,
+                sources: 2
+            }
         );
         assert_eq!(
             p(&[8_100_001, 8_000_000]),
-            Aggregate::Price { cents: 8_050_000, sources: 2 }
+            Aggregate::Price {
+                cents: 8_050_000,
+                sources: 2
+            }
         );
     }
 
@@ -387,7 +424,10 @@ mod tests {
         // 2% of 10_000_000 is 200_000
         assert_eq!(
             p(&[10_000_000, 10_200_000]),
-            Aggregate::Price { cents: 10_100_000, sources: 2 }
+            Aggregate::Price {
+                cents: 10_100_000,
+                sources: 2
+            }
         );
     }
 
@@ -395,7 +435,10 @@ mod tests {
     fn two_prices_over_two_percent_apart_wait() {
         assert_eq!(
             p(&[10_000_000, 10_200_001]),
-            Aggregate::Disagree { low: 10_000_000, high: 10_200_001 }
+            Aggregate::Disagree {
+                low: 10_000_000,
+                high: 10_200_001
+            }
         );
     }
 
@@ -403,11 +446,17 @@ mod tests {
     fn the_spread_limit_is_configurable() {
         assert_eq!(
             aggregate(&[10_000_000, 10_100_000], 50),
-            Aggregate::Disagree { low: 10_000_000, high: 10_100_000 }
+            Aggregate::Disagree {
+                low: 10_000_000,
+                high: 10_100_000
+            }
         );
         assert_eq!(
             aggregate(&[10_000_000, 10_100_000], 100),
-            Aggregate::Price { cents: 10_050_000, sources: 2 }
+            Aggregate::Price {
+                cents: 10_050_000,
+                sources: 2
+            }
         );
     }
 
@@ -421,7 +470,10 @@ mod tests {
     fn large_prices_do_not_overflow() {
         assert_eq!(
             aggregate(&[u64::MAX, u64::MAX - 1], DEFAULT_MAX_SPREAD_BPS),
-            Aggregate::Price { cents: u64::MAX - 1, sources: 2 }
+            Aggregate::Price {
+                cents: u64::MAX - 1,
+                sources: 2
+            }
         );
     }
 
@@ -490,7 +542,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_decimal_strings() {
-        for s in ["", ".5", "-1.00", "+1.00", "1e5", "1,000.00", "abc", "1.2.3", "0", "0.00", " 1", "1.0x"] {
+        for s in [
+            "", ".5", "-1.00", "+1.00", "1e5", "1,000.00", "abc", "1.2.3", "0", "0.00", " 1",
+            "1.0x",
+        ] {
             assert!(parse_cents(s).is_err(), "{s:?} was accepted");
         }
         assert!(parse_cents("99999999999999999999.00").is_err());
@@ -501,8 +556,14 @@ mod tests {
     fn parses_iso8601_with_any_fraction_length() {
         // 2026-10-14T17:09:14Z is unix 1791997754
         assert_eq!(parse_iso8601_utc("2026-10-14T17:09:14Z"), Ok(1_791_997_754));
-        assert_eq!(parse_iso8601_utc("2026-10-14T17:09:14.4Z"), Ok(1_791_997_754));
-        assert_eq!(parse_iso8601_utc("2026-10-14T17:09:14.493778Z"), Ok(1_791_997_754));
+        assert_eq!(
+            parse_iso8601_utc("2026-10-14T17:09:14.4Z"),
+            Ok(1_791_997_754)
+        );
+        assert_eq!(
+            parse_iso8601_utc("2026-10-14T17:09:14.493778Z"),
+            Ok(1_791_997_754)
+        );
         assert_eq!(
             parse_iso8601_utc("2026-10-14T17:09:14.493778247Z"),
             Ok(1_791_997_754)
@@ -538,15 +599,24 @@ mod tests {
     fn parses_the_three_tickers() {
         assert_eq!(
             parse_coinbase(COINBASE_BODY),
-            Ok(Quote { cents: 8_167_355, observed_at: 1_791_997_754 })
+            Ok(Quote {
+                cents: 8_167_355,
+                observed_at: 1_791_997_754
+            })
         );
         assert_eq!(
             parse_bitstamp(BITSTAMP_BODY),
-            Ok(Quote { cents: 8_167_012, observed_at: 1_791_997_755 })
+            Ok(Quote {
+                cents: 8_167_012,
+                observed_at: 1_791_997_755
+            })
         );
         assert_eq!(
             parse_gemini(GEMINI_BODY),
-            Ok(Quote { cents: 8_167_000, observed_at: 1_791_997_740 })
+            Ok(Quote {
+                cents: 8_167_000,
+                observed_at: 1_791_997_740
+            })
         );
     }
 

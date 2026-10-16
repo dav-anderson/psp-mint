@@ -152,7 +152,14 @@ mod tests {
     }
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("psp-mint-seal-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("psp-mint-seal-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -213,7 +220,10 @@ mod tests {
         for i in 0..sealed.len() {
             let mut bad = sealed.clone();
             bad[i] ^= 0x01;
-            assert!(decrypt(&mint, &bad).is_err(), "byte {i} changed but it opened");
+            assert!(
+                decrypt(&mint, &bad).is_err(),
+                "byte {i} changed but it opened"
+            );
         }
     }
 
@@ -269,7 +279,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         // a reloaded key opens what was sealed to the first
         let sealed = encrypt(&first.public_key(), b"hello").unwrap();

@@ -48,6 +48,13 @@ pub enum Status {
     Issued,
     /// Settled and nothing was signed.
     Rejected,
+    /// Paid, but short of the request by more than the reconciliation target
+    /// allows, so nothing was signed and the BTC is held. Kept under the
+    /// payment and the payer's DID until the payer answers with a new request
+    /// over AIR. That AIR exchange is not built yet, so today the record just
+    /// waits. It is never deleted automatically (see the README, "Underpayment").
+    #[serde(rename = "paid_unsettled")]
+    PaidUnsettled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,13 +73,29 @@ pub struct Record {
     /// True if the payment was first seen with more than 1 confirmation, so the
     /// lock was taken later than intended.
     pub late: bool,
-    /// Requested PSP units that were not signed because of a large underpayment.
-    /// The mint keeps that value.
+    /// Requested PSP units that were not signed because the payment was short
+    /// (the smallest outputs are dropped first). For `paid_unsettled` it is the
+    /// whole request.
     pub skipped_units: u64,
-    /// Overpayment of 10% or more, in USD cents, owed back to the payer.
+    /// Overpayment beyond `settle.payment_reconciliation_target`, in USD cents,
+    /// owed back to the payer's DID. An overpayment within the target is kept by
+    /// the mint and leaves this at 0.
     pub credit_cents: u64,
-    /// Why nothing was signed, when status is rejected.
+    /// Why nothing was signed, when status is rejected or paid_unsettled.
     pub reason: Option<String>,
+    /// The payer's AIR DID from the payload (66 hex characters), once the
+    /// payload has been read. Together with the txid it keys a credit or an
+    /// unsettled payment. Absent on records made before this field existed and
+    /// on payments whose payload could not be read.
+    #[serde(default)]
+    pub payer_did: Option<String>,
+    /// PSP units the payload asked for. 0 when there was no readable payload.
+    #[serde(default)]
+    pub requested_units: u64,
+    /// What the payment was worth in sats. Kept so a new request over AIR can
+    /// later be checked against what was actually paid. 0 on older records.
+    #[serde(default)]
+    pub value_sats: u64,
 }
 
 impl Record {
@@ -86,6 +109,9 @@ impl Record {
             skipped_units: 0,
             credit_cents: 0,
             reason: None,
+            payer_did: None,
+            requested_units: 0,
+            value_sats: 0,
         }
     }
 }
@@ -130,6 +156,9 @@ impl Records {
                 skipped_units: 0,
                 credit_cents: 0,
                 reason: Some("imported from processed_txids.json".to_string()),
+                payer_did: None,
+                requested_units: 0,
+                value_sats: 0,
             });
         }
         if next.len() != records.rows.len() {
@@ -141,6 +170,31 @@ impl Records {
 
     pub fn get(&self, txid: &str) -> Option<&Record> {
         self.rows.get(txid)
+    }
+
+    /// The txids of payments whose price is locked and that are not settled
+    /// yet. The scan looks at these again every time.
+    pub fn unsettled(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|(_, r)| r.status == Status::Locked && !r.issued)
+            .map(|(txid, _)| txid.clone())
+            .collect()
+    }
+
+    /// What the mint still owes one payer DID: every payment of theirs that
+    /// holds a credit or is paid but unsettled, as (txid, record), by txid.
+    /// Both kinds stay here until the AIR exchange that settles them exists;
+    /// nothing deletes them.
+    pub fn owed_to(&self, payer_did: &str) -> Vec<(&str, &Record)> {
+        self.rows
+            .iter()
+            .filter(|(_, r)| {
+                r.payer_did.as_deref() == Some(payer_did)
+                    && (r.credit_cents > 0 || r.status == Status::PaidUnsettled)
+            })
+            .map(|(txid, r)| (txid.as_str(), r))
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -184,7 +238,14 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("psp-mint-rec-{}-{name}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("psp-mint-rec-{}-{name}", {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "{}-{}",
+                std::process::id(),
+                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            )
+        }));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -238,11 +299,69 @@ mod tests {
     }
 
     #[test]
+    fn a_record_from_before_the_payer_fields_still_opens() {
+        let dir = scratch("old-format");
+        let path = dir.join("settlements.json");
+        fs::write(
+            &path,
+            r#"{"aa": {"locked_price_cents": 9, "issued": true, "over_under_bps": 5,
+                "status": "issued", "late": false, "skipped_units": 0,
+                "credit_cents": 0, "reason": null}}"#,
+        )
+        .unwrap();
+        let r = Records::open(&path).unwrap();
+        let rec = r.get("aa").unwrap();
+        assert_eq!(rec.payer_did, None);
+        assert_eq!(rec.requested_units, 0);
+        assert_eq!(rec.value_sats, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn owed_to_lists_credits_and_unsettled_payments_of_one_did_only() {
+        let dir = scratch("owed");
+        let path = dir.join("settlements.json");
+        let mut r = Records::open(&path).unwrap();
+        let mut credit = Record::locked(1, false);
+        credit.status = Status::Issued;
+        credit.issued = true;
+        credit.credit_cents = 50;
+        credit.payer_did = Some("aa".repeat(33));
+        r.put("t1", credit).unwrap();
+        let mut held = Record::locked(1, false);
+        held.status = Status::PaidUnsettled;
+        held.payer_did = Some("aa".repeat(33));
+        r.put("t2", held).unwrap();
+        let mut plain = Record::locked(1, false);
+        plain.status = Status::Issued;
+        plain.issued = true;
+        plain.payer_did = Some("aa".repeat(33));
+        r.put("t3", plain).unwrap();
+        let mut other = Record::locked(1, false);
+        other.status = Status::PaidUnsettled;
+        other.payer_did = Some("bb".repeat(33));
+        r.put("t4", other).unwrap();
+        let owed: Vec<&str> = r
+            .owed_to(&"aa".repeat(33))
+            .into_iter()
+            .map(|(txid, _)| txid)
+            .collect();
+        assert_eq!(owed, vec!["t1", "t2"]);
+        let value: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(value["t2"]["status"], "paid_unsettled");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn corrupt_file_is_an_error_not_an_empty_store() {
         let dir = scratch("corrupt");
         let path = dir.join("settlements.json");
         fs::write(&path, "not json").unwrap();
-        assert!(matches!(Records::open(&path), Err(RecordsError::Corrupt(_))));
+        assert!(matches!(
+            Records::open(&path),
+            Err(RecordsError::Corrupt(_))
+        ));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -284,7 +403,11 @@ mod tests {
         let dir = scratch("legacy-none");
         let path = dir.join("settlements.json");
         let legacy = dir.join("processed_txids.json");
-        assert!(Records::open_with_legacy(&path, &legacy).unwrap().is_empty());
+        assert!(
+            Records::open_with_legacy(&path, &legacy)
+                .unwrap()
+                .is_empty()
+        );
         assert!(!path.exists());
         fs::write(&legacy, "nope").unwrap();
         assert!(Records::open_with_legacy(&path, &legacy).is_err());
