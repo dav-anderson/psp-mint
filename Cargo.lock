@@ -1416,7 +1416,7 @@ dependencies = [
 
 [[package]]
 name = "psp-mint"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "axum",
  "bdhke",
@@ -2084,8 +2084,8 @@ dependencies = [
 
 [[package]]
 name = "sp-wire"
-version = "0.2.0"
-source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.2.0#56c7f67c1d803911d07540d139e7710177c88266"
+version = "0.3.0"
+source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.3.0#6670c69e0ea42a86f0f32c1ea9e627f66b5b201e"
 dependencies = [
  "air",
  "hex",

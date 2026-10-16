@@ -176,8 +176,9 @@ impl Settings {
         let price_config = cfg.price();
         let terms = cfg.terms();
         let mut price = Lazy::new(|| service::btc_usd_cents(price_config));
-        service::run_once_with(
+        service::run_once_rotating(
             &state.logic,
+            Some(&**rot),
             records,
             &found,
             &mut || price.get(),

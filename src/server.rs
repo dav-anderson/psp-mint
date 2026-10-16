@@ -515,11 +515,14 @@ async fn burns_handler(
 }
 
 /// The ceilings on request bodies, one for each route that takes a body
-/// (`server.*_max_request_bytes` in the config).
+/// (`server.*_max_request_bytes` in the config), and the most notes in one
+/// rollover (`rollover.max_items`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub melt_bytes: usize,
     pub burns_bytes: usize,
+    pub rollover_bytes: usize,
+    pub rollover_notes: usize,
     pub check_state_bytes: usize,
 }
 
@@ -529,6 +532,8 @@ impl Default for Limits {
         Limits {
             melt_bytes: bytes,
             burns_bytes: bytes,
+            rollover_bytes: bytes,
+            rollover_notes: sp_wire::psp::MAX_ROLLOVER_NOTES,
             check_state_bytes: bytes,
         }
     }
@@ -686,12 +691,13 @@ async fn rotation_handler(
 async fn rollover_handler(
     State((state, rot)): State<RotState>,
     Json(req): Json<RolloverRequest>,
+    max_notes: usize,
 ) -> Result<Json<crate::rotation::RolloverResponse>, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let r2 = Some(Arc::clone(&rot));
     let rotor = rotor_of(&r2, &mut logic)?.expect("rotating");
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
-    match crate::rotation::rollover(&logic, &rotor, &mut store, &req) {
+    match crate::rotation::rollover(&logic, &rotor, &mut store, &req, max_notes) {
         Ok(a) => Ok(Json(a)),
         Err(RolloverError::Refused(e)) => Err(coded(StatusCode::BAD_REQUEST, "refused", e)),
         Err(RolloverError::Keyset(code, e)) => Err(coded(StatusCode::BAD_REQUEST, code, e)),
@@ -746,7 +752,12 @@ pub fn router_full(
             .route("/keysets", get(keysets_handler))
             .route(
                 "/rollover",
-                limited(post(rollover_handler), limits.melt_bytes),
+                limited(
+                    post(move |state: State<RotState>, req: Json<RolloverRequest>| {
+                        rollover_handler(state, req, limits.rollover_notes)
+                    }),
+                    limits.rollover_bytes,
+                ),
             )
             .route(
                 "/check-state",

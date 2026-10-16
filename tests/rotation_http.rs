@@ -40,6 +40,10 @@ struct Mint {
 }
 
 async fn start(dir: &PathBuf, clock: u64) -> Mint {
+    start_with(dir, clock, Default::default()).await
+}
+
+async fn start_with(dir: &PathBuf, clock: u64, limits: psp_mint::server::Limits) -> Mint {
     let (rotor, logic) = Rotor::open_at(dir, Amount::from_units(1024), 1, 1, clock).unwrap();
     let rot = Rotating::new(rotor, Rollovers::open(dir).unwrap());
     let state = psp_mint::server::app_state(logic);
@@ -52,7 +56,7 @@ async fn start(dir: &PathBuf, clock: u64) -> Mint {
         Arc::clone(&state),
         Health::new(100),
         melts,
-        Default::default(),
+        limits,
         Some(Arc::clone(&rot)),
     );
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -274,29 +278,39 @@ async fn rotation_keeps_previous_notes_for_one_period_then_they_are_lost() {
     let (late, _, _) = rollover(&c, one, &id0, &id2);
     let (code, body) = m.post("/rollover", &late).await;
     assert_eq!((code, body["code"].as_str()), (400, Some("keyset_retired")));
-    // Outputs asked of the previous set (now `id1`) are refused: new signing
-    // is by the current set only, and the error names it.
-    let (prev_out, _, _) = rollover(&fresh, one, &id1, &id1);
-    let (code, body) = m.post("/rollover", &prev_out).await;
+    // Outputs asked of a retired set are refused, and of an unknown one, before
+    // anything is burned.
+    let (gone_out, _, _) = rollover(&fresh, one, &id1, &id0);
+    let (code, body) = m.post("/rollover", &gone_out).await;
     assert_eq!(
         (code, body["code"].as_str()),
-        (400, Some("keyset_not_current")),
+        (400, Some("keyset_retired")),
         "{body}"
     );
-    assert!(body["error"].as_str().unwrap().contains(&id2));
+    let (unk_out, _, _) = rollover(&fresh, one, &id1, &"00".repeat(8));
+    let (code, body) = m.post("/rollover", &unk_out).await;
+    assert_eq!(
+        (code, body["code"].as_str()),
+        (400, Some("unknown_keyset")),
+        "{body}"
+    );
+    // Outputs asked of the previous set (now `id1`) are signed by it, and the
+    // answer names it.
+    let (prev_out, _, _) = rollover(&fresh, one, &id1, &id1);
+    let (code, body) = m.post("/rollover", &prev_out).await;
+    assert_eq!(code, 200, "{body}");
+    let signed: RolloverResponse = serde_json::from_value(body).unwrap();
+    assert_eq!((signed.keyset.as_str(), signed.epoch), (id1.as_str(), 1));
     let ks: KeysetsResponse = m.get("/keysets").await;
     assert!(
         !ks.keysets.contains_key(&id0),
         "the retired set's keys are gone"
     );
-    assert_eq!(
-        m.post("/melt", &melt(&[fresh], one, "z", &[&id1])).await.0,
-        200
-    );
-    // The audit still counts the deleted generation: 3 issued + 1 rolled over;
-    // a, b (rolled), fresh redeemed.
+    // The audit still counts the deleted generation: 3 issued + 2 rolled over
+    // (b's output, and fresh's output signed by the previous set); a (burned),
+    // b and fresh (rolled) redeemed.
     let audit: AuditResponse = m.get("/audit").await;
-    assert_eq!((audit.issued.units, audit.redeemed.units), (4, 3));
+    assert_eq!((audit.issued.units, audit.redeemed.units), (5, 3));
 }
 
 #[tokio::test]
@@ -446,11 +460,15 @@ async fn one_melt_may_mix_the_current_and_previous_sets() {
 
 /// A rollover burned before its keyset retired, its answer lost, retried after
 /// the retirement. `burn`: the note was burned before the crash; `flag`: the
-/// burn was also recorded under the request hash.
+/// burn was also recorded under the request hash; `later`: the retry comes
+/// after the set the outputs name has been deleted too. Returns the status, the
+/// body and the ID of the set that should have signed: the set the request
+/// names while that is still live, else the current one.
 async fn rollover_after_retirement(
     name: &str,
     burn: bool,
     flag: bool,
+    later: bool,
 ) -> (u16, serde_json::Value, String) {
     let dir = scratch(name);
     let one = Amount::from_units(1);
@@ -481,32 +499,46 @@ async fn rollover_after_retirement(
     }
     *m.rot.rollovers.lock().unwrap() = Rollovers::open(&dir).unwrap();
     m.set_clock(T + 2 * H);
-    let w: RotationResponse = m.get("/rotation").await;
+    let after_one: RotationResponse = m.get("/rotation").await;
+    assert_eq!(after_one.previous.unwrap().id, req.keyset, "still live");
+    let expected = if later {
+        m.set_clock(T + 3 * H);
+        let after_two: RotationResponse = m.get("/rotation").await;
+        assert_ne!(after_two.previous.unwrap().id, req.keyset, "deleted");
+        after_two.current.id
+    } else {
+        req.keyset.clone()
+    };
     let (code, body) = m.post("/rollover", &req).await;
-    (code, body, w.current.id)
+    (code, body, expected)
 }
 
 #[tokio::test]
 async fn a_resumed_rollover_after_retirement_finishes_only_with_stored_proof_of_its_burn() {
-    let (code, body, current) = rollover_after_retirement("proof-yes", true, true).await;
+    // The input set is deleted, the set the outputs name is still live (it is
+    // the previous set now): the outputs are signed by the set they name.
+    let (code, body, signer) = rollover_after_retirement("proof-yes", true, true, false).await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(
-        body["keyset"],
-        current.as_str(),
-        "signed by the current set"
-    );
+    assert_eq!(body["keyset"], signer.as_str(), "signed by the named set");
     // Crash injected after the burn, before the flag: the proof taken from
     // the spent list at the retirement (saved with the retired ID) finishes it.
-    let (code, body, current) = rollover_after_retirement("proof-crash", true, false).await;
+    let (code, body, signer) = rollover_after_retirement("proof-crash", true, false, false).await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(body["keyset"], current.as_str());
+    assert_eq!(body["keyset"], signer.as_str());
     // Crash before the burn: nothing proves it.
-    let (code, body, _) = rollover_after_retirement("proof-no", false, false).await;
+    let (code, body, _) = rollover_after_retirement("proof-no", false, false, false).await;
     assert_eq!(
         (code, body["code"].as_str()),
         (400, Some("burn_not_proven")),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn a_resumed_rollover_whose_output_set_was_deleted_meanwhile_is_signed_by_the_current_set() {
+    let (code, body, signer) = rollover_after_retirement("proof-late", true, true, true).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["keyset"], signer.as_str(), "signed by the current set");
 }
 
 #[tokio::test]
@@ -554,5 +586,61 @@ async fn a_note_held_by_a_pending_rollover_cannot_be_melted_or_rolled_over_by_an
     assert!(body.to_string().contains("held"), "{body}");
     // The holder finishes.
     let (code, body) = m.post("/rollover", &req).await;
+    assert_eq!(code, 200, "{body}");
+}
+
+#[tokio::test]
+async fn the_rollover_has_its_own_body_ceiling_and_note_cap() {
+    let dir = scratch("rollover-limits");
+    let one = Amount::from_units(1);
+    let m = start_with(
+        &dir,
+        T,
+        psp_mint::server::Limits {
+            rollover_bytes: 4096,
+            rollover_notes: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+    let a = m.issue(one);
+    let b = m.issue(one);
+    let _: RotationResponse = m.get("/rotation").await;
+    m.set_clock(T + H);
+    let ids: KeysetsResponse = m.get("/keysets").await;
+    let prev = ids.previous.clone().unwrap();
+
+    // a body over the ceiling is refused before it is parsed: 413
+    let r = reqwest::Client::new()
+        .post(format!("{}/rollover", m.base))
+        .header("content-type", "application/json")
+        .body(vec![b' '; 4097])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 413);
+
+    // two notes with the cap at one: refused, and nothing is burned
+    let (r1, _, _) = rollover(&a, one, &prev, &ids.current);
+    let (r2, _, _) = rollover(&b, one, &prev, &ids.current);
+    let outputs = [r1.outputs.clone(), r2.outputs.clone()].concat();
+    let mut inputs = [r1.inputs.clone(), r2.inputs.clone()].concat();
+    let h = transaction_sighash(&inputs, &outputs);
+    inputs[0].spend_signature = SECP256K1.sign_schnorr(&h, &a.1);
+    inputs[1].spend_signature = SECP256K1.sign_schnorr(&h, &b.1);
+    let both = RolloverRequest {
+        input_keysets: vec![prev.clone(), prev.clone()],
+        inputs,
+        keyset: ids.current.clone(),
+        outputs,
+    };
+    let (code, body) = m.post("/rollover", &both).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(body.to_string().contains("1 to 1 notes"), "{body}");
+
+    // one note at a time is within the cap
+    let (code, body) = m.post("/rollover", &r1).await;
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = m.post("/rollover", &r2).await;
     assert_eq!(code, 200, "{body}");
 }

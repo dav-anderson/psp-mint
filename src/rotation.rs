@@ -87,9 +87,6 @@ pub enum KeysetError {
     Retired(String),
     /// This mint never had it.
     Unknown(String),
-    /// Live, but not the current set: new outputs are signed only by the
-    /// current one.
-    NotCurrent { named: String, current: String },
 }
 
 impl KeysetError {
@@ -97,7 +94,6 @@ impl KeysetError {
         match self {
             KeysetError::Retired(_) => sp_wire::codes::KEYSET_RETIRED,
             KeysetError::Unknown(_) => sp_wire::codes::UNKNOWN_KEYSET,
-            KeysetError::NotCurrent { .. } => sp_wire::codes::KEYSET_NOT_CURRENT,
         }
     }
     pub fn why(&self, what: &str) -> String {
@@ -106,9 +102,6 @@ impl KeysetError {
                 format!("{what}: keyset {id} was rotated out and deleted with its spent list")
             }
             KeysetError::Unknown(id) => format!("{what}: keyset {id} is not a keyset of this mint"),
-            KeysetError::NotCurrent { named, current } => format!(
-                "{what}: keyset {named} is the previous keyset; new outputs are signed only by the current keyset {current}. Re-blind the outputs for {current} and send the request again. Nothing was burned"
-            ),
         }
     }
 }
@@ -672,12 +665,11 @@ pub fn rollover(
     rotor: &Rotor,
     store: &mut Rollovers,
     req: &RolloverRequest,
+    max_notes: usize,
 ) -> Result<RolloverResponse, RolloverError> {
     use RolloverError::*;
-    if req.inputs.is_empty() || req.inputs.len() > MAX_ROLLOVER_NOTES {
-        return Err(Refused(format!(
-            "a rollover takes 1 to {MAX_ROLLOVER_NOTES} notes"
-        )));
+    if req.inputs.is_empty() || req.inputs.len() > max_notes {
+        return Err(Refused(format!("a rollover takes 1 to {max_notes} notes")));
     }
     if req.input_keysets.len() != req.inputs.len() || req.keyset.is_empty() {
         return Err(Keyset(
@@ -724,22 +716,15 @@ pub fn rollover(
             }
         }
     };
-    // New signing is by the current set only; a resumed request is signed
-    // by the current set whatever it named (the reply names it).
-    let (out_logic, out_keys) = if resumed {
-        (current, &rotor.current)
-    } else {
-        match rotor.resolve(&req.keyset) {
-            Ok(Side::Current) => (current, &rotor.current),
-            Ok(Side::Previous) => {
-                let e = KeysetError::NotCurrent {
-                    named: req.keyset.clone(),
-                    current: rotor.current.id.clone(),
-                };
-                return Err(Keyset(e.code(), e.why("the outputs")));
-            }
-            Err(e) => return Err(Keyset(e.code(), e.why("the outputs"))),
-        }
+    // The outputs are signed by the live set the request names, current or
+    // previous. A set that is not live is refused (`keyset_retired` or
+    // `unknown_keyset`), except for a request resumed after a crash: its
+    // inputs are already burned, so if the set it named has since been
+    // deleted it is signed by the current set (the reply names it).
+    let (out_logic, out_keys) = match rotor.resolve(&req.keyset) {
+        Ok(side) => gen_of(side),
+        Err(_) if resumed => (current, &rotor.current),
+        Err(e) => return Err(Keyset(e.code(), e.why("the outputs"))),
     };
     let sighash = transaction_sighash(&req.inputs, &req.outputs);
     let mut seen = std::collections::HashSet::new();

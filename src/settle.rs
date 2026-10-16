@@ -396,6 +396,23 @@ pub fn settle_with(
     price: &mut dyn FnMut() -> Result<u64, String>,
     terms: &Terms,
 ) -> Result<Settlement, SettleError> {
+    settle_with_previous(logic, None, records, received, price, terms)
+}
+
+/// `settle_with`, for a mint that rotates. `previous` is the previous key set's
+/// ID and mint. A payload that names the previous set is signed by it, as every
+/// other request is; one that names the current set, no set, or a set that is
+/// no longer live (the BTC is already paid, and blinding does not depend on the
+/// key) is signed by `logic`, the current set. The settlement names the set that
+/// signed.
+pub fn settle_with_previous(
+    logic: &MintLogic,
+    previous: Option<(&str, &MintLogic)>,
+    records: &mut Records,
+    received: &Received,
+    price: &mut dyn FnMut() -> Result<u64, String>,
+    terms: &Terms,
+) -> Result<Settlement, SettleError> {
     let txid = received.txid.as_str();
     if let Some(existing) = records.get(txid) {
         if existing.status != Status::Locked {
@@ -438,14 +455,18 @@ pub fn settle_with(
         Ok(payload) => payload,
         Err(e) => return reject(records, txid, record, Rejection::BadPayload(e), None, 0),
     };
-    let keys = logic.public_keys();
+    let (issuer, issuer_keyset) = match (payload.keyset.as_deref(), previous) {
+        (Some(named), Some((id, prev))) if named == id => (prev, id.to_string()),
+        _ => (logic, crate::rotation::keyset_id(logic.public_keys())),
+    };
+    let keys = issuer.public_keys();
     let requested = match check(|amount| keys.contains_key(&amount), &payload.outputs) {
         Ok(requested) => requested,
         Err(why) => return reject(records, txid, record, why, None, 0),
     };
     let assessment = assess_with(received.value_sats, price_cents, requested, terms);
     for output in &payload.outputs {
-        let used = logic
+        let used = issuer
             .is_blind_nonce_used(&output.blind_nonce)
             .map_err(|e| SettleError::Mint(e.to_string()))?;
         if used {
@@ -502,7 +523,8 @@ pub fn settle_with(
     settled.value_sats = received.value_sats;
     records.put(txid, settled)?;
 
-    // PSP uses MintLogic::issue, not issue_with_key. Every PSP note of a given
+    // The set that signs is the one the payload names if it is live, else the
+    // current one. PSP uses MintLogic::issue, not issue_with_key. Every PSP note of a given
     // amount is signed by the same key from the mint's fixed key table, and
     // issue looks that key up by amount. issue_with_key is for mints whose key
     // depends on more than the amount, such as the ESP, where it also depends
@@ -510,7 +532,7 @@ pub fn settle_with(
     let results = plan
         .sign
         .iter()
-        .map(|&i| logic.issue(&payload.outputs[i]))
+        .map(|&i| issuer.issue(&payload.outputs[i]))
         .collect();
     let blind_nonces = plan
         .sign
@@ -518,7 +540,7 @@ pub fn settle_with(
         .map(|&i| payload.outputs[i].blind_nonce)
         .collect();
     Ok(Settlement::Issued(Issue {
-        keyset: crate::rotation::keyset_id(logic.public_keys()),
+        keyset: issuer_keyset,
         results,
         blind_nonces,
         skipped_units: plan.skipped_units,
@@ -923,6 +945,65 @@ mod tests {
         price: &mut Price,
     ) -> Settlement {
         settle(logic, records, r, &mut || price.ask()).unwrap()
+    }
+
+    /// Settle the 4 + 1 payload naming `named` (`prev` is the previous set's
+    /// ID, `cur` the current one's, or something else), and say which set signed.
+    fn signed_by(
+        case: &str,
+        named: &dyn Fn(&str, &str) -> Option<String>,
+    ) -> (String, String, String) {
+        let (current, mut records, _d1) = fixture(&format!("named-current-{case}"));
+        let (previous, _r2, _d2) = fixture(&format!("named-previous-{case}"));
+        let (cur_id, prev_id) = (
+            crate::rotation::keyset_id(current.public_keys()),
+            crate::rotation::keyset_id(previous.public_keys()),
+        );
+        assert_ne!(cur_id, prev_id);
+        let mut p = payload::decode(&hex::decode(PAYLOAD_HEX).unwrap()).unwrap();
+        p.keyset = named(&cur_id, &prev_id);
+        let r = received(
+            "t1",
+            6,
+            5_000,
+            Some(&hex::encode(payload::encode(&p).unwrap())),
+        );
+        let mut price = Price::at(BTC_10K);
+        let issue = issued(
+            settle_with_previous(
+                &current,
+                Some((&prev_id, &previous)),
+                &mut records,
+                &r,
+                &mut || price.ask(),
+                &Terms::default(),
+            )
+            .unwrap(),
+        );
+        (issue.keyset, cur_id, prev_id)
+    }
+
+    #[test]
+    fn a_payload_naming_the_previous_set_is_signed_by_it() {
+        let (signed, _, prev) = signed_by("prev", &|_, prev| Some(prev.to_string()));
+        assert_eq!(signed, prev);
+    }
+
+    #[test]
+    fn a_payload_naming_the_current_set_no_set_or_a_set_that_is_not_live_is_signed_by_the_current_set()
+     {
+        for (case, named) in [
+            (
+                "cur",
+                (&|cur: &str, _: &str| Some(cur.to_string()))
+                    as &dyn Fn(&str, &str) -> Option<String>,
+            ),
+            ("none", &|_, _| None),
+            ("gone", &|_, _| Some("00000000000000ff".to_string())),
+        ] {
+            let (signed, cur, _) = signed_by(case, named);
+            assert_eq!(signed, cur, "{case}");
+        }
     }
 
     fn issued(s: Settlement) -> Issue {

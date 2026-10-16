@@ -70,6 +70,21 @@ pub fn run_once_with(
     report: &mut dyn FnMut(&Received, &Settlement),
     terms: &Terms,
 ) -> Result<(), SettleError> {
+    run_once_rotating(logic, None, records, found, price, report, terms)
+}
+
+/// `run_once_with` for a mint that rotates. A payment whose payload names the
+/// previous key set is signed by it (see `settle::settle_with_previous`). The
+/// mint is locked first and the rotor second, as everywhere else.
+pub fn run_once_rotating(
+    logic: &Mutex<MintLogic>,
+    rotating: Option<&crate::server::Rotating>,
+    records: &mut Records,
+    found: &[Received],
+    price: &mut dyn FnMut() -> Result<u64, String>,
+    report: &mut dyn FnMut(&Received, &Settlement),
+    terms: &Terms,
+) -> Result<(), SettleError> {
     for received in found {
         let needs_price = received.confirmations >= terms.lock_confirmations
             && records.get(&received.txid).is_none();
@@ -78,8 +93,21 @@ pub fn run_once_with(
             let guard = logic
                 .lock()
                 .map_err(|_| SettleError::Mint("mint lock is poisoned".to_string()))?;
-            settle::settle_with(
+            let rotor = match rotating {
+                Some(r) => Some(
+                    r.rotor
+                        .lock()
+                        .map_err(|_| SettleError::Mint("rotor lock is poisoned".to_string()))?,
+                ),
+                None => None,
+            };
+            let previous = rotor
+                .as_ref()
+                .and_then(|r| r.previous.as_ref())
+                .map(|(keys, prev)| (keys.id.as_str(), prev));
+            settle::settle_with_previous(
                 &guard,
+                previous,
                 records,
                 received,
                 &mut || {

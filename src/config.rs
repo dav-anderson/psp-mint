@@ -92,6 +92,20 @@ pub const SPECS: &[Spec] = &[
         what: "The ceiling on one `POST /melt` body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned.",
     },
     Spec {
+        key: "server.rollover_max_request_bytes",
+        env: "PSP_ROLLOVER_MAX_BYTES",
+        default: "1048576",
+        units: "bytes",
+        what: "The ceiling on one `POST /rollover` body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned.",
+    },
+    Spec {
+        key: "rollover.max_items",
+        env: "PSP_ROLLOVER_MAX_ITEMS",
+        default: "1000",
+        units: "notes",
+        what: "The most notes in one `POST /rollover`. More is refused 400 before anything is burned.",
+    },
+    Spec {
         key: "server.burns_max_request_bytes",
         env: "PSP_BURNS_MAX_BYTES",
         default: "1048576",
@@ -239,6 +253,8 @@ pub struct Config {
     pub network: Network,
     pub melt_max_request_bytes: usize,
     pub burns_max_request_bytes: usize,
+    pub rollover_max_request_bytes: usize,
+    pub rollover_max_items: usize,
     pub check_state_max_request_bytes: usize,
     pub rpc_url: String,
     pub wallet: String,
@@ -279,6 +295,8 @@ impl Config {
             network: Network::Main,
             melt_max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             burns_max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            rollover_max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            rollover_max_items: sp_wire::psp::MAX_ROLLOVER_NOTES,
             check_state_max_request_bytes: DEFAULT_MAX_REQUEST_BYTES,
             rpc_url: Network::Main.default_rpc_url(),
             wallet: Network::Main.default_wallet(),
@@ -358,6 +376,8 @@ impl Config {
             "server.bind" => self.bind.clone(),
             "server.melt_max_request_bytes" => self.melt_max_request_bytes.to_string(),
             "server.burns_max_request_bytes" => self.burns_max_request_bytes.to_string(),
+            "server.rollover_max_request_bytes" => self.rollover_max_request_bytes.to_string(),
+            "rollover.max_items" => self.rollover_max_items.to_string(),
             "server.check_state_max_request_bytes" => {
                 self.check_state_max_request_bytes.to_string()
             }
@@ -392,6 +412,10 @@ impl Config {
             "server.bind" => self.bind = value.trim().to_string(),
             "server.melt_max_request_bytes" => self.melt_max_request_bytes = whole(key, value)?,
             "server.burns_max_request_bytes" => self.burns_max_request_bytes = whole(key, value)?,
+            "server.rollover_max_request_bytes" => {
+                self.rollover_max_request_bytes = whole(key, value)?
+            }
+            "rollover.max_items" => self.rollover_max_items = whole(key, value)?,
             "server.check_state_max_request_bytes" => {
                 self.check_state_max_request_bytes = whole(key, value)?
             }
@@ -441,6 +465,10 @@ impl Config {
                 self.burns_max_request_bytes,
             ),
             (
+                "server.rollover_max_request_bytes",
+                self.rollover_max_request_bytes,
+            ),
+            (
                 "server.check_state_max_request_bytes",
                 self.check_state_max_request_bytes,
             ),
@@ -453,6 +481,13 @@ impl Config {
                 "bytes; a request with one note has to fit, and 1 GiB is the most the mint will hold in memory",
             );
         }
+        range(
+            "rollover.max_items",
+            self.rollover_max_items as u64,
+            1,
+            100_000,
+            "notes",
+        );
         range(
             "bitcoin.rpc_timeout_secs",
             self.rpc_timeout_secs,
@@ -631,6 +666,8 @@ impl Config {
         crate::server::Limits {
             melt_bytes: self.melt_max_request_bytes,
             burns_bytes: self.burns_max_request_bytes,
+            rollover_bytes: self.rollover_max_request_bytes,
+            rollover_notes: self.rollover_max_items,
             check_state_bytes: self.check_state_max_request_bytes,
         }
     }
@@ -972,10 +1009,12 @@ mod tests {
         for bytes in [
             c.melt_max_request_bytes,
             c.burns_max_request_bytes,
+            c.rollover_max_request_bytes,
             c.check_state_max_request_bytes,
         ] {
             assert_eq!(bytes, 1024 * 1024);
         }
+        assert_eq!(c.rollover_max_items, 1000);
     }
 
     #[test]
@@ -1091,6 +1130,8 @@ mod tests {
         let mut c = Config::defaults("/h");
         c.melt_max_request_bytes = 100;
         c.burns_max_request_bytes = 2 << 30;
+        c.rollover_max_request_bytes = 100;
+        c.rollover_max_items = 0;
         c.scan_interval_secs = 0;
         c.lock_confirmations = 0;
         c.payment_reconciliation_target_bps = 10_001;
@@ -1102,6 +1143,8 @@ mod tests {
         for key in [
             "server.melt_max_request_bytes",
             "server.burns_max_request_bytes",
+            "server.rollover_max_request_bytes",
+            "rollover.max_items",
             "scan.interval_secs",
             "settle.lock_confirmations",
             "settle.payment_reconciliation_target",
@@ -1136,6 +1179,8 @@ mod tests {
         c.payment_reconciliation_target_bps = 2500;
         c.price_timeout_secs = 4;
         c.melt_max_request_bytes = 5000;
+        c.rollover_max_request_bytes = 6000;
+        c.rollover_max_items = 7;
         c.rpc_url = "http://node:8332/".into();
         assert_eq!(
             c.terms(),
@@ -1148,6 +1193,8 @@ mod tests {
         );
         assert_eq!(c.price().timeout_secs, 4);
         assert_eq!(c.limits().melt_bytes, 5000);
+        assert_eq!(c.limits().rollover_bytes, 6000);
+        assert_eq!(c.limits().rollover_notes, 7);
         assert_eq!(c.wallet_url(), "http://node:8332/wallet/psp-main");
     }
 

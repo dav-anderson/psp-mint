@@ -256,6 +256,8 @@ async fn a_ceiling_above_two_megabytes_is_the_one_in_force() {
     let limits = Limits {
         melt_bytes: big,
         burns_bytes: big,
+        rollover_bytes: big,
+        rollover_notes: 1000,
         check_state_bytes: big,
     };
     let (base, state) = start("big", Some(limits)).await;
