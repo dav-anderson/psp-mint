@@ -32,7 +32,10 @@ fn ks(state: &AppState, melt: MeltRequest) -> psp_mint::server::PspMeltRequest {
     let id = psp_mint::rotation::keyset_id(state.logic.lock().unwrap().public_keys());
     psp_mint::server::PspMeltRequest {
         keysets: vec![id; melt.inputs.len()],
-        melt,
+        melt: sp_wire::psp::MeltRequest {
+            inputs: melt.inputs,
+            memo: melt.memo,
+        },
     }
 }
 
@@ -504,6 +507,7 @@ async fn health_reports_the_last_successful_scan() {
     assert_eq!(code, reqwest::StatusCode::OK);
     assert_eq!(body["status"], "starting");
     assert!(body["last_scan_unix"].is_null());
+    assert_eq!(body["wire_version"], sp_wire::WIRE_VERSION);
 
     health.record_scan();
     let (code, body) = health_json(&base).await;

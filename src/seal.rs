@@ -23,56 +23,16 @@
 //! deferred.
 
 use std::error::Error;
-use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use air::names::secp256k1::{Encrypted, PublicKey, SecretKey};
+// The sealed format, `encrypt`, `decrypt` and `parse_public_key` live in sp-wire.
+pub use sp_wire::seal::{PublicKey, SealError, SecretKey, decrypt, encrypt, parse_public_key};
 
 use crate::scan::Received;
 
 pub const KEY_FILENAME: &str = "mint_did_key.json";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealError {
-    /// The bytes are not a sealed payload at all: too short, the wrong framing,
-    /// or bytes left over.
-    Malformed,
-    /// The framing is right but it does not open with this key. It was sealed
-    /// to another key, or it was altered.
-    Undecryptable,
-    /// The payload could not be written out. Not expected.
-    Encoding,
-}
-
-impl fmt::Display for SealError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SealError::Malformed => write!(f, "not a sealed payload"),
-            SealError::Undecryptable => write!(f, "not sealed to this key, or altered"),
-            SealError::Encoding => write!(f, "could not encode the sealed payload"),
-        }
-    }
-}
-
-impl Error for SealError {}
-
-/// Seal `plaintext` to the mint's DID public key.
-pub fn encrypt(mint_key: &PublicKey, plaintext: &[u8]) -> Result<Vec<u8>, SealError> {
-    let sealed = mint_key.encrypt(plaintext.to_vec());
-    postcard::to_allocvec(&sealed).map_err(|_| SealError::Encoding)
-}
-
-/// Open a sealed payload with the mint's DID secret key.
-pub fn decrypt(secret: &SecretKey, sealed: &[u8]) -> Result<Vec<u8>, SealError> {
-    let (parsed, rest) =
-        postcard::take_from_bytes::<Encrypted>(sealed).map_err(|_| SealError::Malformed)?;
-    if !rest.is_empty() {
-        return Err(SealError::Malformed);
-    }
-    secret.decrypt(parsed).map_err(|_| SealError::Undecryptable)
-}
 
 /// Open the payload of every payment that has one.
 ///
@@ -129,13 +89,6 @@ pub fn load_or_generate(path: &Path) -> Result<SecretKey, Box<dyn Error>> {
 /// The key a wallet seals to: 33 bytes, compressed, as hex.
 pub fn public_key_hex(secret: &SecretKey) -> String {
     secret.public_key().to_string()
-}
-
-/// Parse a published DID public key (hex).
-pub fn parse_public_key(text: &str) -> Result<PublicKey, Box<dyn Error>> {
-    text.trim()
-        .parse::<PublicKey>()
-        .map_err(|e| Box::<dyn Error>::from(format!("not a public key: {e}")))
 }
 
 #[cfg(test)]

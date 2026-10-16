@@ -49,10 +49,12 @@ use mint_core::MintLogic;
 use mint_server::api::{self, MeltRequest, MeltResponse};
 use mint_server::state::AppState;
 use mint_types::{Amount, MintInput, Nonce};
-use serde::{Deserialize, Serialize};
 
 use crate::melts::MeltLog;
 use crate::rotation::{RolloverError, RolloverRequest, Rollovers, Rotor};
+
+// The wire types live in sp-wire; they are re-exported so the paths are unchanged.
+pub use sp_wire::psp::{Burn, BurnsRequest, BurnsResponse, KeysetsResponse, PspMeltRequest};
 
 /// Key rotation, when the mint has it: the previous generation and the
 /// rollover answers. Always locked while holding the mint lock, so they
@@ -173,6 +175,7 @@ impl Health {
             "last_scan_unix": last,
             "seconds_since_last_scan": age,
             "stale_after_secs": self.stale_after_secs,
+            "wire_version": sp_wire::WIRE_VERSION,
         });
         if let Some(n) = &self.network {
             body["network"] = serde_json::Value::String(n.clone());
@@ -332,27 +335,6 @@ pub fn melt_recording_gens(
     Ok(total)
 }
 
-/// What the PSP says about one note.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Burn {
-    /// Whether the note is spent.
-    pub spent: bool,
-    /// The memo the note was burned under. `None` if it is not spent, or if it
-    /// was spent with no memo on record.
-    pub memo: Option<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BurnsRequest {
-    pub nonces: Vec<Nonce>,
-}
-
-/// In the order of the request.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct BurnsResponse {
-    pub burns: Vec<Burn>,
-}
-
 /// The state of each note, for `POST /burns`. The caller holds the mint lock.
 pub fn burns(logic: &MintLogic, log: &MeltLog, nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
     burns_gens(logic, None, log, nonces)
@@ -429,22 +411,15 @@ fn rotor_of<'a>(
     Ok(Some(g))
 }
 
-/// `POST /melt`: mint-core's melt request plus the keyset of each input.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct PspMeltRequest {
-    #[serde(flatten)]
-    pub melt: MeltRequest,
-    /// The keyset each input note carries, in order. Each note is verified,
-    /// and looked up in the spent list, of the keyset it names.
-    #[serde(default)]
-    pub keysets: Vec<String>,
-}
-
 async fn melt_handler(
     State((state, melts, rot)): State<MeltState>,
     Json(req): Json<PspMeltRequest>,
 ) -> Result<Json<MeltResponse>, ApiFailure> {
-    let PspMeltRequest { melt: req, keysets } = req;
+    let PspMeltRequest { melt, keysets } = req;
+    let req = MeltRequest {
+        inputs: melt.inputs,
+        memo: melt.memo,
+    };
     let mut logic = state.logic.lock().map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -461,7 +436,7 @@ async fn melt_handler(
     if keysets.len() != req.inputs.len() {
         return Err(coded(
             StatusCode::BAD_REQUEST,
-            "missing_keyset",
+            sp_wire::codes::MISSING_KEYSET,
             "every input needs its keyset (keysets, in order)",
         ));
     }
@@ -675,17 +650,6 @@ async fn audit_handler(
     }))
 }
 
-/// `GET /keysets`: every live keyset's public keys by ID, current and
-/// previous, as fsp-mint's `/keys` gives them. A wallet unblinds with the
-/// keys of the keyset named in a reply (or printed with claim signatures).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct KeysetsResponse {
-    pub current: String,
-    pub previous: Option<String>,
-    pub keysets:
-        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, secp256k1::PublicKey>>,
-}
-
 async fn keysets_handler(
     State((state, rot)): State<RotState>,
 ) -> Result<Json<KeysetsResponse>, ApiFailure> {
@@ -735,7 +699,7 @@ async fn rollover_handler(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": format!("input {i}: the note is already spent"),
-                "code": "note_spent_elsewhere",
+                "code": sp_wire::codes::NOTE_SPENT_ELSEWHERE,
                 "spent": [i],
             })),
         )),

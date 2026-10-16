@@ -147,7 +147,7 @@ async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
     let (note, keypair) = issued_note(&state, amount);
     let memo = "limits test";
     let request = psp_mint::server::PspMeltRequest {
-        melt: MeltRequest {
+        melt: sp_wire::psp::MeltRequest {
             inputs: vec![melt_input(note, &keypair, amount, memo)],
             memo: memo.to_string(),
         },
@@ -276,7 +276,7 @@ async fn under_the_ceiling_a_bad_melt_is_still_a_400_with_an_error() {
     let amount = Amount::from_units(2);
     let (note, keypair) = issued_note(&state, amount);
     let request = psp_mint::server::PspMeltRequest {
-        melt: MeltRequest {
+        melt: sp_wire::psp::MeltRequest {
             inputs: vec![melt_input(note, &keypair, amount, "signed memo")],
             memo: "a different memo".to_string(),
         },

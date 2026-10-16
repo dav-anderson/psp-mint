@@ -4,7 +4,16 @@
 
 Targets Bitcoin Core 31.1. The mint defaults to mainnet (see "Networks"); these steps use regtest, a private chain where you mine your own blocks and coins, so every `cargo run` in them passes `--regtest`. These steps are for macOS on Apple Silicon.
 
-psp-mint depends on the `air` crate by path (`../air`, which itself needs `../substance`) for the payload encryption, so those two folders must sit next to `psp-mint`.
+psp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags), and the `air` crate at commit `6dd0117` (AIR has no tags). `sp-wire` holds the wire types this mint shares with the other mints and the wallet (see "Wire format and versions" below).
+
+AIR's own manifest names `../substance` by path, which a build from a git checkout cannot find. Until that is changed upstream, build against local folders with a `[patch]` for `air` in `.cargo/config.toml` (git-ignored; the exact recipe, for every repo, is in the top-level README in `sandbox-mint`):
+
+```toml
+[patch."https://github.com/ramp-stack/air"]
+air = { path = "../air" }
+```
+
+`../air` needs `../substance` next to it. To test against unpushed local copies of `sp-wire` or mint-core, `sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags.
 
 ### 1. Install Bitcoin Core
 
@@ -286,6 +295,12 @@ The numbers in the rest of this README (1 and 6 confirmations, the 0.10 reconcil
 
 The price feeds are not settings. The three sources (Coinbase, Bitstamp and Gemini, see "Price") and their URLs are fixed in `src/price.rs`, and only those three are allowed. Changing a feed means changing the code.
 
+## Wire format and versions
+
+The request and response bodies, the payload and its sealed form, the key-set ID, the request hashes and the error codes are defined in the `sp-wire` crate, not here. `psp-mint` re-exports them (`psp_mint::payload`, `psp_mint::rotation::RolloverRequest`, `psp_mint::server::KeysetsResponse`, and so on), so the paths did not change. The ESP and FSP mints and the wallet build against the same crate, so they cannot drift from this mint by a byte.
+
+`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (1 to start). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
+
 ## HTTP API
 
 The API is mint-server's handlers, the same ones `mintd` uses, mounted over the PSP's own mint in the same process. The exception is `/melt`, which is the PSP's own handler: it does what mint-server's does and also keeps the memo of each burn (see "Burn memos"), and `/burns` is the PSP's own route. The scanner and the API share the mint behind one mutex. The scanner locks it once per payment and never while it waits on the exchanges for a price.
@@ -300,7 +315,7 @@ The API is mint-server's handlers, the same ones `mintd` uses, mounted over the 
 | `GET /rotation` | Whether rotation is on, `first_issue`, `activation`, the period, the current and previous keysets (ID, epoch, start, `current_until`, `retires`), `next_rotation` and the mint's clock. |
 | `POST /rollover` | Swaps notes for new notes of exactly the same amounts on the current key set. Body: `input_keysets`, inputs, `keyset`, outputs. `400` if refused, with `code` (`keyset_not_current`, `keyset_retired`, `unknown_keyset`, `missing_keyset`, `note_held`, `burn_not_proven`, or `note_spent_elsewhere` with `spent`: the positions of the inputs that are spent), and nothing is burned. Also the swap for wallet-to-wallet hand-overs. See "Key rotation". |
 | `GET /audit` | `issued`, `redeemed`, `outstanding`. |
-| `GET /health` | `200` with `status` `ok` (or `starting`, before the first scan finishes), `503` with `scan_stale` or `mint_lock_poisoned`. The body also has `last_scan_unix`, `seconds_since_last_scan` (both null until a scan succeeds) and `stale_after_secs`. A scan counts when the wallet was read and every payment was processed as far as it could go, so a payment waiting on confirmations or a price is not a failure. `scan_stale` means no successful scan for `scan.health_intervals` intervals plus `scan.health_grace_secs` (by default three intervals plus 60 s). |
+| `GET /health` | `200` with `status` `ok` (or `starting`, before the first scan finishes), `503` with `scan_stale` or `mint_lock_poisoned`. The body also has `wire_version` (an integer: the version of the wire format this mint speaks; a wallet refuses a mint whose number is not its own), `last_scan_unix`, `seconds_since_last_scan` (both null until a scan succeeds) and `stale_after_secs`. A scan counts when the wallet was read and every payment was processed as far as it could go, so a payment waiting on confirmations or a price is not a failure. `scan_stale` means no successful scan for `scan.health_intervals` intervals plus `scan.health_grace_secs` (by default three intervals plus 60 s). |
 
 Every route that takes a body has a ceiling, 1 MiB by default (`server.*_max_request_bytes` above). A body over it is refused with `413` before it is parsed, so nothing is burned. A body that gives its `Content-Length` is refused without being read; one sent without it is read only up to the ceiling. The reply is JSON, with `error` like every other error here, plus `code` (`request_too_large`), `size_bytes` (the declared size, or `null`) and `limit_bytes`, as the ESP mint's `413` has:
 

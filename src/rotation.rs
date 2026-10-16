@@ -29,6 +29,10 @@ use mint_types::{Amount, DEFAULT_DENOMINATION_BASE, MintConfig, gen_denomination
 use secp256k1::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 
+// The wire types live in sp-wire; they are re-exported so the paths are unchanged.
+pub use sp_wire::keyset::{KeysetWindow, RotationResponse, keyset_id};
+pub use sp_wire::psp::{MAX_ROLLOVER_NOTES, RolloverRequest, RolloverResponse};
+
 pub const FIRST_ISSUE_FILE: &str = "first_issue.json";
 /// The most retired keyset IDs kept: 1 MB of 8-byte IDs (131,072). A
 /// request naming a listed ID gets `keyset_retired` (its notes expired); any
@@ -69,29 +73,6 @@ impl Rotation {
     }
 }
 
-/// `GET /rotation`, the same shape as fsp-mint's.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct KeysetWindow {
-    pub id: String,
-    pub epoch: u64,
-    pub starts: Option<u64>,
-    pub current_until: Option<u64>,
-    pub retires: Option<u64>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RotationResponse {
-    pub active: bool,
-    pub first_issue: Option<u64>,
-    pub rotation_activation_hours: u64,
-    pub activation: Option<u64>,
-    pub rotation_period_hours: u64,
-    pub current: KeysetWindow,
-    pub previous: Option<KeysetWindow>,
-    pub next_rotation: Option<u64>,
-    pub now: u64,
-}
-
 /// A live generation, as a keyset ID names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -114,9 +95,9 @@ pub enum KeysetError {
 impl KeysetError {
     pub fn code(&self) -> &'static str {
         match self {
-            KeysetError::Retired(_) => "keyset_retired",
-            KeysetError::Unknown(_) => "unknown_keyset",
-            KeysetError::NotCurrent { .. } => "keyset_not_current",
+            KeysetError::Retired(_) => sp_wire::codes::KEYSET_RETIRED,
+            KeysetError::Unknown(_) => sp_wire::codes::UNKNOWN_KEYSET,
+            KeysetError::NotCurrent { .. } => sp_wire::codes::KEYSET_NOT_CURRENT,
         }
     }
     pub fn why(&self, what: &str) -> String {
@@ -138,16 +119,6 @@ pub struct GenKeys {
     pub id: String,
     pub sk: BTreeMap<Amount, SecretKey>,
     pub pk: BTreeMap<Amount, PublicKey>,
-}
-
-/// The keyset ID: 8 bytes of SHA-256 over a tag and the 1-unit public key.
-pub fn keyset_id(pk: &BTreeMap<Amount, PublicKey>) -> String {
-    use sha2::{Digest, Sha256};
-    let mut data = b"psp-mint/keyset-id/v1".to_vec();
-    if let Some(k) = pk.values().next() {
-        data.extend_from_slice(&k.serialize());
-    }
-    hex::encode(&Sha256::digest(&data)[..8])
 }
 
 fn gen_dir(base: &Path, epoch: u64) -> PathBuf {
@@ -618,43 +589,6 @@ impl Rotor {
 use mint_types::{MintInput, MintOutput, MintOutputOutcome, transaction_sighash};
 
 pub const ROLLOVERS_FILE: &str = "rollovers.json";
-/// Most notes in one rollover.
-pub const MAX_ROLLOVER_NOTES: usize = 1000;
-
-/// `POST /rollover`: notes in, fresh notes of exactly the same amounts out,
-/// signed with the current keyset. Every input signs `transaction_sighash`
-/// over the inputs and outputs, as in a mint-core swap.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloverRequest {
-    /// The keyset of each input note, in order. Each note is verified, and
-    /// looked up in the spent list, of the keyset it names.
-    #[serde(default)]
-    pub input_keysets: Vec<String>,
-    pub inputs: Vec<MintInput>,
-    /// The keyset the outputs are to be signed with: the current or the
-    /// previous one (normally the current).
-    #[serde(default)]
-    pub keyset: String,
-    pub outputs: Vec<MintOutput>,
-}
-
-impl RolloverRequest {
-    pub fn hash(&self) -> String {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(
-            serde_json::to_vec(self).expect("serializable"),
-        ))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RolloverResponse {
-    pub keyset: String,
-    pub epoch: u64,
-    pub outcomes: Vec<MintOutputOutcome>,
-    /// The public key each output was signed with, for unblinding.
-    pub keys: Vec<PublicKey>,
-}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Rollovers {
@@ -747,7 +681,7 @@ pub fn rollover(
     }
     if req.input_keysets.len() != req.inputs.len() || req.keyset.is_empty() {
         return Err(Keyset(
-            "missing_keyset",
+            sp_wire::codes::MISSING_KEYSET,
             "every input needs its keyset (input_keysets) and the outputs need one (keyset)".into(),
         ));
     }
@@ -826,7 +760,7 @@ pub fn rollover(
             Err(_) if proven || rotor.burn_proven(input) => continue,
             Err(e) if resumed => {
                 return Err(Keyset(
-                    "burn_not_proven",
+                    sp_wire::codes::BURN_NOT_PROVEN,
                     format!(
                         "input {i}: {}; this request was started before, but nothing stored proves its inputs were burned under this request, so it cannot be finished without them",
                         e.why("its keyset")

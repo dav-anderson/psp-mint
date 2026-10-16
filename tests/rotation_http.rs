@@ -122,7 +122,7 @@ fn melt(notes: &[(Note, Keypair)], amount: Amount, memo: &str, keysets: &[&str])
         .collect();
     let h = melt_sighash(&unsigned, memo.as_bytes());
     PspMeltRequest {
-        melt: MeltRequest {
+        melt: sp_wire::psp::MeltRequest {
             inputs: unsigned
                 .into_iter()
                 .zip(notes)
