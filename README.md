@@ -144,5 +144,6 @@ The integration tests in `tests/` run the HTTP routes (`api.rs`, `limits_http.rs
 - [DESIGN.md](DESIGN.md): how psp-mint works and why: the scanner, key rotation, settlement and the price tolerance, the price, the payload and its encryption, burn memos.
 - [CHANGELOG.md](CHANGELOG.md): what was built and what changed.
 - [ROADMAP.md](../sandbox-mint/ROADMAP.md) (in `sandbox-mint`): left to do and not decided yet, for every repo.
+- [OPERATIONS.md](../sandbox-mint/OPERATIONS.md) (in `sandbox-mint`): running the mints as services: `launchd` and `systemd` definitions, install and uninstall, the health monitor.
 - [esp-mint](../esp-mint/README.md) and [ecash-wallet](../ecash-wallet/README.md): the other parts.
 - [sandbox-mint README](../sandbox-mint/README.md): the family of repos.

@@ -278,12 +278,33 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
             server::router_full(state, health, melts, limits, Some(rot)),
         )
         .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+            shutdown_signal().await;
             println!("shutting down");
         })
         .await?;
         Ok::<(), Box<dyn Error>>(())
     })
+}
+
+/// Resolves on SIGINT (Ctrl-C) or SIGTERM, which is what `launchd` and
+/// `systemd` send to stop a service. The server then stops taking new
+/// connections, lets the requests it is answering finish, and returns, and the
+/// process exits with status 0.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).ok();
+    let terminate = async {
+        match term.as_mut() {
+            Some(t) => {
+                t.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate => {}
+    }
 }
 
 /// Print the mint's DID public key, the one wallets seal payloads to.

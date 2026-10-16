@@ -2,6 +2,10 @@
 
 psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.2.1 (2026-10-16)
+
+- **Running as a service.** SIGTERM now stops `serve` the way Ctrl-C does (the API drains and the process exits 0); before, only SIGINT did, and a service manager's stop killed it. `launchd` and `systemd` definitions, env and monitor settings examples and `sp-health-monitor.sh` are in `sandbox-mint/ops`, with the steps in `sandbox-mint/OPERATIONS.md`. DESIGN.md: "Running as a service", with what the AIR storage has to keep (single writer, atomic durable writes).
+
 ## 0.2.0
 
 - **`POST /rollover` signs the outputs with the live key set the request names, current or previous.** Before, a request naming the previous set was refused `400 keyset_not_current`. Now only a set that is not live is refused: `keyset_retired` for a deleted one, `unknown_keyset` for anything else, before anything is burned. A request resumed after a crash is signed by the named set while that is live, and by the current set once it has been deleted. `keyset_not_current` is no longer sent; `sp-wire` keeps the name reserved.

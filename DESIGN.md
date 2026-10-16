@@ -260,3 +260,15 @@ The wallet calls this crate's `payload::encode` and `seal::encrypt` by path, so 
 It covers the BTC price moving between the payer working out the amount, the price lock and settlement, which no payer should be penalised or credited for. Operators can widen it in a volatile market.
 
 **Over** by no more than this: the mint keeps the excess; over by more: the whole excess is recorded as credit for the payer's DID. **Short:** the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid the mint signs those notes and keeps the remainder, otherwise it signs nothing and holds the payment as paid but unsettled. One setting for both directions.
+
+## Running as a service
+
+`psp-mint serve` runs under `launchd` (macOS) or `systemd` (Linux) as a user that is not root, with its data directory (`PSP_DATA_DIR`), settings file (`PSP_CONFIG`) and network (`PSP_NETWORK`) named in an env file. The definitions, the install and uninstall steps and the health monitor are in [OPERATIONS.md](../sandbox-mint/OPERATIONS.md) (in `sandbox-mint`).
+
+**Failure and restart.** `serve` exits with status 1 if the scan thread dies or the mint lock is poisoned, and the service manager starts it again after a delay (growing under systemd, fixed under launchd) and never gives up. Downtime is not free here: a payment is priced only when a scan sees it at 1 confirmation or later, so a long outage can cost a price lock. The restart is picked up from what is on disk by the rules of a crash: the scan checkpoint is written only after a successful pass, and a pass also re-reads every payment that is not yet settled (see "The scan"), so a restart misses nothing.
+
+**Stopping.** SIGTERM and SIGINT stop the API gracefully (no new connections, the requests being answered finish) and the process exits with status 0. The scan thread may be in the middle of a pass; that is the same as a crash in the middle of a pass, which the checkpoint and the settlement records already cover.
+
+**Opening the data twice.** The database allows one process at a time, so a new process that starts while the old one is still stopping cannot open it; it exits with an error and the service manager starts it again. The storage that replaces sled has to give the same refusal or an equivalent single-writer guarantee, and the writes of the scan checkpoint, the settlement records and the melt memos have to be atomic (all or nothing) and durable once the call that made them returns, so that a restart sees each one whole or not at all.
+
+**Health.** `GET /health` is `200` while the scanner is keeping up and the lock is sound and `503` otherwise. The monitor in `sandbox-mint/ops` polls it and reports or restarts a mint that stays unhealthy.
