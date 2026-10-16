@@ -4,16 +4,7 @@
 
 Targets Bitcoin Core 31.1. The mint defaults to mainnet (see "Networks"); these steps use regtest, a private chain where you mine your own blocks and coins, so every `cargo run` in them passes `--regtest`. These steps are for macOS on Apple Silicon.
 
-psp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.1.0` (git tags), and the `air` crate at commit `6dd0117` (AIR has no tags). `sp-wire` holds the wire types this mint shares with the other mints and the wallet (see "Wire format and versions" below).
-
-AIR's own manifest names `../substance` by path, which a build from a git checkout cannot find. Until that is changed upstream, build against local folders with a `[patch]` for `air` in `.cargo/config.toml` (git-ignored; the exact recipe, for every repo, is in the top-level README in `sandbox-mint`):
-
-```toml
-[patch."https://github.com/ramp-stack/air"]
-air = { path = "../air" }
-```
-
-`../air` needs `../substance` next to it. To test against unpushed local copies of `sp-wire` or mint-core, `sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags.
+psp-mint builds from tagged dependencies: mint-core at `v0.1.3` and `sp-wire` at `v0.2.0` (git tags). `sp-wire` holds the wire types this mint shares with the other mints and the wallet (see "Wire format and versions" below), and it pulls in AIR 2.0.3 (commit `8e281d5`, AIR has no tags) for the payload encryption. AIR 2.0.3 has no path dependencies, so nothing needs patching to build from git. To test against unpushed local copies of `sp-wire` or mint-core, `sandbox-mint/scripts/local-git.sh` points git at the local folders and their local tags.
 
 ### 1. Install Bitcoin Core
 
@@ -103,7 +94,7 @@ $CLI -rpcwallet=psp-regtest gettransaction $TXID | grep confirmations
 $CLI -rpcwallet=psp-regtest gettransaction $TXID true true | grep -B6 nulldata
 ```
 
-The confirmations are `1` and then `6`. To watch the price lock, run `cargo run` (step 7) between the two `generatetoaddress` commands, once after the first confirmation and again after the sixth. The `nulldata` output has an `asm` of `OP_RETURN` followed by the sealed payload hex, identical to what was sent, and nothing in it is readable. The raw `hex` of that output is `6a4cc7` followed by the sealed payload: `OP_RETURN`, `OP_PUSHDATA1`, then the length byte (199 for the example, which is 117 plus 82).
+The confirmations are `1` and then `6`. To watch the price lock, run `cargo run` (step 7) between the two `generatetoaddress` commands, once after the first confirmation and again after the sixth. The `nulldata` output has an `asm` of `OP_RETURN` followed by the sealed payload hex, identical to what was sent, and nothing in it is readable. The raw `hex` of that output is `6a4cc5` followed by the sealed payload: `OP_RETURN`, `OP_PUSHDATA1`, then the length byte (197 for the example, which is 117 plus 80).
 
 ### 7. Run the PSP once
 
@@ -135,6 +126,7 @@ psp-mint settings: no config file, so defaults and the environment:
   price.timeout_secs = 10 seconds (default)
   settle.lock_confirmations = 1 confirmations (default)
   settle.min_confirmations = 6 confirmations (default)
+  settle.price_tolerance = 0.01 fraction, 0 to 1 (0.01 is 1%) (default)
   settle.payment_reconciliation_target = 0.10 fraction, 0 to 1 (0.10 is 10%) (default)
   mint.max_denomination_units = 16777216 PSP units (default)
 ```
@@ -257,6 +249,7 @@ Every setting is in `psp-mint.toml` in the data directory (or the file `PSP_CONF
 ```
 [settle]
 min_confirmations = 6
+price_tolerance = 0.01
 payment_reconciliation_target = 0.10
 
 [bitcoin]
@@ -284,14 +277,15 @@ The settings are read once, when the mint starts, and logged then with the value
 | `price.timeout_secs` | `PSP_PRICE_TIMEOUT_SECS` | `10` | How long one ticker request may take. 1 to 600. |
 | `settle.lock_confirmations` | `PSP_LOCK_CONFIRMATIONS` | `1` | Confirmations at which the price is locked. 1 to 1000. |
 | `settle.min_confirmations` | `PSP_MIN_CONFIRMATIONS` | `6` | Confirmations at which the payment is settled. At least `lock_confirmations`, at most 1000. |
-| `settle.payment_reconciliation_target` | `PSP_PAYMENT_RECONCILIATION_TARGET` | `0.10` (10%) | A fraction, 0 to 1, with at most four decimals (`0.10`, `0.05`, `0.0525`). How far a payment may miss the requested amount before the mint stops absorbing the difference and starts reconciling it. **Over** by no more than this: the mint keeps the excess; over by more: the whole excess is recorded as credit for the payer's DID. **Short:** the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid the mint signs those notes and keeps the remainder, otherwise it signs nothing and holds the payment as paid but unsettled. One setting for both directions. See "The reconciliation target" for how to choose it. |
+| `settle.price_tolerance` | `PSP_PRICE_TOLERANCE` | `0.01` (1%) | A fraction, 0 to 1, with at most four decimals (`0.01`, `0.005`, `0.025`). How far a payment may miss the requested amount, over or under (up to and including this), and still settle in full as if it were exact: every requested note is signed, and nothing is credited, dropped or kept. It covers the BTC price moving between the payer working out the amount, the price lock and settlement, which no payer should be penalised or credited for. Operators can widen it in a volatile market. It must not be more than `settle.payment_reconciliation_target`: the mint refuses to start otherwise. See "The price tolerance". |
+| `settle.payment_reconciliation_target` | `PSP_PAYMENT_RECONCILIATION_TARGET` | `0.10` (10%) | A fraction, 0 to 1, with at most four decimals (`0.10`, `0.05`, `0.0525`). For a payment outside `settle.price_tolerance`, which is genuinely wrong: how far it may miss the requested amount before the mint stops absorbing the difference and starts reconciling it. **Over** by no more than this: the mint keeps the excess; over by more: the whole excess is recorded as credit for the payer's DID. **Short:** the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid the mint signs those notes and keeps the remainder, otherwise it signs nothing and holds the payment as paid but unsettled. One setting for both directions. See "The reconciliation target" for how to choose it. |
 | `mint.max_denomination_units` | `PSP_MAX_DENOMINATION_UNITS` | `16777216` | Largest denomination (2^24, 25 keys). Only used when `mint_keys.json` is first made; an existing key file keeps its denominations. 1 to 2^62. |
 | `rotation.activation_hours` | `PSP_ROTATION_ACTIVATION_HOURS` | `8760` (1 year) | Whole hours from the first issue to the first key rotation. **0 turns rotation off** (one key set, one spent list). 0 to 10,000,000. Restart only. See "Key rotation". |
 | `rotation.period_hours` | `PSP_ROTATION_PERIOD_HOURS` | `87600` (10 years) | Whole hours between rotations. **0 also turns rotation off.** With rotation on it must be **at least 24**: BTC claims need time to settle before a rotation, and the mint refuses to start with a shorter period. 0 to 10,000,000. Restart only. |
 
 The ranges are checked when the mint starts. They are wide on purpose: they refuse values that cannot work (0 confirmations, a ceiling too small for one note, a minimum below the lock) and values far outside any sensible use (a 1 GiB body, a 1000-confirmation wait, a day between scans), not values that are merely unusual. `settle.min_confirmations` must also be at least `settle.lock_confirmations`, so a price is always locked before settlement.
 
-The numbers in the rest of this README (1 and 6 confirmations, the 0.10 reconciliation target, 2%, 120 s, 420 s for `/health`) are these defaults.
+The numbers in the rest of this README (1 and 6 confirmations, the 0.01 price tolerance, the 0.10 reconciliation target, 2%, 120 s, 420 s for `/health`) are these defaults.
 
 The price feeds are not settings. The three sources (Coinbase, Bitstamp and Gemini, see "Price") and their URLs are fixed in `src/price.rs`, and only those three are allowed. Changing a feed means changing the code.
 
@@ -299,7 +293,7 @@ The price feeds are not settings. The three sources (Coinbase, Bitstamp and Gemi
 
 The request and response bodies, the payload and its sealed form, the key-set ID, the request hashes and the error codes are defined in the `sp-wire` crate, not here. `psp-mint` re-exports them (`psp_mint::payload`, `psp_mint::rotation::RolloverRequest`, `psp_mint::server::KeysetsResponse`, and so on), so the paths did not change. The ESP and FSP mints and the wallet build against the same crate, so they cannot drift from this mint by a byte.
 
-`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (1 to start). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
+`GET /health` returns `wire_version`, the crate's `WIRE_VERSION` (2: version 1 was the first release, with AIR 1.1.0's sealed envelope; version 2 is AIR 2.0.3's, 80 bytes of overhead instead of 82 or 83, and the only change). **Changing any encoded byte or JSON field in `sp-wire` means bumping `WIRE_VERSION`**, and a wallet refuses a mint that reports another number. Golden-bytes and size tests in `sp-wire` fail if a byte moves.
 
 ## HTTP API
 
@@ -381,7 +375,7 @@ The transaction is marked `issued` before anything is signed, so a payment is is
 ### Settlement rules
 
 - **Payment value** is the sum of the outputs in that transaction that pay the PSP's address. It is read from the chain, never from the payload.
-- **Rate** is 10 PSP = 1 USD (1 PSP = $0.10), paid in BTC, at the price locked at 1 confirmation (see Price below). So $1 buys exactly 10 PSP, and 10 PSP exchange at the ESP mint for 10^12 ESP. Ten to the dollar, and not a thousand, keeps the OP_RETURN small: each output the payment names costs 41 bytes (an 8-byte amount and a 33-byte point), a hundred times finer a unit would add about 7 denominations (up to 7 more outputs, 287 bytes), and the OP_RETURN limit is not raised. The top denomination is 2^24 so that a purchase still covers the same dollar range (it was 2^20 at one PSP to the dollar). A purchase of one of every denomination is 25 outputs and 1,143 bytes sealed, well inside the 255 outputs the payload allows.
+- **Rate** is 10 PSP = 1 USD (1 PSP = $0.10), paid in BTC, at the price locked at 1 confirmation (see Price below). So $1 buys exactly 10 PSP, and 10 PSP exchange at the ESP mint for 10^12 ESP. Ten to the dollar, and not a thousand, keeps the OP_RETURN small: each output the payment names costs 41 bytes (an 8-byte amount and a 33-byte point), a hundred times finer a unit would add about 7 denominations (up to 7 more outputs, 287 bytes), and the OP_RETURN limit is not raised. The top denomination is 2^24 so that a purchase still covers the same dollar range (it was 2^20 at one PSP to the dollar). A purchase of one of every denomination is 25 outputs and 1,140 bytes sealed, well inside the 255 outputs the payload allows.
 - **Amounts** are `u64`. Sums of amounts are checked, and a request whose total overflows is rejected. Conversions between sats, cents and units use `u128`. Tests cover the limits.
 - **Requested** is the sum of the requested output amounts. It is compared with the payment value in USD at the locked price.
 - Every output is validated before any is issued: the denomination exists, there are no duplicate blind nonces within the request, and no blind nonce was used by an earlier payment. A failure rejects the whole payment.
@@ -390,13 +384,35 @@ The transaction is marked `issued` before anything is signed, so a payment is is
 - A payment with no usable price at its first sighting gets no record. It is tried again on the next run.
 - A sealed payload copied into someone else's transaction is harmless. The signatures go to the DID inside the payload, which the copier cannot change, and only the payer holds the blinding factors that turn them into notes. The copier ends up paying for the payer's notes. A copied payload also cannot be issued twice, because its blind nonces are used once.
 
+#### The price tolerance
+
+One setting, `settle.price_tolerance` (a fraction; default `0.01`, 1%), is checked first. A payment within it of the requested amount, over or under (a miss of exactly the tolerance counts as within), **settles in full as if it were exact**: every requested note is signed, no credit is recorded, nothing is dropped and nothing is held. The reconciliation target below does not come into it. The comparison is in USD at the locked price, like everything else here. The `over/under` printed for the payment and stored in its record still shows the real miss, so the difference can be audited.
+
+**Why it exists.** The price moves. The payer works out the amount at one moment, the mint locks the price when the payment has 1 confirmation, and settles it at 6, an hour or so on. A payer who paid exactly what their wallet showed can be a fraction of a percent off by the time the mint looks at it, in either direction, and has done nothing wrong. No payer should lose their smallest note, or be credited a few cents, for that. The reconciliation target is for payments that are genuinely wrong, and a fixed 10% would be far too wide to tell the two apart, so the ordinary movement of the market gets its own, much smaller setting.
+
+**How to choose it.** Leave it at 1% in a calm market. In a volatile one, when BTC regularly moves more than 1% in an hour, widen it (`0.02` or `0.03`) so that honest payers are not pushed into reconciliation. A wider tolerance means the mint absorbs more of the movement: a payment 3% over settles with nothing credited, and one 3% under gets the full request. `0` turns it off, so that only an exact payment is exact. It is symmetric, and it can never be wider than `settle.payment_reconciliation_target`, because that setting handles whatever falls outside it: the mint refuses to start if the tolerance is more than the target (lower the tolerance or raise the target).
+
+At 1%, the sums are small at any size:
+
+| Request | Payer pays | What happens |
+|---|---|---|
+| $100 (1,000 PSP) | $100.90 (0.9% over) | Within the 1% ($1.00): all 1,000 PSP signed. No credit, nothing kept as an excess. |
+| $100 (1,000 PSP) | $99.10 (0.9% under) | Within the tolerance: all 1,000 PSP signed. Nothing dropped. |
+| $100 (1,000 PSP) | $101.10 (1.1% over) | Outside the tolerance, so the reconciliation target applies. At the default 10% it is within the $10 target: signed in full, the mint keeps the $1.10. |
+| $100 (1,000 PSP: a 512, 256, 128, 64, 32 and an 8) | $98.90 (1.1% under) | Outside the tolerance. The 8 and the 32 are dropped (960 is no more than the 989 whole units paid). The unused $2.90 is 2.9% of the payment, within the target: the mint signs 960 and keeps $2.90. |
+| $10,000 (100,000 PSP) | $10,090 (0.9% over) | Within the $100 tolerance: all signed. No credit. |
+| $10,000 (100,000 PSP) | $9,910 (0.9% under) | Within the tolerance: all signed. |
+| $10,000 (100,000 PSP: a 65,536, 32,768, 1,024, 512, 128 and a 32) | $9,890 (1.1% under) | Outside the tolerance. The 32, 128, 512 and 1,024 are dropped, leaving 98,304 of the 98,900 whole units paid. The unused $59.60 is 0.6% of the payment, within the target: the mint signs 98,304 and keeps $59.60. |
+
+A tolerance is a percentage, so it is a bigger sum at $10,000 (up to $100) than at $100 (up to $1). The reconciliation target has the same property; see its "Future consideration" about variable or tiered thresholds.
+
 #### The reconciliation target
 
-One setting, `settle.payment_reconciliation_target` (a fraction; default `0.10`, 10%), decides what happens when a payment does not match its request exactly. It is measured in USD at the locked price. It sets how far a payment can miss the requested amount before the mint stops absorbing the difference and starts reconciling it: a credit for an overpayment, a new request for an underpayment.
+One setting, `settle.payment_reconciliation_target` (a fraction; default `0.10`, 10%), decides what happens to a payment that is **outside the price tolerance**, one that is genuinely wrong rather than a little off from price movement. It is measured in USD at the locked price. It sets how far a payment can miss the requested amount before the mint stops absorbing the difference and starts reconciling it: a credit for an overpayment, a new request for an underpayment.
 
 **Why one number.** Both mistakes have the same cause (a payer who pays a different amount than they asked for, usually because the price moved or the wallet rounded), and both ask the same question: is the gap small enough to swallow? So one tolerance covers both directions.
 
-**How to choose it.** A tighter target (say `0.01`) is fairer to payers, because the mint keeps less of a mistaken payment, but it sends more payments to credit or reconciliation, and each of those needs the payer to answer over AIR. A looser target (say `0.25`) settles more payments automatically but keeps, or forgoes, more value. `0` accepts only an exact fit: any overpayment, however small, is credited, and any shortfall is held. Because the target is a percentage, the same setting is a very different sum at different sizes. With the default 10%:
+**How to choose it.** A tighter target (say `0.01`) is fairer to payers, because the mint keeps less of a mistaken payment, but it sends more payments to credit or reconciliation, and each of those needs the payer to answer over AIR. A looser target (say `0.25`) settles more payments automatically but keeps, or forgoes, more value. `0` accepts only an exact fit: any overpayment, however small, is credited, and any shortfall is held (the price tolerance must then be `0` too, because it cannot be more than the target). Because the target is a percentage, the same setting is a very different sum at different sizes. With the default 10%:
 
 | Request | Payer pays | What happens |
 |---|---|---|
@@ -420,14 +436,15 @@ When the payment is worth less than the request, the mint does the following.
 2. If something is left and the value that would be unused is no more than the target times the amount paid (equivalently, the signed value is at least the amount paid times 1 minus the target), it signs what is left and **keeps the remainder**. The dropped outputs are not used up: their blind nonces stay free.
 3. If nothing is left, or the unused value is beyond the target, it **signs nothing** and records the payment as `paid_unsettled`, keyed by the txid and the payer's DID, and holds the BTC. Dropping more outputs would only widen the gap, so the payer has to send a new request that matches what was paid.
 
-There is no longer a free 1% leeway: a payment even one sat short of the request buys one whole unit fewer than was asked, so it always loses at least its smallest note. It is signed without that note if the unused value is within the target, and held if it is not (a request of a 4 and a 1, which is $0.50, paid 499 sats at $100,000 per BTC is held, because dropping the 1 would leave about 20% of the payment unused). Buyers should pay a little over the request, not under it.
+These steps apply only to a payment that is short by more than `settle.price_tolerance` (1% by default). A payment within the tolerance is signed in full, as if exact. Beyond it, a payment short of the request buys at least one whole unit fewer than was asked, so it loses at least its smallest note. It is signed without that note if the unused value is within the target, and held if it is not (a request of a 4 and a 1, which is $0.50, paid 494 sats at $100,000 per BTC, 1.2% short, is held, because dropping the 1 would leave about 19% of the payment unused; 499 sats, 0.2% short, is within the tolerance and signed in full). Buyers should pay a little over the request, not under it.
 
-**The second half is not built.** It runs over AIR: the mint messages the payer's DID, saying what was received and asking for a new request that matches it. The payer returns the new request over AIR (not on chain, since it is already paid). The mint checks it against the stored payment (`value_sats`, the locked price and the payer DID in the record), signs it, and marks the payment settled so that it cannot be claimed twice. AIR messaging does not exist yet, so today the payment is only recorded, printed (`paid but unsettled ...`) and held. Nothing deletes the record. A local stand-in for testing, like `esp-mint decline`, has been proposed but not built.
+**The second half is not built.** It runs over AIR: the mint messages the payer's DID, saying what was received and asking for a new request that matches it. The payer returns the new request over AIR (not on chain, since it is already paid). The mint checks it against the stored payment (`value_sats`, the locked price and the payer DID in the record), signs it, and marks the payment settled so that it cannot be claimed twice. AIR messaging does not exist yet, so today the payment is only recorded, printed (`paid but unsettled ...`) and held. Nothing deletes the record. A local stand-in for settling a held payment (like `esp-mint decline`) was considered and declined for now: the exchange happens over AIR, so the held payment waits for AIR.
 
 **An unanswered reconciliation is not forgotten.** If the payer never sends a new request, the mint keeps the payment as a credit record for that DID indefinitely and never deletes it automatically. At some point it may need to be treated as a dead obligation (a time limit, or a sweep into the mint's own funds). That is a policy question for later and is not built.
 
 #### Overpayment
 
+- **Within the price tolerance.** Settled in full as if exact, no credit (see "The price tolerance"). Everything below is for a payment outside it.
 - **Over by no more than the target.** The mint issues the requested outputs and keeps the excess.
 - **Over by more than the target.** The mint issues the requested outputs and records the **whole** excess (not only the part past the target) as credit (`credit_cents`) against the transaction, with the payer's DID (`payer_did`).
 
@@ -482,25 +499,25 @@ Total size is `35 + 41 * outputs`. For example, 3 outputs is 158 bytes. The sign
 
 ### Encryption
 
-The payload is encrypted to the mint's DID public key, and only the mint's DID secret key can decrypt it. The cipher is AIR's, from `air::names::secp256k1`, not a new scheme: `PublicKey::encrypt` seals bytes to a public key and `SecretKey::decrypt` opens them. It does an ElligatorSwift key exchange with a fresh sender key for every message, then ChaCha20-Poly1305. No payer signature is needed.
+The payload is encrypted to the mint's DID public key, and only the mint's DID secret key can decrypt it. The cipher is AIR's (2.0.3), from `air::names::secp256k1`, which `sp-wire` re-exports, not a new scheme: `PublicKey::encrypt` seals bytes to a public key and `SecretKey::decrypt` opens them. It does an ElligatorSwift key exchange with a fresh sender key for every message, then ChaCha20-Poly1305. No payer signature is needed.
 
 - **Wallet.** Build the payload exactly as in "Payload format", seal it to the mint's published DID public key, and put the result in the OP_RETURN. The wallet library's `build_psp_payload` does all of it (below). `psp-mint encrypt <mint pubkey hex> <payload hex>` seals a ready payload, for testing.
 - **Mint.** The scanner tries to decrypt each data output with the mint's DID secret key and reads only what decrypts. Anything that fails is not for this mint. It is ignored without a record, a price fetch or an error. This covers a payload sealed to another key, a tampered one, and a cleartext one. Nothing is accepted in cleartext any more.
-- **Wire format.** AIR's `Encrypted` has private fields, so the bytes on chain are its `postcard` encoding (serde is the only way in or out): `0x40`, the 64-byte sender key, the 16-byte tag, the length of the ciphertext (1 byte below 128, 2 bytes below 16,384), then the ciphertext, which is as long as the payload. Bytes left over after that are rejected. A payload is therefore 82 bytes longer when encrypted (83 from 128 bytes up). The sender key is sent as an ElligatorSwift encoding, which looks like random bytes.
+- **Wire format.** `64-byte ElligatorSwift sender key || 16-byte tag || ciphertext`, and nothing else. There is no length byte and no framing, so a sealed payload is always 80 bytes longer than the payload, whatever its length, and anything under 81 bytes cannot be a sealed payload. A sealed payload is a constant-size envelope around a ciphertext as long as the payload; bytes added or removed make the tag fail, so they are rejected. The sender key is an ElligatorSwift encoding, which looks like random bytes. This is wire version 2. Version 1 (AIR 1.1.0) used a `postcard` envelope of 82 or 83 bytes, and the mint no longer reads it (see "Wire format and versions").
 - **Keys.** The mint's DID key pair is a local file, `mint_did_key.json`, in the data directory, with `0600` permissions. It is made on first use and never overwritten. `psp-mint pubkey` prints the public half, 33 bytes in hex, for wallets to seal to. Moving the key into the AIR keystore is deferred.
-- **Relay.** A sealed payload is over 83 bytes, the old standard limit for a data output. Bitcoin Core 30 and later relay larger ones by default, and 31.1 is what this targets. A node with an older policy will not relay the transaction.
+- **Relay.** A sealed payload is at least 156 bytes (one note), well over 83 bytes, the old standard limit for a data output. Bitcoin Core 30 and later relay larger ones by default, and 31.1 is what this targets. A node with an older policy will not relay the transaction.
 
 Expected sizes, at 1 sat/vB and BTC at $81,672:
 
 | Purchase | Notes | Payload | Output | Fee |
 |---|---|---|---|---|
-| $10 (100 PSP) | 3 | 241 B | 253 vB | about $0.21 |
-| $100 (1,000 PSP) | 6 | 364 B | 379 vB | about $0.31 |
-| $1,000 (10,000 PSP) | 5 | 323 B | 338 vB | about $0.28 |
-| $10,000 (100,000 PSP) | 6 | 364 B | 379 vB | about $0.31 |
-| $6,553.50 (65,535 PSP, a worst case under $10,000) | 16 | 774 B | 789 vB | about $0.64 |
+| $10 (100 PSP) | 3 | 238 B | 250 vB | about $0.20 |
+| $100 (1,000 PSP) | 6 | 361 B | 376 vB | about $0.31 |
+| $1,000 (10,000 PSP) | 5 | 320 B | 335 vB | about $0.27 |
+| $10,000 (100,000 PSP) | 6 | 361 B | 376 vB | about $0.31 |
+| $6,553.50 (65,535 PSP, a worst case under $10,000) | 16 | 771 B | 786 vB | about $0.64 |
 
-The notes are the set bits of the purchase in PSP (it is split into powers of two), at 41 bytes each, plus 118 bytes of DID, count and encryption. At one PSP to the dollar a purchase under $10,000 took at most 13 notes (651 bytes); at ten to the dollar it takes at most 16 (774 bytes), the cost of the finer unit. The most any purchase can take is one of each of the 25 denominations: 1,143 bytes.
+The notes are the set bits of the purchase in PSP (it is split into powers of two), at 41 bytes each, plus 115 bytes of DID, count and encryption (35 for the reply and count, 80 for the envelope). At one PSP to the dollar a purchase under $10,000 took at most 13 notes (648 bytes); at ten to the dollar it takes at most 16 (771 bytes), the cost of the finer unit. The most any purchase can take is one of each of the 25 denominations: 1,140 bytes.
 
 ### Wallet
 
@@ -522,7 +539,7 @@ The items every repo shares (all traffic over the AIR except local processes on 
 - **Local store.** psp-mint's own state is `db/` (sled), `settlements.json`, `melt_memos.json`, the key files and `rollovers.json`. Only one process can open the mint (so `serve` and the one-shot run cannot overlap), a live `db/` must not be copied as a backup, and the `serve` design, with the API and the scanner sharing one process and one mutex, assumes this local store and will change with it. The AIR storage that replaces sled must keep the rule from mint-core v0.1.3: marking an output's blind nonce used and adding its amount to the issued total are one atomic step.
 - **Running as a service.** `serve` exits with a non-zero status if the scan thread dies or the mint lock is poisoned, but nothing restarts it. A payment is only priced when a scan sees it at 1 confirmation or later, so downtime can cost a price lock. Something like `launchd` or `systemd` should restart it, and a monitor should poll `/health`.
 - **API hardening.** The HTTP API has no TLS and no authentication, and binds to localhost. Rate limiting is not built.
-- **AIR messaging for reconciliation (deferred to the AIR).** Two things are recorded only, because the messages to the payer's DID are not built: a credit (an overpayment beyond the reconciliation target) and a payment held as `paid_unsettled` (an underpayment no partial fill can settle). The held payment also needs the second half: the payer's new matching request arriving over AIR, being checked against the stored payment, signed, and marked settled so it cannot be claimed twice. Credit and held records are kept for the payer's DID indefinitely; whether they ever become a dead obligation is a policy question for later.
+- **AIR messaging for reconciliation (deferred to the AIR).** Two things are recorded only, because the messages to the payer's DID are not built: a credit (an overpayment beyond the reconciliation target) and a payment held as `paid_unsettled` (an underpayment no partial fill can settle). The held payment also needs the second half: the payer's new matching request arriving over AIR, being checked against the stored payment, signed, and marked settled so it cannot be claimed twice. Credit and held records are kept for the payer's DID indefinitely; whether they ever become a dead obligation is a policy question for later. A local stand-in for settling held payments is deliberately not built; it waits on AIR.
 - **Signature delivery (deferred to the AIR).** The signatures are printed to the terminal, as a temporary development stand-in. They will be sent to the DID as an AIR DID message, paid for by the mint. Not built.
 - **Silent payments (deferred, behind the scanner interface).** A static address, with a scanner that finds payments by a scan key, can plug in through the scanner interface (see "The scanner interface") without changing settlement. Today the PSP scans a normal wallet address.
 - **Mint key storage (deferred to the AIR).** The note-signing keyfile and the DID key file are plain JSON with `0600` permissions in the data directory. The mint keystore moves into the AIR, and how the keys are protected there is not decided.

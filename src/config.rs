@@ -197,11 +197,18 @@ pub const SPECS: &[Spec] = &[
         what: "A payment is settled, at its locked price, once it has this many confirmations.",
     },
     Spec {
+        key: "settle.price_tolerance",
+        env: "PSP_PRICE_TOLERANCE",
+        default: "0.01",
+        units: "fraction, 0 to 1 (0.01 is 1%)",
+        what: "How far a payment may miss the requested amount, over or under, and still settle in full as if it were exact: every requested note is signed, and nothing is credited, dropped or kept. It covers the BTC price moving between the price lock (settle.lock_confirmations) and settlement (settle.min_confirmations), which no payer should be penalised or credited for. Widen it in a volatile market. It must not be more than settle.payment_reconciliation_target (the mint refuses to start otherwise), because that setting handles the payments outside it. See the README.",
+    },
+    Spec {
         key: "settle.payment_reconciliation_target",
         env: "PSP_PAYMENT_RECONCILIATION_TARGET",
         default: "0.10",
         units: "fraction, 0 to 1 (0.10 is 10%)",
-        what: "How far a payment may miss the requested amount before the mint stops absorbing the difference and reconciles it. Over by no more than this: the mint keeps the excess; over by more: the excess is recorded as credit for the payer's DID. Short: the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid, those notes are signed and the mint keeps the remainder; otherwise nothing is signed and the payment is held as paid but unsettled. Tighter is fairer to payers but sends more payments to credit or reconciliation; looser settles more automatically but keeps or forgoes more value. See the README.",
+        what: "For a payment outside settle.price_tolerance, which is genuinely wrong: how far it may miss the requested amount before the mint stops absorbing the difference and reconciles it. Over by no more than this: the mint keeps the excess; over by more: the excess is recorded as credit for the payer's DID. Short: the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid, those notes are signed and the mint keeps the remainder; otherwise nothing is signed and the payment is held as paid but unsettled. Tighter is fairer to payers but sends more payments to credit or reconciliation; looser settles more automatically but keeps or forgoes more value. See the README.",
     },
     Spec {
         key: "mint.max_denomination_units",
@@ -245,6 +252,8 @@ pub struct Config {
     pub price_timeout_secs: u64,
     pub lock_confirmations: u32,
     pub min_confirmations: u32,
+    /// `settle.price_tolerance` in basis points (100 is 0.01).
+    pub price_tolerance_bps: u64,
     /// `settle.payment_reconciliation_target` in basis points (1000 is 0.10).
     pub payment_reconciliation_target_bps: u64,
     pub max_denomination_units: u64,
@@ -283,6 +292,7 @@ impl Config {
             price_timeout_secs: price::DEFAULT_TIMEOUT_SECS,
             lock_confirmations: settle::LOCK_CONFIRMATIONS,
             min_confirmations: settle::MIN_CONFIRMATIONS,
+            price_tolerance_bps: settle::PRICE_TOLERANCE_BPS as u64,
             payment_reconciliation_target_bps: settle::PAYMENT_RECONCILIATION_TARGET_BPS as u64,
             max_denomination_units: DEFAULT_MAX_DENOMINATION_UNITS,
             rotation_activation_hours: 8760,
@@ -364,6 +374,7 @@ impl Config {
             "price.timeout_secs" => self.price_timeout_secs.to_string(),
             "settle.lock_confirmations" => self.lock_confirmations.to_string(),
             "settle.min_confirmations" => self.min_confirmations.to_string(),
+            "settle.price_tolerance" => bps_to_fraction(self.price_tolerance_bps),
             "settle.payment_reconciliation_target" => {
                 bps_to_fraction(self.payment_reconciliation_target_bps)
             }
@@ -398,6 +409,7 @@ impl Config {
             "price.timeout_secs" => self.price_timeout_secs = whole(key, value)?,
             "settle.lock_confirmations" => self.lock_confirmations = whole(key, value)?,
             "settle.min_confirmations" => self.min_confirmations = whole(key, value)?,
+            "settle.price_tolerance" => self.price_tolerance_bps = fraction_to_bps(key, value)?,
             "settle.payment_reconciliation_target" => {
                 self.payment_reconciliation_target_bps = fraction_to_bps(key, value)?
             }
@@ -531,6 +543,18 @@ impl Config {
                 bps_to_fraction(self.payment_reconciliation_target_bps)
             ));
         }
+        if self.price_tolerance_bps > 10_000 {
+            problems.push(format!(
+                "settle.price_tolerance = {} is out of range: it must be a fraction from 0 to 1 (0.01 is 1%; 0 treats only an exact payment as exact)",
+                bps_to_fraction(self.price_tolerance_bps)
+            ));
+        } else if self.price_tolerance_bps > self.payment_reconciliation_target_bps {
+            problems.push(format!(
+                "settle.price_tolerance = {} is more than settle.payment_reconciliation_target = {}: the tolerance settles a payment as if exact, so it cannot be wider than the target that handles the payments outside it. Lower the tolerance or raise the target",
+                bps_to_fraction(self.price_tolerance_bps),
+                bps_to_fraction(self.payment_reconciliation_target_bps)
+            ));
+        }
         if self.rotation_activation_hours > 0
             && self.rotation_period_hours > 0
             && self.rotation_period_hours < MIN_PSP_ROTATION_PERIOD_HOURS
@@ -598,6 +622,7 @@ impl Config {
         Terms {
             lock_confirmations: self.lock_confirmations,
             min_confirmations: self.min_confirmations,
+            price_tolerance_bps: u128::from(self.price_tolerance_bps),
             reconciliation_target_bps: u128::from(self.payment_reconciliation_target_bps),
         }
     }
@@ -698,10 +723,13 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             }
             match value {
                 toml::Value::Integer(n) => pairs.push((key, n.to_string())),
-                // A decimal is only meaningful for the reconciliation target
-                // (`0.10`); everywhere else it is a type error, not a number to
-                // be truncated.
-                toml::Value::Float(f) if key == "settle.payment_reconciliation_target" => {
+                // A decimal is only meaningful for the two fractions
+                // (`0.01`, `0.10`); everywhere else it is a type error, not a
+                // number to be truncated.
+                toml::Value::Float(f)
+                    if key == "settle.payment_reconciliation_target"
+                        || key == "settle.price_tolerance" =>
+                {
                     pairs.push((key, f.to_string()))
                 }
                 toml::Value::Float(f) => {
@@ -938,6 +966,8 @@ mod tests {
             c.get("settle.payment_reconciliation_target").unwrap(),
             "0.10"
         );
+        assert_eq!(c.price_tolerance_bps, 100);
+        assert_eq!(c.get("settle.price_tolerance").unwrap(), "0.01");
         assert_eq!(c.max_denomination_units, 16_777_216);
         for bytes in [
             c.melt_max_request_bytes,
@@ -1112,6 +1142,7 @@ mod tests {
             Terms {
                 lock_confirmations: 2,
                 min_confirmations: 10,
+                price_tolerance_bps: 100,
                 reconciliation_target_bps: 2500,
             }
         );
@@ -1175,6 +1206,75 @@ mod tests {
             problems[0].starts_with("settle.payment_reconciliation_target = 1.0001"),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn the_tolerance_is_read_from_the_file_and_the_environment() {
+        let dir = scratch("tolerance");
+        fs::write(dir.join(FILE_NAME), "[settle]\nprice_tolerance = 0.02\n").unwrap();
+        let loaded = load(&dir, &env_of(&[])).unwrap();
+        assert_eq!(loaded.config.price_tolerance_bps, 200);
+        assert_eq!(loaded.config.terms().price_tolerance_bps, 200);
+        assert_eq!(loaded.sources["settle.price_tolerance"], Source::File);
+        let loaded = load(&dir, &env_of(&[("PSP_PRICE_TOLERANCE", "0.005")])).unwrap();
+        assert_eq!(loaded.config.price_tolerance_bps, 50);
+        assert_eq!(
+            loaded.sources["settle.price_tolerance"],
+            Source::Env("PSP_PRICE_TOLERANCE")
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_tolerance_must_be_a_fraction_from_zero_to_one() {
+        let mut c = Config::defaults("/h");
+        c.payment_reconciliation_target_bps = 10_000;
+        c.set("settle.price_tolerance", "0").unwrap();
+        assert!(c.validate().is_ok());
+        c.set("settle.price_tolerance", "1").unwrap();
+        assert!(c.validate().is_ok());
+        c.set("settle.price_tolerance", "1.0001").unwrap();
+        let problems = c.validate().unwrap_err();
+        assert!(
+            problems[0].starts_with("settle.price_tolerance = 1.0001"),
+            "{problems:?}"
+        );
+        assert!(c.set("settle.price_tolerance", "-0.01").is_err());
+        assert!(c.set("settle.price_tolerance", "1%").is_err());
+    }
+
+    #[test]
+    fn a_tolerance_wider_than_the_target_is_refused_at_startup() {
+        let mut c = Config::defaults("/h");
+        // equal is allowed: the target then handles nothing the tolerance did not
+        c.set("settle.price_tolerance", "0.10").unwrap();
+        assert!(c.validate().is_ok());
+        c.set("settle.price_tolerance", "0.1001").unwrap();
+        let problems = c.validate().unwrap_err();
+        assert!(
+            problems[0].starts_with("settle.price_tolerance = 0.1001 is more than"),
+            "{problems:?}"
+        );
+        // lowering the target below the default tolerance is refused the same way
+        let mut c = Config::defaults("/h");
+        c.set("settle.payment_reconciliation_target", "0.005")
+            .unwrap();
+        assert!(c.validate().is_err());
+        // and through the file, where startup sees it
+        let dir = scratch("tolerance-over-target");
+        fs::write(
+            dir.join(FILE_NAME),
+            "[settle]\nprice_tolerance = 0.05\npayment_reconciliation_target = 0.02\n",
+        )
+        .unwrap();
+        let problems = load(&dir, &env_of(&[])).unwrap_err();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("settle.price_tolerance = 0.05 is more than")),
+            "{problems:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

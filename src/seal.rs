@@ -1,6 +1,6 @@
 //! The OP_RETURN payload is encrypted to the mint's DID public key.
 //!
-//! The cipher is AIR's, not a new scheme: `air::names::secp256k1`, where
+//! The cipher is AIR's, not a new scheme: `air::names::secp256k1` (re-exported by sp-wire), where
 //! `PublicKey::encrypt` seals bytes to a public key and `SecretKey::decrypt`
 //! opens them with the matching secret key. It does an ElligatorSwift key
 //! exchange and encrypts with ChaCha20-Poly1305, and a fresh sender key is made
@@ -12,11 +12,11 @@
 //! [`open_payloads`] drops it without an error and the rest of the PSP never
 //! sees it.
 //!
-//! On the wire the sealed payload is the `postcard` encoding of AIR's
-//! `Encrypted`, because its fields are private and serde is the only way in or
-//! out. For a payload shorter than 128 bytes that is
-//! `0x40 || 64 byte sender key || 16 byte tag || length byte || ciphertext`, so
-//! 82 bytes longer than the payload. The ciphertext is as long as the payload.
+//! On the wire (AIR 2.0.3, wire version 2) the sealed payload is
+//! `64 byte ElligatorSwift sender key || 16 byte tag || ciphertext`. That is a
+//! constant 80 bytes longer than the payload, whatever its length, and the
+//! ciphertext is as long as the payload. Wire version 1 (AIR 1.1.0) carried a
+//! `postcard` envelope of 82 or 83 bytes; it is not read any more.
 //!
 //! The mint's DID key pair is a local file for now (`mint_did_key.json`, `0600`
 //! permissions, in the data directory). Moving it into the AIR keystore is
@@ -137,17 +137,17 @@ mod tests {
     }
 
     #[test]
-    fn the_sealed_payload_is_82_bytes_longer_and_hides_the_did() {
+    fn the_sealed_payload_is_80_bytes_longer_and_hides_the_did() {
         let mint = SecretKey::new();
         let sealed = encrypt(&mint.public_key(), &plaintext()).unwrap();
         assert_eq!(plaintext().len(), 117);
-        assert_eq!(sealed.len(), 117 + 82);
+        assert_eq!(sealed.len(), 117 + sp_wire::seal::OVERHEAD);
         // the payer's DID bytes do not appear on chain
         let did = &plaintext()[1..34];
         assert!(!sealed.windows(did.len()).any(|w| w == did));
-        // a payload of 128 bytes or more takes a two byte length
+        // the overhead does not depend on the length
         let longer = encrypt(&mint.public_key(), &vec![7u8; 158]).unwrap();
-        assert_eq!(longer.len(), 158 + 83);
+        assert_eq!(longer.len(), 158 + sp_wire::seal::OVERHEAD);
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
         assert!(decrypt(&mint, &sealed[..40]).is_err());
         let mut extended = sealed.clone();
         extended.push(0);
-        assert_eq!(decrypt(&mint, &extended), Err(SealError::Malformed));
+        assert_eq!(decrypt(&mint, &extended), Err(SealError::Undecryptable));
         assert!(decrypt(&mint, &[0xff; 300]).is_err());
         // the old cleartext payload is not a sealed payload
         assert!(decrypt(&mint, &plaintext()).is_err());

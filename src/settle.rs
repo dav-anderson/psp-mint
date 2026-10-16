@@ -13,9 +13,22 @@ use crate::scan::Received;
 pub const LOCK_CONFIRMATIONS: u32 = 1;
 /// A payment is settled once it has this many confirmations.
 pub const MIN_CONFIRMATIONS: u32 = 6;
+/// The price tolerance (1%, in basis points): how far a payment may miss the
+/// requested amount, in either direction, and still settle in full as if it were
+/// exact. Every requested note is signed, nothing is credited, dropped or kept.
+///
+/// It exists because the price is locked at 1 confirmation and the payment is
+/// settled at 6, an hour or so later, and BTC moves in that time. The payer
+/// priced the request at one moment and the mint settles it at another, so a
+/// small miss is movement in the market, not a mistake. No payer should be
+/// penalised or credited for it. The operator can widen it
+/// (`settle.price_tolerance`) in a volatile market. It never exceeds the
+/// reconciliation target below, which the config checks at startup.
+pub const PRICE_TOLERANCE_BPS: u128 = 100;
 /// How far a payment may miss the requested amount before the mint stops
 /// absorbing the difference and reconciles it instead (10%, in basis points).
-/// One value covers both directions:
+/// This applies only to a payment that is outside the price tolerance above; it
+/// is for payments that are genuinely wrong. One value covers both directions:
 ///
 /// - Over by no more than this: the mint keeps the excess. Over by more: the
 ///   excess is recorded as credit for the payer's DID.
@@ -33,6 +46,10 @@ pub struct Terms {
     pub lock_confirmations: u32,
     /// Confirmations at which the payment is settled.
     pub min_confirmations: u32,
+    /// `settle.price_tolerance`, in basis points (100 is 1%). A payment this
+    /// close to the request, either way, settles in full as if exact. See
+    /// [`PRICE_TOLERANCE_BPS`].
+    pub price_tolerance_bps: u128,
     /// `settle.payment_reconciliation_target`, in basis points (1000 is 10%).
     /// See [`PAYMENT_RECONCILIATION_TARGET_BPS`].
     pub reconciliation_target_bps: u128,
@@ -43,6 +60,7 @@ impl Default for Terms {
         Terms {
             lock_confirmations: LOCK_CONFIRMATIONS,
             min_confirmations: MIN_CONFIRMATIONS,
+            price_tolerance_bps: PRICE_TOLERANCE_BPS,
             reconciliation_target_bps: PAYMENT_RECONCILIATION_TARGET_BPS,
         }
     }
@@ -106,6 +124,9 @@ pub struct Issue {
     /// credit for `payer_did`. 0 when the excess was within the target and kept.
     pub credit_cents: u64,
     pub over_under_bps: i64,
+    /// True if the payment missed the request, but by no more than the price
+    /// tolerance, so it was settled in full as if exact.
+    pub within_tolerance: bool,
     /// The payer's AIR DID from the payload: who a credit is owed to.
     pub payer_did: [u8; DID_LEN],
 }
@@ -164,8 +185,13 @@ pub struct Assessment {
     /// What was paid, in sat-cents (sats times the price in cents): the exact
     /// value a partial fill is measured against.
     pub paid_value: u128,
-    /// True if the payment is worth less than the request. The plan then drops
-    /// outputs; it does not matter yet whether the result is within the target.
+    /// True if the payment is within the price tolerance of the request, in
+    /// either direction (exact counts). It then settles in full: not underpaid,
+    /// no credit, and the reconciliation target does not come into it.
+    pub within_tolerance: bool,
+    /// True if the payment is worth less than the request by more than the price
+    /// tolerance. The plan then drops outputs; it does not matter yet whether the
+    /// result is within the target.
     pub underpaid: bool,
     /// Overpayment beyond the reconciliation target, in whole USD cents (rounded
     /// down). 0 when the payment is short, exact, or over by no more than the
@@ -208,7 +234,12 @@ pub fn assess_with(
 ) -> Assessment {
     let paid = u128::from(value_sats) * u128::from(usd_cents_per_btc);
     let required = u128::from(requested_units) * SAT_CENTS_PER_UNIT;
-    let (underpaid, credit_cents) = if paid >= required {
+    // Up to and including the tolerance, either way, counts as exact.
+    let within_tolerance = paid.abs_diff(required).saturating_mul(10_000)
+        <= required.saturating_mul(terms.price_tolerance_bps);
+    let (underpaid, credit_cents) = if within_tolerance {
+        (false, 0)
+    } else if paid >= required {
         let excess = paid - required;
         // Within the target the mint keeps the excess; beyond it, all of the
         // excess (not just the part past the target) is credited.
@@ -227,6 +258,7 @@ pub fn assess_with(
         over_under_bps: basis_points(paid, required),
         paid_units: allowed_units(value_sats, usd_cents_per_btc),
         paid_value: paid,
+        within_tolerance,
         underpaid,
         credit_cents,
     }
@@ -492,6 +524,7 @@ pub fn settle_with(
         skipped_units: plan.skipped_units,
         credit_cents: assessment.credit_cents,
         over_under_bps: assessment.over_under_bps,
+        within_tolerance: assessment.within_tolerance,
         payer_did: payload.did,
     }))
 }
@@ -580,7 +613,10 @@ mod tests {
         let exact = assess(100_000, BTC_10K, 100);
         assert!(!exact.underpaid);
         assert_eq!(exact.credit_cents, 0);
-        assert!(assess(99_999, BTC_10K, 100).underpaid);
+        // the price tolerance (1% by default) is off in this test, so that a
+        // hair short is still short
+        let strict = strict();
+        assert!(assess_with(99_999, BTC_10K, 100, &strict).underpaid);
         assert!(assess(0, BTC_10K, 100).underpaid);
         // 10% over exactly is within the target: the mint keeps it
         assert_eq!(assess(110_000, BTC_10K, 100).credit_cents, 0);
@@ -603,12 +639,22 @@ mod tests {
         assert_eq!(b.over_under_bps, -10_000);
     }
 
+    /// The default rules with the price tolerance off, for tests of the
+    /// reconciliation rules on payments that miss by less than 1%.
+    fn strict() -> Terms {
+        Terms {
+            price_tolerance_bps: 0,
+            ..Terms::default()
+        }
+    }
+
     /// An assessment for a payment worth exactly `paid_units` whole units.
     fn short(paid_units: u64) -> Assessment {
         Assessment {
             over_under_bps: -5_000,
             paid_units,
             paid_value: u128::from(paid_units) * SAT_CENTS_PER_UNIT,
+            within_tolerance: false,
             underpaid: true,
             credit_cents: 0,
         }
@@ -699,14 +745,14 @@ mod tests {
         // one large note: dropping it leaves nothing
         let one = [out(100, 1)];
         assert_eq!(
-            plan(&one, &assess(99_000, BTC_10K, 100), &t),
+            plan(&one, &assess_with(99_000, BTC_10K, 100, &strict()), &t),
             unsettled_plan(100)
         );
         // a hair short of two notes: the drop would leave 20% of the payment
         // unused, beyond the target
         let two = [out(4, 1), out(1, 2)];
         assert_eq!(
-            plan(&two, &assess(4_999, BTC_10K, 5), &t),
+            plan(&two, &assess_with(4_999, BTC_10K, 5, &strict()), &t),
             unsettled_plan(5)
         );
         // nothing paid at all
@@ -1171,10 +1217,11 @@ mod tests {
         let (logic, mut records, dir) = fixture("hair");
         let mut price = Price::at(BTC_10K);
         // 99.98% of the request, yet dropping the 1 would leave 20% of the
-        // payment unused: held, not trimmed (the 1% leeway of the old rule is gone)
+        // payment unused: held, not trimmed. The price tolerance is off here;
+        // with it on (the default) this payment is within 1% and settles in full.
         let r = received("aa", 6, 4_999, Some(PAYLOAD_HEX));
         assert!(matches!(
-            run(&logic, &mut records, &r, &mut price),
+            settle_with(&logic, &mut records, &r, &mut || price.ask(), &strict()).unwrap(),
             Settlement::PaidUnsettled(_)
         ));
         assert_eq!(total(&logic), Amount::ZERO);
@@ -1404,6 +1451,156 @@ mod tests {
         assert!(!records.get("cc").unwrap().late);
         assert!(matches!(go(&mut records, 3), Settlement::Issued(_)));
         assert_eq!(total(&logic), Amount::from_units(5));
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- the price tolerance ----
+    //
+    // 65 units ($6.50) is 65,000 sats at $10,000 per BTC, so 1% is 650 sats.
+    // 0.9% is 585 sats either way, 1.1% is 715.
+
+    fn big_payload() -> String {
+        payload_bytes(&[(64, 1), (1, 2)])
+    }
+
+    #[test]
+    fn a_payment_within_the_tolerance_is_exact_either_way() {
+        let t = Terms::default();
+        for sats in [64_415u64, 65_000, 65_585] {
+            let a = assess_with(sats, BTC_10K, 65, &t);
+            assert!(a.within_tolerance, "{sats}");
+            assert!(!a.underpaid, "{sats}");
+            assert_eq!(a.credit_cents, 0, "{sats}");
+        }
+        // exactly 1% is still within it; one sat more is not
+        assert!(assess_with(64_350, BTC_10K, 65, &t).within_tolerance);
+        assert!(assess_with(65_650, BTC_10K, 65, &t).within_tolerance);
+        assert!(!assess_with(64_349, BTC_10K, 65, &t).within_tolerance);
+        assert!(!assess_with(65_651, BTC_10K, 65, &t).within_tolerance);
+    }
+
+    #[test]
+    fn a_payment_beyond_the_tolerance_is_left_to_the_reconciliation_target() {
+        let t = Terms::default();
+        let under = assess_with(64_285, BTC_10K, 65, &t); // 1.1% under
+        assert!(!under.within_tolerance && under.underpaid);
+        let over = assess_with(65_715, BTC_10K, 65, &t); // 1.1% over
+        assert!(!over.within_tolerance && !over.underpaid);
+        // within the 10% target, so the mint keeps the excess
+        assert_eq!(over.credit_cents, 0);
+        // with a target of 1% the same payment is credited, all of the excess
+        let tight = Terms {
+            reconciliation_target_bps: 100,
+            ..Terms::default()
+        };
+        assert_eq!(assess_with(65_715, BTC_10K, 65, &tight).credit_cents, 7);
+    }
+
+    #[test]
+    fn the_tolerance_comes_from_the_terms() {
+        let wide = Terms {
+            price_tolerance_bps: 300,
+            ..Terms::default()
+        };
+        assert!(assess_with(63_050, BTC_10K, 65, &wide).within_tolerance); // 3.0% under
+        assert!(!assess_with(63_049, BTC_10K, 65, &wide).within_tolerance);
+        assert!(!assess_with(64_415, BTC_10K, 65, &strict()).within_tolerance);
+        // zero means only an exact payment is exact
+        assert!(assess_with(65_000, BTC_10K, 65, &strict()).within_tolerance);
+    }
+
+    #[test]
+    fn nine_tenths_of_a_percent_under_settles_in_full() {
+        let (logic, mut records, dir) = fixture("tol-under");
+        let mut price = Price::at(BTC_10K);
+        let r = received("aa", 6, 64_415, Some(&big_payload()));
+        let issue = issued(run(&logic, &mut records, &r, &mut price));
+        assert_eq!(issue.results.len(), 2);
+        assert!(issue.results.iter().all(|x| x.is_ok()));
+        assert_eq!(issue.skipped_units, 0);
+        assert_eq!(issue.credit_cents, 0);
+        assert!(issue.within_tolerance);
+        assert_eq!(issue.over_under_bps, -90);
+        let rec = records.get("aa").unwrap();
+        assert_eq!(rec.status, Status::Issued);
+        assert_eq!(rec.skipped_units, 0);
+        assert_eq!(rec.credit_cents, 0);
+        assert_eq!(total(&logic), Amount::from_units(65));
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nine_tenths_of_a_percent_over_settles_in_full_with_no_credit() {
+        let (logic, mut records, dir) = fixture("tol-over");
+        let mut price = Price::at(BTC_10K);
+        let r = received("aa", 6, 65_585, Some(&big_payload()));
+        let issue = issued(run(&logic, &mut records, &r, &mut price));
+        assert_eq!(issue.results.len(), 2);
+        assert_eq!(issue.skipped_units, 0);
+        assert_eq!(issue.credit_cents, 0);
+        assert!(issue.within_tolerance);
+        assert_eq!(issue.over_under_bps, 90);
+        assert!(records.owed_to(&hex::encode([7u8; 33])).is_empty());
+        assert_eq!(total(&logic), Amount::from_units(65));
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_point_one_percent_under_goes_to_reconciliation() {
+        let (logic, mut records, dir) = fixture("tol-beyond-under");
+        let mut price = Price::at(BTC_10K);
+        // 64,285 sats buys 64 whole units: the 1 is dropped and the 64 signed,
+        // the target rule at work (0.44% of the payment is kept)
+        let r = received("aa", 6, 64_285, Some(&big_payload()));
+        let issue = issued(run(&logic, &mut records, &r, &mut price));
+        assert_eq!(issue.results.len(), 1);
+        assert_eq!(issue.skipped_units, 1);
+        assert!(!issue.within_tolerance);
+        assert_eq!(total(&logic), Amount::from_units(64));
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+        // and on the 5-unit request, where no drop fits, it is held
+        let (logic, mut records, dir) = fixture("tol-beyond-held");
+        let mut price = Price::at(BTC_10K);
+        let r = received("bb", 6, 4_945, Some(PAYLOAD_HEX));
+        assert!(matches!(
+            run(&logic, &mut records, &r, &mut price),
+            Settlement::PaidUnsettled(_)
+        ));
+        assert_eq!(total(&logic), Amount::ZERO);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_point_one_percent_over_goes_to_reconciliation() {
+        // under the default 10% target the mint keeps the excess; the payment is
+        // not "as if exact" (not within the tolerance) but nothing is credited
+        let (logic, mut records, dir) = fixture("tol-beyond-over");
+        let mut price = Price::at(BTC_10K);
+        let r = received("aa", 6, 65_715, Some(&big_payload()));
+        let issue = issued(run(&logic, &mut records, &r, &mut price));
+        assert!(!issue.within_tolerance);
+        assert_eq!(issue.credit_cents, 0);
+        assert_eq!(issue.over_under_bps, 110);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+        // with a target of 1% the same payment is credited to the payer's DID
+        let (logic, mut records, dir) = fixture("tol-beyond-credit");
+        let mut price = Price::at(BTC_10K);
+        let tight = Terms {
+            reconciliation_target_bps: 100,
+            ..Terms::default()
+        };
+        let r = received("bb", 6, 65_715, Some(&big_payload()));
+        let issue =
+            issued(settle_with(&logic, &mut records, &r, &mut || price.ask(), &tight).unwrap());
+        assert_eq!(issue.credit_cents, 7);
+        assert!(!issue.within_tolerance);
+        assert_eq!(records.get("bb").unwrap().credit_cents, 7);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }

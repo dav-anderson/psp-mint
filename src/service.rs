@@ -153,6 +153,12 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
         }
         Settlement::Issued(issue) => {
             lines.push(format!("  over/under: {} bps", issue.over_under_bps));
+            if issue.within_tolerance && issue.over_under_bps != 0 {
+                lines.push(format!(
+                    "  within the price tolerance ({}): settled in full as if exact",
+                    percent_text(terms.price_tolerance_bps)
+                ));
+            }
             if issue.skipped_units > 0 {
                 lines.push(format!(
                     "  underpaid: the smallest outputs were dropped ({} units not signed); what is signed is within {} of the amount paid and the mint keeps the remainder",
@@ -408,7 +414,7 @@ mod tests {
     #[test]
     fn sealed_payments_settle_and_payments_sealed_to_another_key_leave_no_trace() {
         use crate::seal;
-        use air::names::secp256k1::SecretKey;
+        use sp_wire::seal::SecretKey;
 
         let (logic, mut records, dir) = fixture("sealed");
         let mint = SecretKey::new();
@@ -503,6 +509,7 @@ mod tests {
         let terms = Terms {
             lock_confirmations: 2,
             min_confirmations: 3,
+            price_tolerance_bps: 50,
             reconciliation_target_bps: 150,
         };
         let r = received("dd", 1);
@@ -524,6 +531,7 @@ mod tests {
             skipped_units: 2,
             credit_cents: 100,
             over_under_bps: 0,
+            within_tolerance: false,
             payer_did: [7; crate::payload::DID_LEN],
         };
         let lines = describe_with(&r, &Settlement::Issued(issue), &terms);

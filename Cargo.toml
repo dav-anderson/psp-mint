@@ -1,6 +1,6 @@
 [package]
 name = "psp-mint"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -12,10 +12,7 @@ mint-types = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.
 bdhke = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.1.3" }
 mint-server = { git = "https://github.com/dav-anderson/mint-core.git", tag = "v0.1.3" }
 # The wire types, shared with the other mints and the wallet.
-sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.1.0", features = ["seal"] }
-# AIR has no tags, so it is pinned by commit (1.1.0). Its manifest names
-# ../substance by path, so building it from git needs the local [patch] below.
-air = { git = "https://github.com/ramp-stack/air", rev = "6dd01171dfd80c5e3ae6e948013377f8b7e39022" }
+sp-wire = { git = "https://github.com/dav-anderson/sp-wire.git", tag = "v0.2.0", features = ["seal"] }
 secp256k1 = { version = "0.30", default-features = false, features = ["global-context", "rand"] }
 hex = "0.4.3"
 sha2 = "0.10"
@@ -29,9 +26,6 @@ toml = "0.8"
 
 # For local work, put this in .cargo/config.toml (git-ignored) or uncomment it
 # here and do not commit it. See the top-level README.
-#
-# [patch."https://github.com/ramp-stack/air"]
-# air = { path = "../air" }
 #
 # [patch."https://github.com/dav-anderson/sp-wire.git"]
 # sp-wire = { path = "../sp-wire" }

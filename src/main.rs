@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use air::names::secp256k1::SecretKey;
 use mint_server::state::AppState;
 use mint_types::Amount;
 use psp_mint::config::{self, Config};
@@ -17,6 +16,7 @@ use psp_mint::records::Records;
 use psp_mint::rpc::Rpc;
 use psp_mint::settle::Settlement;
 use psp_mint::{rotation, scan, seal, server, service};
+use sp_wire::seal::SecretKey;
 
 /// Load the settings, or say everything that is wrong with them.
 fn load_config(data_dir: &Path, flag: Option<Network>) -> Result<config::Loaded, Box<dyn Error>> {
