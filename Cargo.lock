@@ -13,14 +13,15 @@ dependencies = [
 
 [[package]]
 name = "air"
-version = "1.1.0"
+version = "2.0.3"
+source = "git+https://github.com/ramp-stack/air?rev=8e281d585ef0280812c109f67e248d5579c1970e#8e281d585ef0280812c109f67e248d5579c1970e"
 dependencies = [
  "arc-swap",
  "axum",
- "bitcoin_hashes 0.20.0",
  "chacha20-poly1305",
  "chrono",
  "crossfire",
+ "futures",
  "futures-util",
  "hex",
  "im",
@@ -32,7 +33,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "substance",
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
@@ -167,6 +167,7 @@ checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 [[package]]
 name = "bdhke"
 version = "0.1.3"
+source = "git+https://github.com/dav-anderson/mint-core.git?tag=v0.1.3#1366acec7a7550a220dc287995b6d2af5e93cefc"
 dependencies = [
  "rand 0.8.8",
  "secp256k1 0.30.0",
@@ -175,29 +176,14 @@ dependencies = [
 
 [[package]]
 name = "bitcoin-consensus-encoding"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8d7ca3dc8ff835693ad73bf1596240c06f974a31eeb3f611aaedf855f1f2725"
-dependencies = [
- "bitcoin-internals 0.5.0",
-]
-
-[[package]]
-name = "bitcoin-consensus-encoding"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9daa31138eb443d5751b207f3f64154e2bb09cd59960562ccc7a7112be38147f"
 dependencies = [
- "bitcoin-internals 0.7.0",
+ "bitcoin-internals",
  "hex-conservative 1.3.0",
  "serde",
 ]
-
-[[package]]
-name = "bitcoin-internals"
-version = "0.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a30a22d1f112dde8e16be7b45c63645dc165cef254f835b3e1e9553e485cfa64"
 
 [[package]]
 name = "bitcoin-internals"
@@ -211,7 +197,7 @@ version = "0.1.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bb5de036369d1ac59d3c1819ebc4d850f89466f5401c571a285b6ed564a4cb78"
 dependencies = [
- "bitcoin-consensus-encoding 1.3.0",
+ "bitcoin-consensus-encoding",
 ]
 
 [[package]]
@@ -222,17 +208,6 @@ checksum = "bca4c7abb40c8817d77403c880988cfd484f23ab2365726afb2f798363e2c4a2"
 dependencies = [
  "bitcoin-io",
  "hex-conservative 0.2.3",
-]
-
-[[package]]
-name = "bitcoin_hashes"
-version = "0.20.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9a8a45c2b41c457a9a9e4670422fcbdf109afb3b22bc920b4045e8bdfd788a3d"
-dependencies = [
- "bitcoin-consensus-encoding 0.1.0",
- "bitcoin-internals 0.5.0",
- "hex-conservative 0.3.2",
 ]
 
 [[package]]
@@ -419,6 +394,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "pointers",
  "smallvec",
+ "tokio",
 ]
 
 [[package]]
@@ -587,6 +563,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "futures"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a31d2a3fbaaeb2af2368bbdd904aa8e812d3c04a1ee10d3171f52d556e5d0a3"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "futures-executor",
+ "futures-io",
+ "futures-sink",
+ "futures-task",
+ "futures-util",
+]
+
+[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -601,6 +592,17 @@ name = "futures-core"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92d699e522242e69e3003b94ecc1f960f3a5e015aa7c5d7486e65ad01dd94f5e"
+
+[[package]]
+name = "futures-executor"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "031b47cf1a3c6cc8bc2fc76cd437f521619387907d469316e7c0bc278f1f5432"
+dependencies = [
+ "futures-core",
+ "futures-task",
+ "futures-util",
+]
 
 [[package]]
 name = "futures-io"
@@ -637,6 +639,7 @@ version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0d50a92467f8ba5dd6e3ee5d4bd04d73ab2e4e1c44474a0674821dfce14b79bc"
 dependencies = [
+ "futures-channel",
  "futures-core",
  "futures-io",
  "futures-macro",
@@ -769,15 +772,6 @@ name = "hex-conservative"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db3fef046dca3ca91ee1408a8c1b80ab777e80a4d308d1bf4e7adb3fcb047e08"
-dependencies = [
- "arrayvec",
-]
-
-[[package]]
-name = "hex-conservative"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "830e599c2904b08f0834ee6337d8fe8f0ed4a63b5d9e7a7f49c0ffa06d08d360"
 dependencies = [
  "arrayvec",
 ]
@@ -1178,6 +1172,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 [[package]]
 name = "mint-core"
 version = "0.1.3"
+source = "git+https://github.com/dav-anderson/mint-core.git?tag=v0.1.3#1366acec7a7550a220dc287995b6d2af5e93cefc"
 dependencies = [
  "anyhow",
  "bdhke",
@@ -1191,6 +1186,7 @@ dependencies = [
 [[package]]
 name = "mint-server"
 version = "0.1.3"
+source = "git+https://github.com/dav-anderson/mint-core.git?tag=v0.1.3#1366acec7a7550a220dc287995b6d2af5e93cefc"
 dependencies = [
  "anyhow",
  "axum",
@@ -1208,6 +1204,7 @@ dependencies = [
 [[package]]
 name = "mint-types"
 version = "0.1.3"
+source = "git+https://github.com/dav-anderson/mint-core.git?tag=v0.1.3#1366acec7a7550a220dc287995b6d2af5e93cefc"
 dependencies = [
  "hex",
  "secp256k1 0.30.0",
@@ -1419,22 +1416,21 @@ dependencies = [
 
 [[package]]
 name = "psp-mint"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
- "air",
  "axum",
  "bdhke",
  "hex",
  "mint-core",
  "mint-server",
  "mint-types",
- "postcard",
  "rand 0.8.8",
  "reqwest",
  "secp256k1 0.30.0",
  "serde",
  "serde_json",
  "sha2",
+ "sp-wire",
  "tokio",
  "toml",
 ]
@@ -1843,7 +1839,7 @@ version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b50c5943d326858130af85e049f2661ba3c78b26589b8ab98e65e80ae44a1252"
 dependencies = [
- "bitcoin_hashes 0.14.101",
+ "bitcoin_hashes",
  "rand 0.8.8",
  "secp256k1-sys 0.10.1",
  "serde",
@@ -1855,7 +1851,7 @@ version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c3c81b43dc2d8877c216a3fccf76677ee1ebccd429566d3e67447290d0c42b2"
 dependencies = [
- "bitcoin_hashes 0.14.101",
+ "bitcoin_hashes",
  "rand 0.9.5",
  "secp256k1-sys 0.11.0",
  "serde",
@@ -2087,6 +2083,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sp-wire"
+version = "0.2.0"
+source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.2.0#56c7f67c1d803911d07540d139e7710177c88266"
+dependencies = [
+ "air",
+ "hex",
+ "mint-types",
+ "secp256k1 0.30.0",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2124,15 +2134,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "substance"
-version = "0.1.0"
-dependencies = [
- "rusqlite",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "subtle"
