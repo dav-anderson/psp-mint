@@ -27,6 +27,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use sp_wire::storage::StoragePolicy;
+
 use crate::price;
 use crate::rpc;
 use crate::settle::{self, Terms};
@@ -245,6 +247,13 @@ pub const SPECS: &[Spec] = &[
         units: "hours",
         what: "Hours between key rotations (10 years). Notes of the previous key set stay good until the next rotation; then that set and its spent list are deleted. 0 = never rotate. When rotation is on it must be at least 24: BTC claims need time to settle before a rotation (the mint refuses to start otherwise).",
     },
+    Spec {
+        key: "storage.mint_state",
+        env: "PSP_STORAGE_MINT_STATE",
+        default: "",
+        units: "service IDs",
+        what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is a 32-byte x-only key in hex (64 characters); a 33-byte DID key is reduced to it. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -275,6 +284,8 @@ pub struct Config {
     pub max_denomination_units: u64,
     pub rotation_activation_hours: u64,
     pub rotation_period_hours: u64,
+    /// Which AIR services keep this mint's state (setting only for now).
+    pub storage_mint_state: StoragePolicy,
 }
 
 impl Config {
@@ -315,6 +326,7 @@ impl Config {
             max_denomination_units: DEFAULT_MAX_DENOMINATION_UNITS,
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
+            storage_mint_state: StoragePolicy::default(),
         }
     }
 }
@@ -401,6 +413,7 @@ impl Config {
             "mint.max_denomination_units" => self.max_denomination_units.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
+            "storage.mint_state" => self.storage_mint_state.to_config_string(),
             _ => return None,
         })
     }
@@ -443,6 +456,10 @@ impl Config {
             "mint.max_denomination_units" => self.max_denomination_units = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
             "rotation.period_hours" => self.rotation_period_hours = whole(key, value)?,
+            "storage.mint_state" => {
+                self.storage_mint_state =
+                    StoragePolicy::parse(value).map_err(|e| format!("{key} = `{value}`: {e}"))?
+            }
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
@@ -773,6 +790,16 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
                     problems.push(format!("{key} must be a whole number, not the decimal {f}"))
                 }
                 toml::Value::String(s) => pairs.push((key, s.clone())),
+                toml::Value::Array(items) if key.starts_with("storage.") => {
+                    let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
+                    if ids.len() == items.len() {
+                        pairs.push((key, ids.join(",")));
+                    } else {
+                        problems.push(format!(
+                            "{key} must be a list of strings (service IDs), not {items:?}"
+                        ));
+                    }
+                }
                 _ => problems.push(format!(
                     "{key} must be a number or a string, not {}",
                     value.type_str()
@@ -920,6 +947,79 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_storage_policy_comes_from_the_file_and_the_environment() {
+        const A: &str = "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        const B: &str = "c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
+        let dir = scratch("storage");
+        let first = load(&dir, &env_of(&[])).unwrap();
+        assert!(first.config.storage_mint_state.is_local_only());
+        assert_eq!(first.config.get("storage.mint_state").as_deref(), Some(""));
+
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[storage]\nmint_state = [\"{A}\", \"{B}\"]\n"),
+        )
+        .unwrap();
+        let l = load(&dir, &env_of(&[])).unwrap();
+        let p = &l.config.storage_mint_state;
+        assert_eq!(p.primary().unwrap().to_hex(), A);
+        assert_eq!(p.secondaries().len(), 1);
+        assert_eq!(l.sources["storage.mint_state"], Source::File);
+        assert_eq!(
+            l.config.get("storage.mint_state").unwrap(),
+            format!("{A},{B}")
+        );
+
+        // The environment wins over the file. One entry is valid, and a DID key
+        // is reduced to its service.
+        let did = format!("02{A}");
+        let l = load(&dir, &env_of(&[("PSP_STORAGE_MINT_STATE", did.as_str())])).unwrap();
+        assert_eq!(l.config.storage_mint_state.to_config_string(), A);
+        assert!(l.config.storage_mint_state.secondaries().is_empty());
+        assert_eq!(
+            l.sources["storage.mint_state"],
+            Source::Env("PSP_STORAGE_MINT_STATE")
+        );
+
+        // One string in the file works too, and so does an empty list.
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[storage]\nmint_state = \"{B}, {A}\"\n"),
+        )
+        .unwrap();
+        let l = load(&dir, &env_of(&[])).unwrap();
+        assert_eq!(l.config.storage_mint_state.primary().unwrap().to_hex(), B);
+        fs::write(dir.join(FILE_NAME), "[storage]\nmint_state = []\n").unwrap();
+        let l = load(&dir, &env_of(&[])).unwrap();
+        assert!(l.config.storage_mint_state.is_local_only());
+
+        // Every kind of mistake is refused, naming the variable or the setting.
+        let twice = format!("{A},{A}");
+        let p = load(&dir, &env_of(&[("PSP_STORAGE_MINT_STATE", twice.as_str())])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("PSP_STORAGE_MINT_STATE") && x.contains("listed twice")),
+            "{p:?}"
+        );
+        let gap = format!("{A},,{B}");
+        let p = load(&dir, &env_of(&[("PSP_STORAGE_MINT_STATE", gap.as_str())])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("entry 2")), "{p:?}");
+        let p = load(&dir, &env_of(&[("PSP_STORAGE_MINT_STATE", "not-a-key")])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("must be hex")), "{p:?}");
+        fs::write(dir.join(FILE_NAME), "[storage]\nmint_state = [1]\n").unwrap();
+        let p = load(&dir, &env_of(&[])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("list of strings")), "{p:?}");
+        fs::write(dir.join(FILE_NAME), "[storage]\nwallet = \"x\"\n").unwrap();
+        let p = load(&dir, &env_of(&[])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("unknown setting `storage.wallet`")),
+            "{p:?}"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> + use<> {
