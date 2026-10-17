@@ -63,7 +63,7 @@ async fn start_with_health(name: &str) -> (String, Arc<AppState>, Arc<Health>) {
 
 /// What the mint does when a payment settles, and what the wallet does after.
 fn issued_note(state: &AppState, amount: Amount) -> (Note, Keypair) {
-    let keypair = Keypair::new(&SECP256K1, &mut OsRng);
+    let keypair = Keypair::new(SECP256K1, &mut OsRng);
     let nonce = Nonce(keypair.public_key());
     let (blind_point, blinding_key) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
     let logic = state.logic.lock().unwrap();
@@ -258,7 +258,7 @@ async fn a_burn_that_fails_leaves_the_note_unspent_and_without_a_memo() {
     let (base, state) = start("burn-failed").await;
     let amount = Amount::from_units(2);
     let (note, _owner) = issued_note(&state, amount);
-    let thief = Keypair::new(&SECP256K1, &mut OsRng);
+    let thief = Keypair::new(SECP256K1, &mut OsRng);
     let response = reqwest::Client::new()
         .post(format!("{base}/melt"))
         .json(&ks(
@@ -445,7 +445,7 @@ async fn a_note_signed_by_someone_else_cannot_be_burned() {
     let (base, state) = start("thief").await;
     let amount = Amount::from_units(2);
     let (note, _owner) = issued_note(&state, amount);
-    let thief = Keypair::new(&SECP256K1, &mut OsRng);
+    let thief = Keypair::new(SECP256K1, &mut OsRng);
     let request = ks(
         &state,
         MeltRequest {
@@ -528,9 +528,21 @@ async fn health_fails_when_the_last_scan_is_too_old() {
 #[tokio::test]
 async fn health_answers_while_the_mint_is_busy() {
     let (base, state, _health) = start_with_health("health-busy").await;
-    let _guard = state.logic.lock().unwrap();
+    // The mint lock is held on another thread for the whole request: a guard
+    // kept in the async test itself would be held across the await.
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let busy = Arc::clone(&state);
+    let holder = std::thread::spawn(move || {
+        let _guard = busy.logic.lock().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
     let (code, _) = health_json(&base).await;
     assert_eq!(code, reqwest::StatusCode::OK);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
 }
 
 fn poison(state: &Arc<AppState>) {

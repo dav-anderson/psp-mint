@@ -336,8 +336,46 @@ fn migrate() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
+const USAGE: &str = "\
+psp-mint [--mainnet | --regtest | --signet | --testnet] [command]
+
+  serve                                    The HTTP API and the wallet scan, in
+                                           one process.
+  run                                      The default. Scan the wallet once,
+                                           settle what it can, and exit. For
+                                           testing.
+  config                                   Print the settings in use and where
+                                           each came from.
+  pubkey                                   Print the mint's DID public key (66
+                                           hex characters), making the key file
+                                           on first use.
+  encrypt <mint pubkey hex> <payload hex>  Seal a payload to a public key and
+                                           print it as hex, for testing.
+  migrate                                  Move data that sits directly in
+                                           ~/.psp-mint (from before the
+                                           per-network folders) into
+                                           ~/.psp-mint/regtest.
+  --help                                   Print this text.
+
+The network is --mainnet unless another is given. Settings: psp-mint.toml in
+PSP_DATA_DIR (default ~/.psp-mint) or the file PSP_CONFIG names, then PSP_...
+variables.";
+
+fn main() {
+    // An error is printed as plain text, not as the debug form of the value
+    // (`Error: "..."`), which is what returning it from `main` does.
+    if let Err(e) = run() {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run() -> Result<(), Box<dyn Error>> {
     let mut args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     let flag = network::take_flag(&mut args)?;
     if let [cmd, key, payload] = args.as_slice() {
         if cmd == "encrypt" {

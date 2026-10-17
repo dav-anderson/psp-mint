@@ -2,6 +2,12 @@
 
 psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## Unreleased
+
+- **`psp-mint --help` prints the commands** (it had none; the option was read as an unknown command after the settings were loaded). Errors are printed as `error: ...` in plain text, not as the debug form of the value (`Error: "..."`).
+- Lint cleanups, no change in behaviour: unused imports in `rotation.rs` and two test files, `assert!` instead of a comparison with `true`, a `vec!` that was an array, `describe_offline` moved above the test module, a test that held a mutex guard across an await now holds the lock on another thread, and `&Path` instead of `&PathBuf` in a test helper.
+- Documentation stands alone: the service files and the health monitor are described by the SPI repository, and the storage requirements are the numbered set (1 to 8) in DESIGN.md. README: psp-mint has no fee setting.
+
 ## 0.3.0 (2026-10-16)
 
 - **Setting `storage.mint_state` (`PSP_STORAGE_MINT_STATE`): which AIR services will keep this mint's state.** An ordered list of service IDs (index 0 the primary, the rest secondaries); one entry is valid, empty (the default) means local only, at most 8, no duplicates. Config and validation only: nothing reads or writes the AIR, the state is still local files. The parser and checks are `sp_wire::storage` (sp-wire 0.4.0), shared with the other mints and the wallet. In `psp-mint.toml` the value is an array of strings or one string. DESIGN.md has "Storage policy (setting only)"; the planned behaviour is in sandbox-mint's DESIGN.md, "AIR storage requirements".

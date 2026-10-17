@@ -579,7 +579,7 @@ impl Rotor {
 
 // ---- the rollover swap ------------------------------------------------------
 
-use mint_types::{MintInput, MintOutput, MintOutputOutcome, transaction_sighash};
+use mint_types::{MintInput, MintOutputOutcome, transaction_sighash};
 
 pub const ROLLOVERS_FILE: &str = "rollovers.json";
 
@@ -822,9 +822,53 @@ pub fn rollover(
     Ok(answer)
 }
 
+/// The schedule for `config`, read from the files only (no database is opened,
+/// so it works while `serve` runs).
+pub fn describe_offline(base: &Path, activation_hours: u64, period_hours: u64) -> Vec<String> {
+    let first = load_first_issue(base).ok().flatten();
+    let r = Rotation {
+        first_issue: first,
+        activation_secs: activation_hours.saturating_mul(3600),
+        period_secs: period_hours.saturating_mul(3600),
+    };
+    let now = crate::server::now_secs();
+    let e = r.epoch_at(now);
+    let id = |epoch: u64| -> String {
+        fs::read(gen_dir(base, epoch).join(KEYS))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<MintConfig>(&b).ok())
+            .map(|c| keyset_id(&keygen::public_keys(&c)))
+            .unwrap_or_else(|| "(made at the next start)".into())
+    };
+    let t = |o: Option<u64>| o.map(|v| v.to_string()).unwrap_or_else(|| "not yet".into());
+    let mut out = vec![
+        format!(
+            "rotation: activation {activation_hours} h after the first issue, period {period_hours} h{}",
+            if activation_hours == 0 { " (off)" } else { "" }
+        ),
+        format!(
+            "  first issue: {}; activation: {}; next rotation: {} (Unix seconds)",
+            t(first),
+            t(r.activation()),
+            t(r.activation().map(|_| r.start_of(e + 1).unwrap_or(0)))
+        ),
+        format!("  current keyset {} (epoch {e})", id(e)),
+    ];
+    if e > 0 {
+        out.push(format!(
+            "  previous keyset {} (epoch {}), retires at {}",
+            id(e - 1),
+            e - 1,
+            t(r.start_of(e + 1))
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mint_types::MintOutput;
 
     fn scratch(n: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("psp-rot-{}-{n}", {
@@ -1009,47 +1053,4 @@ mod tests {
         assert_eq!(r2.previous.as_ref().unwrap().0.epoch, 1);
         fs::remove_dir_all(&d).unwrap();
     }
-}
-
-/// The schedule for `config`, read from the files only (no database is opened,
-/// so it works while `serve` runs).
-pub fn describe_offline(base: &Path, activation_hours: u64, period_hours: u64) -> Vec<String> {
-    let first = load_first_issue(base).ok().flatten();
-    let r = Rotation {
-        first_issue: first,
-        activation_secs: activation_hours.saturating_mul(3600),
-        period_secs: period_hours.saturating_mul(3600),
-    };
-    let now = crate::server::now_secs();
-    let e = r.epoch_at(now);
-    let id = |epoch: u64| -> String {
-        fs::read(gen_dir(base, epoch).join(KEYS))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<MintConfig>(&b).ok())
-            .map(|c| keyset_id(&keygen::public_keys(&c)))
-            .unwrap_or_else(|| "(made at the next start)".into())
-    };
-    let t = |o: Option<u64>| o.map(|v| v.to_string()).unwrap_or_else(|| "not yet".into());
-    let mut out = vec![
-        format!(
-            "rotation: activation {activation_hours} h after the first issue, period {period_hours} h{}",
-            if activation_hours == 0 { " (off)" } else { "" }
-        ),
-        format!(
-            "  first issue: {}; activation: {}; next rotation: {} (Unix seconds)",
-            t(first),
-            t(r.activation()),
-            t(r.activation().map(|_| r.start_of(e + 1).unwrap_or(0)))
-        ),
-        format!("  current keyset {} (epoch {e})", id(e)),
-    ];
-    if e > 0 {
-        out.push(format!(
-            "  previous keyset {} (epoch {}), retires at {}",
-            id(e - 1),
-            e - 1,
-            t(r.start_of(e + 1))
-        ));
-    }
-    out
 }

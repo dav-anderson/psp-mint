@@ -24,6 +24,7 @@ Pick the network with `--mainnet` (the default), `--regtest`, `--signet` or `--t
 | `config` | Prints the settings in use and where each came from. |
 | `pubkey` | Prints the mint's DID public key (66 hex characters), making the key file on first use. Wallets seal payloads to it. |
 | `encrypt <mint pubkey hex> <payload hex>` | Seals a payload to a public key and prints it as hex, for testing. |
+| `--help` | Prints the commands and exits. |
 | `migrate` | Moves data that sits directly in `~/.psp-mint` (from before the per-network folders) into `~/.psp-mint/regtest`. The mint refuses to run while those files are there. |
 
 ## Networks
@@ -88,6 +89,8 @@ The settings are read once, when the mint starts, and logged then with the value
 | `rotation.activation_hours` | `PSP_ROTATION_ACTIVATION_HOURS` | `8760` (1 year) | Whole hours from the first issue to the first key rotation. **0 turns rotation off** (one key set, one spent list). 0 to 10,000,000. Restart only. See [DESIGN.md](DESIGN.md), "Key rotation". |
 | `rotation.period_hours` | `PSP_ROTATION_PERIOD_HOURS` | `87600` (10 years) | Whole hours between rotations. **0 also turns rotation off.** With rotation on it must be **at least 24**: BTC claims need time to settle before a rotation, and the mint refuses to start with a shorter period. 0 to 10,000,000. Restart only. |
 | `storage.mint_state` | `PSP_STORAGE_MINT_STATE` | none (local only) | Service IDs (64 hex, comma-separated) that will keep the mint's state; index 0 is the primary. One is valid; at most 8. **Setting only: nothing reads or writes the AIR yet.** See [DESIGN.md](DESIGN.md), "Storage policy". |
+
+**psp-mint has no fee setting.** None of the settings above is a fee, so there is no fee default to set: a melt, a rollover and a swap are exact (the amounts in equal the amounts out).
 
 The ranges are checked when the mint starts. They are wide on purpose: they refuse values that cannot work (0 confirmations, a ceiling too small for one note, a minimum below the lock) and values far outside any sensible use (a 1 GiB body, a 1000-confirmation wait, a day between scans), not values that are merely unusual. `settle.min_confirmations` must also be at least `settle.lock_confirmations`, so a price is always locked before settlement.
 

@@ -2,11 +2,11 @@
 //! starts the clock, notes of the previous set are spendable and can be rolled
 //! over until the next rotation, then they are lost.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use mint_server::api::{AuditResponse, CheckStateRequest, CheckStateResponse, MeltRequest};
+use mint_server::api::{AuditResponse, CheckStateRequest, CheckStateResponse};
 use mint_server::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
@@ -39,11 +39,11 @@ struct Mint {
     rot: SharedRotating,
 }
 
-async fn start(dir: &PathBuf, clock: u64) -> Mint {
+async fn start(dir: &Path, clock: u64) -> Mint {
     start_with(dir, clock, Default::default()).await
 }
 
-async fn start_with(dir: &PathBuf, clock: u64, limits: psp_mint::server::Limits) -> Mint {
+async fn start_with(dir: &Path, clock: u64, limits: psp_mint::server::Limits) -> Mint {
     let (rotor, logic) = Rotor::open_at(dir, Amount::from_units(1024), 1, 1, clock).unwrap();
     let rot = Rotating::new(rotor, Rollovers::open(dir).unwrap());
     let state = psp_mint::server::app_state(logic);

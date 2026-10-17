@@ -146,7 +146,7 @@ mod tests {
         let did = &plaintext()[1..34];
         assert!(!sealed.windows(did.len()).any(|w| w == did));
         // the overhead does not depend on the length
-        let longer = encrypt(&mint.public_key(), &vec![7u8; 158]).unwrap();
+        let longer = encrypt(&mint.public_key(), &[7u8; 158]).unwrap();
         assert_eq!(longer.len(), 158 + sp_wire::seal::OVERHEAD);
     }
 

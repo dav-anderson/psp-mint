@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use mint_server::api::{CheckStateRequest, CheckStateResponse, MeltRequest};
+use mint_server::api::{CheckStateRequest, CheckStateResponse};
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
 use psp_mint::melts::MeltLog;
@@ -50,7 +50,7 @@ async fn start(name: &str, limits: Option<Limits>) -> (String, Arc<AppState>) {
 }
 
 fn issued_note(state: &AppState, amount: Amount) -> (Note, Keypair) {
-    let keypair = Keypair::new(&SECP256K1, &mut OsRng);
+    let keypair = Keypair::new(SECP256K1, &mut OsRng);
     let nonce = Nonce(keypair.public_key());
     let (blind_point, blinding_key) = bdhke::blind_message(&nonce.as_hash_preimage(), None);
     let logic = state.logic.lock().unwrap();

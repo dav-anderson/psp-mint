@@ -275,7 +275,7 @@ mod tests {
         let reopened = Records::open(&path).unwrap();
         assert_eq!(reopened.len(), 2);
         assert_eq!(reopened.get("bb"), Some(&later));
-        assert_eq!(reopened.get("aa").unwrap().late, true);
+        assert!(reopened.get("aa").unwrap().late);
         fs::remove_dir_all(&dir).unwrap();
     }
 
