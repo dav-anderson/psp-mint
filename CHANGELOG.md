@@ -4,6 +4,7 @@ psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-co
 
 ## Unreleased
 
+- AIR 2.1.0 (commit `741b1cf`) comes with the next sp-wire (0.4.1): `PublicKey` and `SecretKey` are the same types under the same names, the sealed bytes and the `mint_did_key.json` format are unchanged, and `WIRE_VERSION` stays 2. psp-mint's code is not changed for it. Comments in `src/seal.rs`, README and DESIGN.md name the AIR types as they are exported now (not `air::names::secp256k1`, which is private in 2.1.0).
 - **`psp-mint --help` prints the commands** (it had none; the option was read as an unknown command after the settings were loaded). Errors are printed as `error: ...` in plain text, not as the debug form of the value (`Error: "..."`).
 - Lint cleanups, no change in behaviour: unused imports in `rotation.rs` and two test files, `assert!` instead of a comparison with `true`, a `vec!` that was an array, `describe_offline` moved above the test module, a test that held a mutex guard across an await now holds the lock on another thread, and `&Path` instead of `&PathBuf` in a test helper.
 - Documentation stands alone: the service files and the health monitor are described by the SPI repository, and the storage requirements are the numbered set (1 to 8) in DESIGN.md. README: psp-mint has no fee setting.

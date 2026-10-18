@@ -30,6 +30,11 @@ toml = "0.8"
 # [patch."https://github.com/dav-anderson/sp-wire.git"]
 # sp-wire = { path = "../sp-wire" }
 #
+# While sp-wire's AIR pin (2.1.0) has no `SecretKey` export upstream, AIR is taken
+# from a local checkout that has it:
+# [patch."https://github.com/ramp-stack/air"]
+# air = { path = "../air" }
+#
 # [patch."https://github.com/dav-anderson/mint-core.git"]
 # mint-core = { path = "../mint-core-v0.1.3/crates/mint-core" }
 # mint-types = { path = "../mint-core-v0.1.3/crates/mint-types" }

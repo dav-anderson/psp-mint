@@ -1,6 +1,6 @@
 //! The OP_RETURN payload is encrypted to the mint's DID public key.
 //!
-//! The cipher is AIR's, not a new scheme: `air::names::secp256k1` (re-exported by sp-wire), where
+//! The cipher is AIR's, not a new scheme: AIR's `PublicKey` and `SecretKey` (re-exported by sp-wire), where
 //! `PublicKey::encrypt` seals bytes to a public key and `SecretKey::decrypt`
 //! opens them with the matching secret key. It does an ElligatorSwift key
 //! exchange and encrypts with ChaCha20-Poly1305, and a fresh sender key is made
@@ -12,7 +12,7 @@
 //! [`open_payloads`] drops it without an error and the rest of the PSP never
 //! sees it.
 //!
-//! On the wire (AIR 2.0.3, wire version 2) the sealed payload is
+//! On the wire (AIR 2.0.3 and 2.1.0, wire version 2) the sealed payload is
 //! `64 byte ElligatorSwift sender key || 16 byte tag || ciphertext`. That is a
 //! constant 80 bytes longer than the payload, whatever its length, and the
 //! ciphertext is as long as the payload. Wire version 1 (AIR 1.1.0) carried a
