@@ -2,6 +2,13 @@
 
 psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.4.0 (unreleased)
+
+**Wire version 3: the service ID is the 33-byte AIR DID.** Builds on `sp-wire` 0.5.0 (`WIRE_VERSION` 3). `Cargo.toml` still names `sp-wire` by `tag = "v0.4.0"`, which moves when the new release is tagged (until then a local `[patch]` is used, see the README of `sp-wire`). `GET /health` reports `wire_version` 3 because it reads the constant. No other code changed: the PSP has no service in any request or file, only the storage policy.
+
+- `storage.mint_state` (`PSP_STORAGE_MINT_STATE`) takes DIDs, 66 hex characters starting `02` or `03`. The 32-byte x-only form is refused when the config loads, with a message that says to use the DID, and a 33-byte DID is no longer reduced to its x coordinate.
+- Tests: the storage config test uses DIDs and checks that the x-only form is refused. Documentation: README and DESIGN.md say 66 hex characters.
+
 ## Unreleased
 
 - AIR 2.1.0 (commit `741b1cf`) comes with the next sp-wire (0.4.1): `PublicKey` and `SecretKey` are the same types under the same names, the sealed bytes and the `mint_did_key.json` format are unchanged, and `WIRE_VERSION` stays 2. psp-mint's code is not changed for it. Comments in `src/seal.rs`, README and DESIGN.md name the AIR types as they are exported now (not `air::names::secp256k1`, which is private in 2.1.0).
