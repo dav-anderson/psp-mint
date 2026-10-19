@@ -150,18 +150,18 @@ impl Window<'_> {
     }
 }
 
-/// What the listener does with a request: given its kind, the reply to it, or
-/// `None` for a kind not served (the cell is skipped). The mint's is
-/// [`crate::server::air_served`].
-pub type Serve = dyn Fn(u8) -> Option<Served> + Send + Sync;
+/// What the listener does with a request: given its kind and its body, the
+/// reply to it, or `None` for a kind not served (the cell is skipped). The
+/// mint's is [`crate::server::air_served`].
+pub type Serve = dyn Fn(u8, &[u8]) -> Option<Served> + Send + Sync;
 
 /// A [`Serve`] that answers mint info with `info` (what the mint reports now,
 /// asked for at each request) and nothing else. For tests of the listener that
 /// do not need a mint.
 pub fn mint_info_only(
     info: impl Fn() -> MintInfo + Send + Sync + 'static,
-) -> impl Fn(u8) -> Option<Served> + Send + Sync + 'static {
-    move |kind| {
+) -> impl Fn(u8, &[u8]) -> Option<Served> + Send + Sync + 'static {
+    move |kind, _| {
         (kind == KIND_MINT_INFO)
             .then(|| Served::Body(serde_json::to_vec(&info()).expect("mint info is JSON")))
     }

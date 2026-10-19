@@ -239,7 +239,14 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
         &settings.data_dir.join("melt_memos.json"),
     )?));
     if let Some(air) = air {
-        start_air_listener(air, did, Arc::clone(&state), air_rot, Arc::clone(&health))?;
+        start_air_listener(
+            air,
+            did,
+            Arc::clone(&state),
+            air_rot,
+            Arc::clone(&health),
+            limits,
+        )?;
     }
 
     // A plain thread, not a task: the price fetch uses a blocking HTTP client,
@@ -305,11 +312,14 @@ fn start_air_listener(
     state: Arc<AppState>,
     rot: server::SharedRotating,
     health: Arc<server::Health>,
+    limits: server::Limits,
 ) -> Result<(), Box<dyn Error>> {
     thread::Builder::new()
         .name("air-listener".into())
         .spawn(move || {
-            let serve = move |kind| server::air_served(&state, &rot, &health, kind);
+            let serve = move |kind, body: &[u8]| {
+                server::air_served(&state, &rot, &health, &limits, kind, body)
+            };
             match psp_mint::air_listener::run_blocking(&air, &did, &serve) {
                 Ok(()) => eprintln!("AIR listener: stopped"),
                 Err(e) => eprintln!(

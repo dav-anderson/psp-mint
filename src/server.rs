@@ -555,22 +555,28 @@ impl Default for Limits {
 /// The body of a `413`. Like every other error here it has `error`; it also has
 /// a `code` and the sizes, as the ESP mint's `413` does.
 fn too_large(size: Option<u64>, limit: usize) -> Response {
+    (
+        StatusCode::PAYLOAD_TOO_LARGE,
+        Json(too_large_body(size, limit)),
+    )
+        .into_response()
+}
+
+/// The JSON of a `413`, shared by the HTTP route and the AIR listener (where it
+/// is the body of a signed refusal), so that the two say the same thing.
+fn too_large_body(size: Option<u64>, limit: usize) -> serde_json::Value {
     let said = match size {
         Some(size) => format!("the request is {size} bytes"),
         None => "the request is larger than the ceiling".to_string(),
     };
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        Json(serde_json::json!({
-            "error": format!(
-                "{said}, and this route accepts at most {limit} bytes. Nothing was parsed or burned"
-            ),
-            "code": "request_too_large",
-            "size_bytes": size,
-            "limit_bytes": limit as u64,
-        })),
-    )
-        .into_response()
+    serde_json::json!({
+        "error": format!(
+            "{said}, and this route accepts at most {limit} bytes. Nothing was parsed or burned"
+        ),
+        "code": sp_wire::codes::REQUEST_TOO_LARGE,
+        "size_bytes": size,
+        "limit_bytes": limit as u64,
+    })
 }
 
 /// Read a request body, but only up to `limit` bytes, before the handler parses
@@ -631,12 +637,15 @@ async fn keys_handler(
     keys_response(&state, &rot).map(Json)
 }
 
-async fn check_state_handler(
-    State((state, rot)): State<RotState>,
-    Json(req): Json<api::CheckStateRequest>,
-) -> Result<Json<api::CheckStateResponse>, ApiFailure> {
+/// What `POST /check-state` returns (shared with the AIR listener): for each
+/// nonce, whether it is spent in either live key set.
+fn check_state_response(
+    state: &AppState,
+    rot: &SharedRotating,
+    req: api::CheckStateRequest,
+) -> Result<api::CheckStateResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(rot);
+    let rot = Some(Arc::clone(rot));
     let rotor = rotor_of(&rot, &mut logic)?;
     let prev = rotor
         .as_ref()
@@ -647,7 +656,14 @@ async fn check_state_handler(
             spent_in(&logic, prev, n).map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))?,
         );
     }
-    Ok(Json(api::CheckStateResponse { spent }))
+    Ok(api::CheckStateResponse { spent })
+}
+
+async fn check_state_handler(
+    State((state, rot)): State<RotState>,
+    Json(req): Json<api::CheckStateRequest>,
+) -> Result<Json<api::CheckStateResponse>, ApiFailure> {
+    check_state_response(&state, &rot, req).map(Json)
 }
 
 /// Issued and redeemed over every generation, the deleted ones included.
@@ -718,19 +734,82 @@ async fn rotation_handler(
     rotation_response(&state, &rot).map(Json)
 }
 
+/// A call with a body, over AIR: the same ceiling, the same parse and the same
+/// refusals as the HTTP route of the same name, and the same answer.
+///
+/// - A body over `limit` bytes is refused with the `413` JSON (`request_too_large`,
+///   `size_bytes`, `limit_bytes`), before it is parsed.
+/// - A body that does not parse as `Q` is refused with `malformed_request`. (HTTP
+///   answers with axum's own rejection text; the AIR refusal is signed JSON.)
+/// - What `call` refuses with a 4xx is a signed refusal with the same JSON the
+///   HTTP route returns (`error`, `code`, and anything else such as `spent`).
+/// - A 5xx, or a reply that cannot be encoded, is "cannot answer now": nothing
+///   of the mint's state is told to the wallet, and a retry is safe, because
+///   what changes state is idempotent by request hash.
+fn post_served<Q, R>(
+    what: &str,
+    limit: usize,
+    body: &[u8],
+    call: impl FnOnce(Q) -> Result<R, ApiFailure>,
+) -> sp_wire::air_request::Served
+where
+    Q: serde::de::DeserializeOwned,
+    R: serde::Serialize,
+{
+    use sp_wire::air_request::Served;
+    let refused = |why: &serde_json::Value| {
+        Served::Refused(serde_json::to_vec(why).expect("a JSON value encodes"))
+    };
+    if body.len() > limit {
+        return refused(&too_large_body(Some(body.len() as u64), limit));
+    }
+    let req: Q = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return refused(&serde_json::json!({
+                "error": format!("the {what} request could not be read: {e}"),
+                "code": sp_wire::codes::MALFORMED_REQUEST,
+            }));
+        }
+    };
+    match call(req) {
+        Ok(value) => match serde_json::to_vec(&value) {
+            Ok(bytes) => Served::Body(bytes),
+            Err(e) => {
+                eprintln!("AIR: {what} could not be encoded: {e}");
+                Served::Unavailable
+            }
+        },
+        Err((status, Json(why))) if status.is_client_error() => refused(&why),
+        Err((_, Json(why))) => {
+            eprintln!("AIR: {what} cannot be answered now: {why}");
+            Served::Unavailable
+        }
+    }
+}
+
 /// What the AIR listener says to one kind of request: the JSON body the HTTP
 /// route of the same name returns, byte for byte (`serde_json`, the same as
 /// axum's `Json`), or a signed "cannot answer now" where the route would fail
-/// (the mint lock is poisoned, or a rotation step failed). `None` for a kind
-/// this mint does not serve, which the listener skips.
+/// (the mint lock is poisoned, or a rotation step failed), or, for the calls
+/// with a body, a signed refusal where the route would answer 4xx. `None` for a
+/// kind this mint does not serve, which the listener skips.
+///
+/// `body` is the request body (empty for the reads); `limits` are the same
+/// ceilings the HTTP routes have, so the same request is refused in both.
 pub fn air_served(
     state: &AppState,
     rot: &SharedRotating,
     health: &Health,
+    limits: &Limits,
     kind: u8,
+    body: &[u8],
 ) -> Option<sp_wire::air_request::Served> {
-    use sp_wire::air_request::{KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROTATION, Served};
-    fn body<T: serde::Serialize>(what: &str, result: Result<T, ApiFailure>) -> Served {
+    use sp_wire::air_request::{
+        KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROLLOVER, KIND_ROTATION,
+        Served,
+    };
+    fn read<T: serde::Serialize>(what: &str, result: Result<T, ApiFailure>) -> Served {
         match result {
             Ok(value) => match serde_json::to_vec(&value) {
                 Ok(bytes) => Served::Body(bytes),
@@ -748,28 +827,44 @@ pub fn air_served(
     Some(match kind {
         KIND_MINT_INFO => {
             let info = health.mint_info(state.logic.is_poisoned(), now_secs());
-            body("mint info", Ok(info))
+            read("mint info", Ok(info))
         }
-        KIND_KEYS => body("keys", keys_response(state, rot)),
-        KIND_KEYSETS => body("keysets", keysets_response(state, rot)),
-        KIND_ROTATION => body("rotation", rotation_response(state, rot)),
+        KIND_KEYS => read("keys", keys_response(state, rot)),
+        KIND_KEYSETS => read("keysets", keysets_response(state, rot)),
+        KIND_ROTATION => read("rotation", rotation_response(state, rot)),
+        KIND_ROLLOVER => post_served(
+            "rollover",
+            limits.rollover_bytes,
+            body,
+            |req: RolloverRequest| rollover_response(state, rot, &req, limits.rollover_notes),
+        ),
+        KIND_CHECK_STATE => post_served(
+            "check-state",
+            limits.check_state_bytes,
+            body,
+            |req: api::CheckStateRequest| check_state_response(state, rot, req),
+        ),
         _ => return None,
     })
 }
 
-/// `POST /rollover`: move notes of the previous (or current) keyset to fresh
-/// notes of the same amounts on the current keyset. Stored by request hash.
-async fn rollover_handler(
-    State((state, rot)): State<RotState>,
-    Json(req): Json<RolloverRequest>,
+/// What `POST /rollover` returns (shared with the AIR listener): move notes of
+/// the previous (or current) keyset to fresh notes of the same amounts on the
+/// current keyset. The answer is stored by request hash before any note is
+/// marked spent, so a resend, over HTTP or AIR, returns the same stored answer
+/// and a crash in the middle is finished by the next resend.
+fn rollover_response(
+    state: &AppState,
+    rot: &SharedRotating,
+    req: &RolloverRequest,
     max_notes: usize,
-) -> Result<Json<crate::rotation::RolloverResponse>, ApiFailure> {
+) -> Result<crate::rotation::RolloverResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let r2 = Some(Arc::clone(&rot));
+    let r2 = Some(Arc::clone(rot));
     let rotor = rotor_of(&r2, &mut logic)?.expect("rotating");
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
-    match crate::rotation::rollover(&logic, &rotor, &mut store, &req, max_notes) {
-        Ok(a) => Ok(Json(a)),
+    match crate::rotation::rollover(&logic, &rotor, &mut store, req, max_notes) {
+        Ok(a) => Ok(a),
         Err(RolloverError::Refused(e)) => Err(coded(StatusCode::BAD_REQUEST, "refused", e)),
         Err(RolloverError::Keyset(code, e)) => Err(coded(StatusCode::BAD_REQUEST, code, e)),
         Err(RolloverError::Spent(i)) => Err((
@@ -782,6 +877,15 @@ async fn rollover_handler(
         )),
         Err(RolloverError::Internal(e)) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
+}
+
+/// `POST /rollover`.
+async fn rollover_handler(
+    State((state, rot)): State<RotState>,
+    Json(req): Json<RolloverRequest>,
+    max_notes: usize,
+) -> Result<Json<crate::rotation::RolloverResponse>, ApiFailure> {
+    rollover_response(&state, &rot, &req, max_notes).map(Json)
 }
 
 /// The API with the default ceilings.
