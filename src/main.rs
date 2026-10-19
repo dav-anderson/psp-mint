@@ -223,6 +223,9 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     let mut records = settings.records()?;
     let did = settings.did_key()?;
     let scan_rot = Arc::clone(&rot);
+    // `air.enabled`: answer mint-info requests over AIR, on a thread of its own.
+    // Settings are read before `settings` moves into the scan thread.
+    let air = settings.config.air_listener(&settings.data_dir);
 
     // How long without a successful pass before `/health` fails:
     // `scan.health_intervals` intervals plus `scan.health_grace_secs`.
@@ -233,6 +236,9 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     let melts: server::SharedMelts = Arc::new(Mutex::new(MeltLog::open(
         &settings.data_dir.join("melt_memos.json"),
     )?));
+    if let Some(air) = air {
+        start_air_listener(air, did, Arc::clone(&state), Arc::clone(&health))?;
+    }
 
     // A plain thread, not a task: the price fetch uses a blocking HTTP client,
     // which must not run on the async runtime.
@@ -284,6 +290,31 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
         .await?;
         Ok::<(), Box<dyn Error>>(())
     })
+}
+
+/// Start the AIR listener (`air.enabled`) on its own thread. It answers
+/// mint-info requests with what `/health` reports at that moment. If it fails
+/// (the AIR client gave up) it says so and ends; the HTTP API keeps running,
+/// and a restart starts the listener again, from the stored slot counter.
+fn start_air_listener(
+    air: psp_mint::air_listener::Settings,
+    did: SecretKey,
+    state: Arc<AppState>,
+    health: Arc<server::Health>,
+) -> Result<(), Box<dyn Error>> {
+    thread::Builder::new()
+        .name("air-listener".into())
+        .spawn(move || {
+            let info = move || health.mint_info(state.logic.is_poisoned(), server::now_secs());
+            match psp_mint::air_listener::run_blocking(&air, &did, &info) {
+                Ok(()) => eprintln!("AIR listener: stopped"),
+                Err(e) => eprintln!(
+                    "AIR listener failed: {e}\nThe HTTP API keeps running; the listener is off until psp-mint is restarted"
+                ),
+            }
+        })?;
+    println!("AIR listener starting (air.enabled is true)");
+    Ok(())
 }
 
 /// Resolves on SIGINT (Ctrl-C) or SIGTERM, which is what `launchd` and

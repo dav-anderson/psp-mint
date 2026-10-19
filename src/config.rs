@@ -254,6 +254,41 @@ pub const SPECS: &[Spec] = &[
         units: "service DIDs (66 hex characters)",
         what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
     },
+    Spec {
+        key: "air.enabled",
+        env: "PSP_AIR_ENABLED",
+        default: "false",
+        units: "true or false",
+        what: "Answer wallets' mint-info requests over AIR (`serve` only), beside the HTTP API. Off by default: nothing is sent to the AIR unless this is true. When true, air.server and air.host are required. The mint's DID key (`mint_did_key.json`) opens the requests and signs the replies; the reply is what `GET /health` reports (status, wire_version, network). If the AIR client gives up, the listener stops with a clear error and the HTTP API keeps running. See the README, \"The AIR listener\".",
+    },
+    Spec {
+        key: "air.server",
+        env: "PSP_AIR_SERVER",
+        default: "",
+        units: "AIR server name (66 hex characters)",
+        what: "The AIR server the listener holds reads on and writes replies to: its identity, a public key in AIR's compressed hex form (66 characters). The listener checks the server's signed challenge against it. Required when air.enabled is true. Until the AIR resolves a DID to a server (upstream item 4), this is configuration.",
+    },
+    Spec {
+        key: "air.host",
+        env: "PSP_AIR_HOST",
+        default: "",
+        units: "host or IP, no port",
+        what: "Where that AIR server is: a host name or an IP (127.0.0.1 for the SPI's own AIR server). No port: the AIR client always uses 5702 (ws). Required when air.enabled is true.",
+    },
+    Spec {
+        key: "air.held_reads",
+        env: "PSP_AIR_HELD_READS",
+        default: "16",
+        units: "reads",
+        what: "How many mailbox slots the listener holds a read on, ahead of the next unfinished one. More lets more wallets be answered at once without waiting for a slot to be reached; each held read costs the AIR server about 2 KB. The AIR server closes the whole session at its 257th held read, so the most accepted is 200.",
+    },
+    Spec {
+        key: "air.timeout_secs",
+        env: "PSP_AIR_TIMEOUT_SECS",
+        default: "10",
+        units: "seconds",
+        what: "How long the AIR server may take to answer one Create or Read before the listener counts the try as failed (a reply is tried three times).",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +321,14 @@ pub struct Config {
     pub rotation_period_hours: u64,
     /// Which AIR services keep this mint's state (setting only for now).
     pub storage_mint_state: StoragePolicy,
+    /// Answer mint-info requests over AIR (`serve` only).
+    pub air_enabled: bool,
+    /// The AIR server's name (its public key, 66 hex characters).
+    pub air_server: String,
+    /// The AIR server's host or IP, no port.
+    pub air_host: String,
+    pub air_held_reads: u32,
+    pub air_timeout_secs: u64,
 }
 
 impl Config {
@@ -327,8 +370,20 @@ impl Config {
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
             storage_mint_state: StoragePolicy::default(),
+            air_enabled: false,
+            air_server: String::new(),
+            air_host: String::new(),
+            air_held_reads: 16,
+            air_timeout_secs: 10,
         }
     }
+}
+
+/// Why `host` is not a host or IP for `air.host`, if it is not: it is a host name
+/// or an IP with no port, no scheme and no path. (An IPv6 address has colons, so
+/// it is told from a `host:port` by parsing it.)
+pub fn air_host_problem(host: &str) -> Option<&'static str> {
+    sp_wire::air_request::host_problem(host)
 }
 
 /// A fraction written as text ("0.10", "0.1", "1", "0.0525"), as basis points
@@ -414,6 +469,11 @@ impl Config {
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
             "storage.mint_state" => self.storage_mint_state.to_config_string(),
+            "air.enabled" => self.air_enabled.to_string(),
+            "air.server" => self.air_server.clone(),
+            "air.host" => self.air_host.clone(),
+            "air.held_reads" => self.air_held_reads.to_string(),
+            "air.timeout_secs" => self.air_timeout_secs.to_string(),
             _ => return None,
         })
     }
@@ -460,6 +520,17 @@ impl Config {
                 self.storage_mint_state =
                     StoragePolicy::parse(value).map_err(|e| format!("{key} = `{value}`: {e}"))?
             }
+            "air.enabled" => {
+                self.air_enabled = match value.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(format!("{key} = `{value}` must be true or false")),
+                }
+            }
+            "air.server" => self.air_server = value.trim().to_string(),
+            "air.host" => self.air_host = value.trim().to_string(),
+            "air.held_reads" => self.air_held_reads = whole(key, value)?,
+            "air.timeout_secs" => self.air_timeout_secs = whole(key, value)?,
             other => return Err(format!("unknown setting `{other}`")),
         }
         Ok(())
@@ -589,6 +660,14 @@ impl Config {
             10_000_000,
             "hours; 0 turns rotation off",
         );
+        range(
+            "air.held_reads",
+            u64::from(self.air_held_reads),
+            1,
+            200,
+            "reads; the AIR server closes the session at its 257th held read",
+        );
+        range("air.timeout_secs", self.air_timeout_secs, 1, 600, "seconds");
         if self.payment_reconciliation_target_bps > 10_000 {
             problems.push(format!(
                 "settle.payment_reconciliation_target = {} is out of range: it must be a fraction from 0 to 1 (0.10 is 10%; 0 reconciles every payment that is not exact)",
@@ -637,6 +716,27 @@ impl Config {
         if self.cookie.is_empty() {
             problems.push("bitcoin.cookie must be a path".to_string());
         }
+        if self.air_enabled {
+            if self.air_server.is_empty() {
+                problems.push(
+                    "air.enabled is true but air.server is not set: it is the AIR server's name, a public key of 66 hex characters"
+                        .to_string(),
+                );
+            } else if let Err(e) = sp_wire::seal::parse_public_key(&self.air_server) {
+                problems.push(format!(
+                    "air.server = `{}` is not an AIR server name (a public key of 66 hex characters): {e}",
+                    self.air_server
+                ));
+            }
+            if self.air_host.is_empty() {
+                problems.push(
+                    "air.enabled is true but air.host is not set: it is the AIR server's host name or IP, with no port"
+                        .to_string(),
+                );
+            } else if let Some(why) = air_host_problem(&self.air_host) {
+                problems.push(format!("air.host = `{}` {why}", self.air_host));
+            }
+        }
         if problems.is_empty() {
             Ok(())
         } else {
@@ -677,6 +777,20 @@ impl Config {
             price_tolerance_bps: u128::from(self.price_tolerance_bps),
             reconciliation_target_bps: u128::from(self.payment_reconciliation_target_bps),
         }
+    }
+
+    /// The AIR listener's settings, or `None` when `air.enabled` is false.
+    /// `state_dir` is the network's data folder.
+    pub fn air_listener(&self, state_dir: &Path) -> Option<crate::air_listener::Settings> {
+        self.air_enabled.then(|| crate::air_listener::Settings {
+            server: sp_wire::air_request::client::ServerRef {
+                name: self.air_server.clone(),
+                host: self.air_host.clone(),
+            },
+            held_reads: self.air_held_reads,
+            timeout_secs: self.air_timeout_secs,
+            state_dir: state_dir.to_path_buf(),
+        })
     }
 
     pub fn limits(&self) -> crate::server::Limits {
@@ -790,6 +904,7 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
                     problems.push(format!("{key} must be a whole number, not the decimal {f}"))
                 }
                 toml::Value::String(s) => pairs.push((key, s.clone())),
+                toml::Value::Boolean(b) if key == "air.enabled" => pairs.push((key, b.to_string())),
                 toml::Value::Array(items) if key.starts_with("storage.") => {
                     let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
                     if ids.len() == items.len() {
@@ -1117,6 +1232,91 @@ mod tests {
             assert_eq!(bytes, 1024 * 1024);
         }
         assert_eq!(c.rollover_max_items, 1000);
+    }
+
+    #[test]
+    fn the_air_listener_is_off_by_default_and_needs_a_server_and_a_host_when_on() {
+        const SERVER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let dir = scratch("air");
+        let off = load(&dir, &env_of(&[])).unwrap();
+        assert!(!off.config.air_enabled);
+        assert!(off.config.air_listener(&dir).is_none());
+        assert_eq!(off.config.air_held_reads, 16);
+        assert_eq!(off.config.air_timeout_secs, 10);
+
+        // On but incomplete: every problem is listed.
+        let p = load(&dir, &env_of(&[("PSP_AIR_ENABLED", "true")])).unwrap_err();
+        assert!(p.iter().any(|x| x.contains("air.server")), "{p:?}");
+        assert!(p.iter().any(|x| x.contains("air.host")), "{p:?}");
+
+        // Complete, from the file (a TOML boolean).
+        fs::write(
+            dir.join(FILE_NAME),
+            format!(
+                "[air]\nenabled = true\nserver = \"{SERVER}\"\nhost = \"127.0.0.1\"\nheld_reads = 8\n"
+            ),
+        )
+        .unwrap();
+        let on = load(&dir, &env_of(&[])).unwrap();
+        let s = on.config.air_listener(&dir).unwrap();
+        assert_eq!(s.server.name, SERVER);
+        assert_eq!(s.server.host, "127.0.0.1");
+        assert_eq!(s.held_reads, 8);
+        assert_eq!(s.timeout_secs, 10);
+        assert_eq!(s.state_dir, dir);
+        assert_eq!(on.sources["air.enabled"], Source::File);
+
+        // The environment wins over the file.
+        let env = load(&dir, &env_of(&[("PSP_AIR_ENABLED", "false")])).unwrap();
+        assert!(env.config.air_listener(&dir).is_none());
+        assert_eq!(env.sources["air.enabled"], Source::Env("PSP_AIR_ENABLED"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_air_mistake_is_refused_naming_the_setting() {
+        const SERVER: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+        let dir = scratch("air-bad");
+        let on = |extra: &[(&'static str, &'static str)]| {
+            let mut pairs = vec![
+                ("PSP_AIR_ENABLED", "true"),
+                ("PSP_AIR_SERVER", SERVER),
+                ("PSP_AIR_HOST", "127.0.0.1"),
+            ];
+            pairs.extend_from_slice(extra);
+            load(&dir, &env_of(&pairs))
+        };
+        assert!(on(&[]).is_ok());
+        for (extra, word) in [
+            (("PSP_AIR_ENABLED", "yes"), "true or false"),
+            (("PSP_AIR_SERVER", "zz"), "air.server"),
+            // 64 characters: an x-only key is not a name
+            (
+                (
+                    "PSP_AIR_SERVER",
+                    "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+                ),
+                "air.server",
+            ),
+            (("PSP_AIR_HOST", "127.0.0.1:5702"), "no port"),
+            (("PSP_AIR_HOST", "ws://127.0.0.1"), "not a URL"),
+            (("PSP_AIR_HELD_READS", "0"), "air.held_reads"),
+            (("PSP_AIR_HELD_READS", "201"), "air.held_reads"),
+            (("PSP_AIR_TIMEOUT_SECS", "0"), "air.timeout_secs"),
+        ] {
+            let p = on(&[extra]).unwrap_err();
+            assert!(
+                p.iter().any(|x| x.contains(word)),
+                "{extra:?}: expected `{word}` in {p:?}"
+            );
+        }
+        // An IPv6 address is a host, not a host and a port.
+        assert!(air_host_problem("::1").is_none());
+        assert!(air_host_problem("[::1]").is_none());
+        assert!(air_host_problem("air.example.org").is_none());
+        // Off, none of it matters.
+        assert!(load(&dir, &env_of(&[("PSP_AIR_HOST", "a:b")])).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

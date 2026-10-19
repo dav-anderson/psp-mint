@@ -150,6 +150,19 @@ impl Health {
         }
     }
 
+    /// What `/health` reports, as the body of a mint-info reply over AIR
+    /// (`status`, `wire_version`, `network`): the same values as
+    /// [`Health::report`] at time `now`, and no status code. A mint with no
+    /// network (a test mint) reports an empty one.
+    pub fn mint_info(&self, lock_poisoned: bool, now: u64) -> sp_wire::air_request::MintInfo {
+        let (_, body) = self.report(lock_poisoned, now);
+        sp_wire::air_request::MintInfo {
+            status: body["status"].as_str().unwrap_or("unknown").to_string(),
+            wire_version: sp_wire::WIRE_VERSION,
+            network: self.network.clone().unwrap_or_default(),
+        }
+    }
+
     /// The status code and body for `/health` at time `now`.
     pub fn report(&self, lock_poisoned: bool, now: u64) -> (StatusCode, serde_json::Value) {
         let last = self.last_scan();
@@ -838,6 +851,21 @@ mod tests {
         let (_, none) = Health::new(100).report(false, now_secs());
         assert!(none["last_scan_unix"].is_null());
         assert!(none["seconds_since_last_scan"].is_null());
+    }
+
+    #[test]
+    fn the_air_mint_info_carries_the_same_status_as_health() {
+        let h = Health::for_network(100, "regtest");
+        let t = h.started;
+        let info = h.mint_info(false, t + 5);
+        assert_eq!(info.status, "starting");
+        assert_eq!(info.wire_version, sp_wire::WIRE_VERSION);
+        assert_eq!(info.network, "regtest");
+        h.record_scan_at(t + 10);
+        assert_eq!(h.mint_info(false, t + 20).status, "ok");
+        assert_eq!(h.mint_info(false, t + 111).status, "scan_stale");
+        assert_eq!(h.mint_info(true, t + 20).status, "mint_lock_poisoned");
+        assert_eq!(Health::new(100).mint_info(false, now_secs()).network, "");
     }
 
     #[test]
