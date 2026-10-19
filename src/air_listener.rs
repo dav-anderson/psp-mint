@@ -1,6 +1,8 @@
-//! The AIR listener: answers a wallet's **mint-info request** over AIR, beside
-//! the HTTP API. Off unless `air.enabled` is true. It is the first call between
-//! a wallet and this mint that does not go over HTTP; `GET /health` stays, for
+//! The AIR listener: answers a wallet's read-only requests over AIR, beside the
+//! HTTP API. Off unless `air.enabled` is true. The calls are **mint info** (what
+//! `GET /health` reports) and the keys calls, **keys**, **keysets** and
+//! **rotation** (`GET /keys`, `/keysets`, `/rotation`); the reply body is what
+//! the HTTP route returns, built by the same code. The HTTP routes stay, for
 //! local use, and every other call is still HTTP.
 //!
 //! The design (REQUEST-DESIGN.md in sandbox-mint) and the wire (envelopes,
@@ -10,8 +12,9 @@
 //! - The mint holds reads on the next `air.held_reads` mailbox slots of its DID
 //!   (`mailbox_secret(DID, j)`; anyone can write a slot, only the mint can open
 //!   it). A slot that fills is opened with the mint DID key
-//!   (`mint_did_key.json`), answered with what `GET /health` reports now
-//!   (`status`, `wire_version`, `network`), signed with the same key, sealed to
+//!   (`mint_did_key.json`), answered with what the HTTP route of the request's
+//!   kind returns now (for mint info: `status`, `wire_version`, `network`),
+//!   signed with the same key, sealed to
 //!   the wallet's one-off key `R`, and `Create`d in the reply cell only the
 //!   wallet and the mint can compute.
 //! - **Create first, no read-then-write.** The reply cell is write-once, so the
@@ -27,8 +30,13 @@
 //!   finished, so a crash between answering and writing it repeats a slot,
 //!   which is harmless.
 //! - **Garbage is skipped.** A cell that does not open, is malformed, is of an
-//!   unknown kind or names a key that is not one is logged and skipped; mint
-//!   info is read-only, so junk changes no state.
+//!   unknown kind or names a key that is not one is logged and skipped. Every
+//!   call is read-only, so junk changes no state; the answer to a valid request
+//!   costs the mint one short lock, as the HTTP route does.
+//! - **A call the mint cannot answer now** (the mint lock is poisoned, or a
+//!   rotation step failed: the HTTP route would be a 500) gets a signed reply
+//!   with status `unavailable` and no body, so the wallet fails at once and says
+//!   why, instead of waiting out its tries.
 //! - **If the AIR client gives up** (the session was refused or killed: more than
 //!   [`LOST_LIMIT`] held reads end within [`LOST_WINDOW_SECS`] seconds, or a
 //!   `Create` fails three times) the listener returns an error and ends. The HTTP
@@ -49,7 +57,7 @@ use std::time::{Duration, Instant};
 use sp_wire::ServiceDid;
 use sp_wire::air_request::addr::{self, mailbox_secret};
 use sp_wire::air_request::client::{self, Client, Event, Put, ServerRef};
-use sp_wire::air_request::{MintInfo, answer_mint_info};
+use sp_wire::air_request::{KIND_MINT_INFO, MintInfo, Served, answer_request};
 use sp_wire::seal::SecretKey;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -142,13 +150,30 @@ impl Window<'_> {
     }
 }
 
+/// What the listener does with a request: given its kind, the reply to it, or
+/// `None` for a kind not served (the cell is skipped). The mint's is
+/// [`crate::server::air_served`].
+pub type Serve = dyn Fn(u8) -> Option<Served> + Send + Sync;
+
+/// A [`Serve`] that answers mint info with `info` (what the mint reports now,
+/// asked for at each request) and nothing else. For tests of the listener that
+/// do not need a mint.
+pub fn mint_info_only(
+    info: impl Fn() -> MintInfo + Send + Sync + 'static,
+) -> impl Fn(u8) -> Option<Served> + Send + Sync + 'static {
+    move |kind| {
+        (kind == KIND_MINT_INFO)
+            .then(|| Served::Body(serde_json::to_vec(&info()).expect("mint info is JSON")))
+    }
+}
+
 /// Run the listener until it fails, or until `stop` resolves (then `Ok`). It
-/// never ends on its own otherwise. `info` is called for each cell that is read,
-/// and says what the mint reports now.
+/// never ends on its own otherwise. `serve` is called for each cell that is read
+/// and opens to a request, and says what the mint answers now.
 pub async fn run(
     settings: &Settings,
     key: &SecretKey,
-    info: &(dyn Fn() -> MintInfo + Send + Sync),
+    serve: &Serve,
     stop: impl Future<Output = ()>,
 ) -> Result<(), String> {
     tokio::pin!(stop);
@@ -177,7 +202,7 @@ pub async fn run(
     loop {
         while let Some(bytes) = pending.remove(&next) {
             window.held.remove(&next);
-            handle_fill(&client, key, info, settings.timeout_secs, next, &bytes).await?;
+            handle_fill(&client, key, serve, settings.timeout_secs, next, &bytes).await?;
             next += 1;
             write_next(&settings.state_dir, next)?;
             window.top_up(next).await;
@@ -226,12 +251,12 @@ pub async fn run(
 async fn handle_fill(
     client: &Client,
     key: &SecretKey,
-    info: &(dyn Fn() -> MintInfo + Send + Sync),
+    serve: &Serve,
     timeout_secs: u64,
     slot: u32,
     sealed: &[u8],
 ) -> Result<(), String> {
-    let answer = match answer_mint_info(key, &info(), sealed, addr::now_secs()) {
+    let answer = match answer_request(key, sealed, addr::now_secs(), serve) {
         Ok(answer) => answer,
         Err(reason) => {
             println!("AIR listener: slot {slot} skipped: {reason}");
@@ -275,18 +300,14 @@ async fn handle_fill(
 
 /// Run the listener on the calling thread, with a runtime of its own, until it
 /// fails. For a thread of its own: `serve` starts one so that the HTTP API's
-/// runtime and the listener never share a thread. A panic in `info` ends the
+/// runtime and the listener never share a thread. A panic in `serve` ends the
 /// thread, like a crash of the process would (the tests use that).
-pub fn run_blocking(
-    settings: &Settings,
-    key: &SecretKey,
-    info: &(dyn Fn() -> MintInfo + Send + Sync),
-) -> Result<(), String> {
+pub fn run_blocking(settings: &Settings, key: &SecretKey, serve: &Serve) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start a runtime: {e}"))?;
-    runtime.block_on(run(settings, key, info, std::future::pending()))
+    runtime.block_on(run(settings, key, serve, std::future::pending()))
 }
 
 #[cfg(test)]

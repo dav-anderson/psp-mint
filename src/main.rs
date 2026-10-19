@@ -223,7 +223,9 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     let mut records = settings.records()?;
     let did = settings.did_key()?;
     let scan_rot = Arc::clone(&rot);
-    // `air.enabled`: answer mint-info requests over AIR, on a thread of its own.
+    let air_rot = Arc::clone(&rot);
+    // `air.enabled`: answer mint-info, keys, keysets and rotation requests over
+    // AIR, on a thread of its own.
     // Settings are read before `settings` moves into the scan thread.
     let air = settings.config.air_listener(&settings.data_dir);
 
@@ -237,7 +239,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
         &settings.data_dir.join("melt_memos.json"),
     )?));
     if let Some(air) = air {
-        start_air_listener(air, did, Arc::clone(&state), Arc::clone(&health))?;
+        start_air_listener(air, did, Arc::clone(&state), air_rot, Arc::clone(&health))?;
     }
 
     // A plain thread, not a task: the price fetch uses a blocking HTTP client,
@@ -293,20 +295,22 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
 }
 
 /// Start the AIR listener (`air.enabled`) on its own thread. It answers
-/// mint-info requests with what `/health` reports at that moment. If it fails
+/// mint-info, keys, keysets and rotation requests with what the HTTP routes
+/// return at that moment (`server::air_served`). If it fails
 /// (the AIR client gave up) it says so and ends; the HTTP API keeps running,
 /// and a restart starts the listener again, from the stored slot counter.
 fn start_air_listener(
     air: psp_mint::air_listener::Settings,
     did: SecretKey,
     state: Arc<AppState>,
+    rot: server::SharedRotating,
     health: Arc<server::Health>,
 ) -> Result<(), Box<dyn Error>> {
     thread::Builder::new()
         .name("air-listener".into())
         .spawn(move || {
-            let info = move || health.mint_info(state.logic.is_poisoned(), server::now_secs());
-            match psp_mint::air_listener::run_blocking(&air, &did, &info) {
+            let serve = move |kind| server::air_served(&state, &rot, &health, kind);
+            match psp_mint::air_listener::run_blocking(&air, &did, &serve) {
                 Ok(()) => eprintln!("AIR listener: stopped"),
                 Err(e) => eprintln!(
                     "AIR listener failed: {e}\nThe HTTP API keeps running; the listener is off until psp-mint is restarted"

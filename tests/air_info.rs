@@ -1,27 +1,36 @@
 //! The AIR listener against a real `air_server` started in this process: a
-//! wallet's mint-info request is answered, signed by the mint DID key, and
-//! checked by the same code the wallet runs (`sp_wire::air_request::ask`).
+//! wallet's mint-info, keys, keysets and rotation requests are answered, signed
+//! by the mint DID key, and checked by the same code the wallet runs
+//! (`sp_wire::air_request::ask`). The keys calls run against a real mint and are
+//! compared with what its HTTP routes return.
 //!
 //! The AIR client always dials port 5702 (upstream item 12), so these tests
 //! need that port free; `local_server::start` says so when it is not. One server
 //! serves every test of this binary, and each test has its own mint key, so no
 //! two tests ever touch the same cell.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use psp_mint::air_listener::{self, NEXT_FILE, Settings};
-use psp_mint::server::Health;
+use mint_server::state::AppState;
+use mint_types::Amount;
+use psp_mint::air_listener::{self, NEXT_FILE, Serve, Settings};
+use psp_mint::melts::MeltLog;
+use psp_mint::rotation::{Rollovers, RotationResponse, Rotor};
+use psp_mint::server::{Health, KeysetsResponse, Rotating, SharedRotating};
 use sp_wire::air_request::addr::{self, mailbox_secret, reply_secret, seal_to, shared_wallet};
-use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Outcome, ask_mint_info};
+use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Outcome, Verified, ask_mint_info};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::envelope::{
     STATUS_ANSWERED, WireRequest, build_reply, build_reply_naming,
 };
-use sp_wire::air_request::{KIND_MINT_INFO, MintInfo, VerifyError, local_server, verify_receipt};
+use sp_wire::air_request::{
+    KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROTATION, MintInfo, STATUS_UNAVAILABLE,
+    VerifyError, local_server, verify_receipt,
+};
 use sp_wire::seal::SecretKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
 
@@ -67,6 +76,20 @@ struct Listener {
 }
 
 fn start_listener(server: &ServerRef, key: &SecretKey, dir: &PathBuf, info: Info) -> Listener {
+    start_serving(
+        server,
+        key,
+        dir,
+        Arc::new(air_listener::mint_info_only(move || info())),
+    )
+}
+
+fn start_serving(
+    server: &ServerRef,
+    key: &SecretKey,
+    dir: &PathBuf,
+    serve: Arc<Serve>,
+) -> Listener {
     let settings = Settings {
         server: server.clone(),
         held_reads: 16,
@@ -82,7 +105,7 @@ fn start_listener(server: &ServerRef, key: &SecretKey, dir: &PathBuf, info: Info
                 .enable_all()
                 .build()
                 .unwrap();
-            runtime.block_on(air_listener::run(&settings, &key, &*info, async move {
+            runtime.block_on(air_listener::run(&settings, &key, &*serve, async move {
                 let _ = stopped.await;
             }))
         })
@@ -607,4 +630,283 @@ fn the_listener_without_a_counter_probes_from_zero_and_skips_answered_slots() {
     let out = ask(&cfg, &mut InFlight::new()).unwrap();
     assert_eq!(out.slots, vec![2]);
     second.stop().unwrap();
+}
+
+// ---------------------------------------------------------------- keys, keysets, rotation
+
+/// A real mint (a rotating one, with a manual clock, so `/rotation` is the same
+/// from one call to the next) with its HTTP routes served in this process, and
+/// the listener's `serve` for it.
+struct RealMint {
+    rt: tokio::runtime::Runtime,
+    base: String,
+    state: Arc<AppState>,
+    rot: SharedRotating,
+    health: Arc<Health>,
+}
+
+fn real_mint(dir: &Path) -> RealMint {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (rotor, logic) =
+        Rotor::open_at(dir, Amount::from_units(1024), 1, 1, 1_800_000_000).unwrap();
+    let rot = Rotating::new(rotor, Rollovers::open(dir).unwrap());
+    let state = psp_mint::server::app_state(logic);
+    let melts = Arc::new(Mutex::new(
+        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
+    ));
+    let health = Health::for_network(100, NETWORK);
+    let app = psp_mint::server::router_full(
+        Arc::clone(&state),
+        Arc::clone(&health),
+        melts,
+        Default::default(),
+        Some(Arc::clone(&rot)),
+    );
+    let base = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        base
+    });
+    RealMint {
+        rt,
+        base,
+        state,
+        rot,
+        health,
+    }
+}
+
+impl RealMint {
+    fn serve(&self) -> Arc<Serve> {
+        let (state, rot, health) = (
+            Arc::clone(&self.state),
+            Arc::clone(&self.rot),
+            Arc::clone(&self.health),
+        );
+        Arc::new(move |kind| psp_mint::server::air_served(&state, &rot, &health, kind))
+    }
+
+    /// The bytes of the HTTP route's body.
+    fn http(&self, path: &str) -> Vec<u8> {
+        self.rt.block_on(async {
+            reqwest::get(format!("{}{path}", self.base))
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .to_vec()
+        })
+    }
+}
+
+/// The wallet's flow for any kind, blocking.
+fn ask_any(cfg: &AskConfig, flight: &mut InFlight) -> Result<Verified, AskError> {
+    async fn go(cfg: &AskConfig, flight: &mut InFlight) -> Result<Verified, AskError> {
+        let client = client::connect(&cfg.server).await?;
+        sp_wire::air_request::ask::ask(&client, cfg, flight, &mut |_| Ok(())).await
+    }
+    block_on_new_runtime(move || go(cfg, flight))
+        .map_err(AskError::from)
+        .and_then(|r| r)
+}
+
+#[test]
+fn keys_keysets_and_rotation_are_what_the_http_routes_return() {
+    let server = server();
+    let (key, did) = mint_key();
+    let dir = scratch("keys-real");
+    let mint = real_mint(&dir.join("mint"));
+    let listener = start_serving(&server, &key, &dir, mint.serve());
+    let cfg = config(&server, &did, 10, 3);
+
+    for (kind, path) in [
+        (KIND_KEYS, "/keys"),
+        (KIND_KEYSETS, "/keysets"),
+        (KIND_ROTATION, "/rotation"),
+    ] {
+        let mut flight = InFlight::of(kind);
+        let v = ask_any(&cfg, &mut flight).unwrap();
+        assert_eq!(
+            v.body(),
+            &mint.http(path)[..],
+            "{path}: the AIR body is the HTTP body, byte for byte"
+        );
+        assert_eq!(v.reply.status, 0);
+        // The receipt verifies from the DID alone.
+        verify_receipt(&did, &v.receipt).unwrap();
+    }
+
+    // The bodies are the types the wallet reads.
+    let keys = ask_any(&cfg, &mut InFlight::of(KIND_KEYS)).unwrap();
+    let keys: serde_json::Value = keys.json().unwrap();
+    assert!(!keys["keys"].as_object().unwrap().is_empty());
+    let keysets: KeysetsResponse = ask_any(&cfg, &mut InFlight::of(KIND_KEYSETS))
+        .unwrap()
+        .json()
+        .unwrap();
+    assert!(keysets.keysets.contains_key(&keysets.current));
+    let window: RotationResponse = ask_any(&cfg, &mut InFlight::of(KIND_ROTATION))
+        .unwrap()
+        .json()
+        .unwrap();
+    assert_eq!(window.current.id, keysets.current);
+
+    // Mint info on the same listener, from the same serve.
+    let info = ask(&cfg, &mut InFlight::new()).unwrap();
+    assert_eq!(info.info.status, "starting");
+    assert_eq!(info.info.network, NETWORK);
+
+    // A kind this mint does not serve is not answered (the listener skips it).
+    assert!(
+        psp_mint::server::air_served(&mint.state, &mint.rot, &mint.health, 9).is_none(),
+        "unknown kinds are not served"
+    );
+    listener.stop().unwrap();
+}
+
+#[test]
+fn a_mint_that_cannot_answer_says_so_in_a_signed_reply() {
+    let server = server();
+    let (key, did) = mint_key();
+    let dir = scratch("keys-poisoned");
+    let mint = real_mint(&dir.join("mint"));
+    let listener = start_serving(&server, &key, &dir, mint.serve());
+    let cfg = config(&server, &did, 10, 3);
+
+    // A thread panics while it holds the mint: the lock is poisoned, and the
+    // HTTP routes would answer 500.
+    let state = Arc::clone(&mint.state);
+    let _ = thread::spawn(move || {
+        let _held = state.logic.lock().unwrap();
+        panic!("poisoning the mint lock on purpose");
+    })
+    .join();
+    assert!(mint.state.logic.is_poisoned());
+
+    for kind in [KIND_KEYS, KIND_KEYSETS, KIND_ROTATION] {
+        let mut flight = InFlight::of(kind);
+        match ask_any(&cfg, &mut flight) {
+            Err(AskError::Verify(VerifyError::Refused(s))) => assert_eq!(s, STATUS_UNAVAILABLE),
+            other => panic!("kind {kind}: expected a signed refusal, got {other:?}"),
+        }
+        // It came at once, from the first try, and was signed: the reply cell
+        // holds a receipt that verifies from the DID.
+        let sealed = peek(&server, &reply_cell(&did, &flight)).expect("a reply");
+        let plain = addr::open(&flight.r, &sealed).unwrap();
+        let receipt = verify_receipt(&did, &plain).unwrap();
+        assert_eq!(receipt.status, STATUS_UNAVAILABLE);
+        assert!(receipt.body.is_empty());
+    }
+    // Mint info still says what is wrong.
+    let info = ask(&cfg, &mut InFlight::new()).unwrap();
+    assert_eq!(info.info.status, "mint_lock_poisoned");
+    listener.stop().unwrap();
+}
+
+/// A keys-kind request that is already "answered" with what `make` builds.
+fn ask_kind_with_planted_reply(
+    server: &ServerRef,
+    did: &ServiceDid,
+    kind: u8,
+    make: impl FnOnce(&InFlight) -> Vec<u8>,
+) -> Result<Verified, AskError> {
+    let mut flight = InFlight::of(kind);
+    let sealed = seal_to(&flight.r.public_key(), &make(&flight)).unwrap();
+    assert!(matches!(
+        put(server, &reply_cell(did, &flight), sealed),
+        client::Put::Created(_)
+    ));
+    ask_any(&config(server, did, 3, 1), &mut flight)
+}
+
+#[test]
+fn a_tampered_or_forged_keys_reply_is_rejected() {
+    let server = server();
+    let (key, did) = mint_key();
+    let (other, _) = mint_key();
+    let now = addr::now_secs();
+    let body: &[u8] =
+        br#"{"keys":{"1":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"}}"#;
+
+    // The control: an honest reply to a keys request is accepted.
+    let honest = |f: &InFlight| build_reply(&key, &f.request(), STATUS_ANSWERED, now, body);
+    let v = ask_kind_with_planted_reply(&server, &did, KIND_KEYS, honest).unwrap();
+    assert_eq!(v.body(), body);
+
+    // A key in the body changed after it was signed.
+    let tampered = |f: &InFlight| {
+        let mut plain = honest(f);
+        plain[addr_body_start() + 12] ^= 1;
+        plain
+    };
+    assert!(matches!(
+        ask_kind_with_planted_reply(&server, &did, KIND_KEYS, tampered),
+        Err(AskError::Verify(VerifyError::BadSignature))
+    ));
+
+    // A man in the middle who signs other keys with his own key.
+    let substituted = |f: &InFlight| build_reply(&other, &f.request(), STATUS_ANSWERED, now, body);
+    assert!(matches!(
+        ask_kind_with_planted_reply(&server, &did, KIND_KEYS, substituted),
+        Err(AskError::Verify(VerifyError::WrongMint))
+    ));
+    // ... who also names the right mint.
+    let forged = |f: &InFlight| {
+        build_reply_naming(
+            &other,
+            did.as_bytes(),
+            &f.request(),
+            STATUS_ANSWERED,
+            now,
+            body,
+        )
+    };
+    assert!(matches!(
+        ask_kind_with_planted_reply(&server, &did, KIND_KEYS, forged),
+        Err(AskError::Verify(VerifyError::BadSignature))
+    ));
+
+    // A genuine reply to another question with the same id and key: the mint's
+    // answer to "mint info" is not an answer to "keys".
+    let another_question = |f: &InFlight| {
+        let request = WireRequest::new(
+            KIND_MINT_INFO,
+            f.request_id,
+            addr::key_to_bytes(&f.r.public_key()),
+        );
+        build_reply(&key, &request, STATUS_ANSWERED, now, &info_body(NETWORK))
+    };
+    assert!(matches!(
+        ask_kind_with_planted_reply(&server, &did, KIND_KEYS, another_question),
+        Err(AskError::Verify(VerifyError::WrongRequestHash))
+    ));
+
+    // The same reply to keys, replayed long after.
+    let old = |f: &InFlight| build_reply(&key, &f.request(), STATUS_ANSWERED, now - 10_000, body);
+    assert!(matches!(
+        ask_kind_with_planted_reply(&server, &did, KIND_KEYS, old),
+        Err(AskError::Verify(VerifyError::Stale { .. }))
+    ));
+
+    // A signed body that is not keys is the mint's own fault: the reply checks
+    // out, and reading it as keys fails.
+    let junk = |f: &InFlight| build_reply(&key, &f.request(), STATUS_ANSWERED, now, b"not json");
+    let v = ask_kind_with_planted_reply(&server, &did, KIND_KEYS, junk).unwrap();
+    assert!(matches!(
+        v.json::<serde_json::Value>(),
+        Err(VerifyError::BadBody(_))
+    ));
+}
+
+/// Where the body starts in a reply plaintext.
+fn addr_body_start() -> usize {
+    sp_wire::air_request::envelope::REPLY_FIXED
 }

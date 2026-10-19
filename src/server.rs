@@ -614,15 +614,21 @@ fn limited<S: Clone + Send + Sync + 'static>(
 
 type RotState = (Arc<AppState>, SharedRotating);
 
+/// What `GET /keys` returns. Shared by the HTTP route and the AIR listener, so
+/// that the two cannot differ.
+fn keys_response(state: &AppState, rot: &SharedRotating) -> Result<api::KeysResponse, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let rot = Some(Arc::clone(rot));
+    let _r = rotor_of(&rot, &mut logic)?;
+    Ok(api::KeysResponse {
+        keys: logic.public_keys().clone(),
+    })
+}
+
 async fn keys_handler(
     State((state, rot)): State<RotState>,
 ) -> Result<Json<api::KeysResponse>, ApiFailure> {
-    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(rot);
-    let _r = rotor_of(&rot, &mut logic)?;
-    Ok(Json(api::KeysResponse {
-        keys: logic.public_keys().clone(),
-    }))
+    keys_response(&state, &rot).map(Json)
 }
 
 async fn check_state_handler(
@@ -668,11 +674,10 @@ async fn audit_handler(
     }))
 }
 
-async fn keysets_handler(
-    State((state, rot)): State<RotState>,
-) -> Result<Json<KeysetsResponse>, ApiFailure> {
+/// What `GET /keysets` returns (shared with the AIR listener).
+fn keysets_response(state: &AppState, rot: &SharedRotating) -> Result<KeysetsResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(rot);
+    let rot = Some(Arc::clone(rot));
     let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
     let units = |pk: &std::collections::BTreeMap<Amount, secp256k1::PublicKey>| {
         pk.iter().map(|(a, k)| (a.units, *k)).collect()
@@ -682,21 +687,74 @@ async fn keysets_handler(
     if let Some((k, _)) = &rotor.previous {
         keysets.insert(k.id.clone(), units(&k.pk));
     }
-    Ok(Json(KeysetsResponse {
+    Ok(KeysetsResponse {
         current: rotor.current.id.clone(),
         previous: rotor.previous.as_ref().map(|(k, _)| k.id.clone()),
         keysets,
-    }))
+    })
+}
+
+async fn keysets_handler(
+    State((state, rot)): State<RotState>,
+) -> Result<Json<KeysetsResponse>, ApiFailure> {
+    keysets_response(&state, &rot).map(Json)
+}
+
+/// What `GET /rotation` returns (shared with the AIR listener).
+fn rotation_response(
+    state: &AppState,
+    rot: &SharedRotating,
+) -> Result<crate::rotation::RotationResponse, ApiFailure> {
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let rot = Some(Arc::clone(rot));
+    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
+    Ok(rotor.window())
 }
 
 /// `GET /rotation`: public and read-only, the same shape as fsp-mint's.
 async fn rotation_handler(
     State((state, rot)): State<RotState>,
 ) -> Result<Json<crate::rotation::RotationResponse>, ApiFailure> {
-    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(rot);
-    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
-    Ok(Json(rotor.window()))
+    rotation_response(&state, &rot).map(Json)
+}
+
+/// What the AIR listener says to one kind of request: the JSON body the HTTP
+/// route of the same name returns, byte for byte (`serde_json`, the same as
+/// axum's `Json`), or a signed "cannot answer now" where the route would fail
+/// (the mint lock is poisoned, or a rotation step failed). `None` for a kind
+/// this mint does not serve, which the listener skips.
+pub fn air_served(
+    state: &AppState,
+    rot: &SharedRotating,
+    health: &Health,
+    kind: u8,
+) -> Option<sp_wire::air_request::Served> {
+    use sp_wire::air_request::{KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROTATION, Served};
+    fn body<T: serde::Serialize>(what: &str, result: Result<T, ApiFailure>) -> Served {
+        match result {
+            Ok(value) => match serde_json::to_vec(&value) {
+                Ok(bytes) => Served::Body(bytes),
+                Err(e) => {
+                    eprintln!("AIR: {what} could not be encoded: {e}");
+                    Served::Unavailable
+                }
+            },
+            Err((_, Json(why))) => {
+                eprintln!("AIR: {what} cannot be answered now: {why}");
+                Served::Unavailable
+            }
+        }
+    }
+    Some(match kind {
+        KIND_MINT_INFO => {
+            let info = health.mint_info(state.logic.is_poisoned(), now_secs());
+            body("mint info", Ok(info))
+        }
+        KIND_KEYS => body("keys", keys_response(state, rot)),
+        KIND_KEYSETS => body("keysets", keysets_response(state, rot)),
+        KIND_ROTATION => body("rotation", rotation_response(state, rot)),
+        _ => return None,
+    })
 }
 
 /// `POST /rollover`: move notes of the previous (or current) keyset to fresh
