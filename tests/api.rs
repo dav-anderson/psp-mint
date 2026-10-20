@@ -1,5 +1,10 @@
-//! The PSP's HTTP API, end to end: a real server on a local port, a note issued
-//! by the mint and unblinded the way a wallet would, then burned over HTTP.
+//! The PSP's API, end to end: a real server on a local port, a note issued by
+//! the mint and unblinded the way a wallet would, then burned over HTTP (the
+//! SPI's `/melt`, `/burns`, `/audit`). What the wallet asks (keys, check-state)
+//! goes over AIR, through the mint's real listener on a real `air_server` (see
+//! `common`).
+
+mod common;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -10,7 +15,10 @@ use mint_server::api::{
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
 use psp_mint::melts::MeltLog;
-use psp_mint::server::{Burn, BurnsRequest, BurnsResponse, Health, fatal};
+use psp_mint::rotation::{Rollovers, Rotor};
+use psp_mint::server::{
+    Burn, BurnsRequest, BurnsResponse, Health, Limits, Rotating, SharedRotating, fatal,
+};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 
@@ -61,6 +69,34 @@ async fn start_with_health(name: &str) -> (String, Arc<AppState>, Arc<Health>) {
     (format!("http://{addr}"), state, health)
 }
 
+/// As [`start`], with the AIR listener of the same mint: a rotating mint, as
+/// `serve` runs, whose keys are generation 0. The `Air` holds the turn on the
+/// shared AIR server until it drops.
+async fn start_with_air(name: &str) -> (String, Arc<AppState>, common::Air) {
+    let dir = scratch(name);
+    let (rotor, logic) =
+        Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, 1_800_000_000).unwrap();
+    let rot: SharedRotating = Rotating::new(rotor, Rollovers::open(&dir).unwrap());
+    let state = psp_mint::server::app_state(logic);
+    let melts = Arc::new(Mutex::new(
+        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
+    ));
+    let air = common::Air::start(&state, &rot, Limits::default());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = psp_mint::server::router_full(
+        Arc::clone(&state),
+        Health::new(100),
+        melts,
+        Limits::default(),
+        Some(rot),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), state, air)
+}
+
 /// What the mint does when a payment settles, and what the wallet does after.
 fn issued_note(state: &AppState, amount: Amount) -> (Note, Keypair) {
     let keypair = Keypair::new(SECP256K1, &mut OsRng);
@@ -93,15 +129,8 @@ fn melt_input(note: Note, keypair: &Keypair, amount: Amount, memo: &str) -> Mint
 
 #[tokio::test]
 async fn keys_lists_every_denomination() {
-    let (base, _state) = start("keys").await;
-    let keys: KeysResponse = reqwest::get(format!("{base}/keys"))
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let (_base, _state, air) = start_with_air("keys").await;
+    let keys: KeysResponse = air.get("/keys");
     // 1, 2, 4, ... 1024
     assert_eq!(keys.keys.len(), 11);
     assert!(keys.keys.contains_key(&Amount::from_units(1)));
@@ -111,7 +140,7 @@ async fn keys_lists_every_denomination() {
 
 #[tokio::test]
 async fn a_note_can_be_burned_once_over_http() {
-    let (base, state) = start("melt").await;
+    let (base, state, air) = start_with_air("melt").await;
     let http = reqwest::Client::new();
     let amount = Amount::from_units(4);
     let (note, keypair) = issued_note(&state, amount);
@@ -137,17 +166,12 @@ async fn a_note_can_be_burned_once_over_http() {
         .unwrap();
     assert_eq!(melted.burned, amount);
 
-    let checked: CheckStateResponse = http
-        .post(format!("{base}/check-state"))
-        .json(&CheckStateRequest {
+    let checked: CheckStateResponse = air.post_ok(
+        "/check-state",
+        &CheckStateRequest {
             nonces: vec![note.nonce],
-        })
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+        },
+    );
     assert_eq!(checked.spent, vec![true]);
 
     let audit: AuditResponse = reqwest::get(format!("{base}/audit"))
@@ -474,6 +498,38 @@ async fn issuing_and_swapping_are_not_exposed() {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+}
+
+/// The calls wallets make are answered over AIR only: on the HTTP server, the
+/// one the SPI uses, they are not routes, in either router `serve` can build.
+#[tokio::test]
+async fn the_wallets_calls_are_not_routes_over_http() {
+    let (rotating, _state, _air) = start_with_air("no-wallet-routes").await;
+    let (plain, _state) = start("no-wallet-routes-plain").await;
+    let http = reqwest::Client::new();
+    for base in [rotating, plain] {
+        for path in [
+            "/keys",
+            "/keysets",
+            "/rotation",
+            "/rollover",
+            "/check-state",
+        ] {
+            for method in [reqwest::Method::GET, reqwest::Method::POST] {
+                let response = http
+                    .request(method.clone(), format!("{base}{path}"))
+                    .json(&serde_json::json!({}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    reqwest::StatusCode::NOT_FOUND,
+                    "{method} {path}"
+                );
+            }
+        }
     }
 }
 

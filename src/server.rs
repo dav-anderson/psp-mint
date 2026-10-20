@@ -1,12 +1,17 @@
-//! The PSP's HTTP API.
+//! The PSP's HTTP API, which is for this machine only, and the calls the AIR
+//! listener answers.
 //!
-//! Most handlers are mint-server's, the same ones `mintd` uses, mounted over the
-//! PSP's own `MintLogic` in the same process. One process owns the database, so
-//! the API and the payment scanner share the mint behind one mutex.
+//! Wallets reach the PSP over AIR and only over AIR (`air_served` is what the
+//! listener calls: mint info, keys, keysets, rotation, rollover and
+//! check-state). What is left on HTTP is local to the SPI and the operator:
+//! the ESP mint's `/melt` and `/burns`, `/audit` and `/health`. The audit and
+//! the melt handlers are mint-server's, the same ones `mintd` uses, mounted
+//! over the PSP's own `MintLogic` in the same process. One process owns the
+//! database, so the API, the AIR listener and the payment scanner share the
+//! mint behind one mutex.
 //!
-//! Routes:
+//! Routes (on `server.bind`, which must be a loopback address):
 //!
-//! - `GET /keys`: the public key for each denomination.
 //! - `POST /melt`: burn notes, bound to a memo that every input signs. The ESP
 //!   mint uses this to burn PSP in an exchange. This is the PSP's own handler,
 //!   which records the memo of each burn (see `melts`) and otherwise does what
@@ -14,15 +19,15 @@
 //! - `POST /burns`: for each nonce, whether it is spent and the memo it was burned
 //!   under. The ESP mint uses this to tell, on a retry, a note it burned itself
 //!   from a note that was burned by someone else.
-//! - `POST /check-state`: which nonces are spent.
 //! - `GET /audit`: issued, redeemed and outstanding totals.
 //! - `GET /health`: `200` while the scanner is keeping up and the mint lock is
 //!   sound, `503` otherwise, with the time of the last successful scan.
 //!
-//! Every route that takes a body has a ceiling (`server.*_max_request_bytes`,
-//! 1 MiB by default). A body over it is refused with `413` before it is
-//! parsed, with `error`, `code: "request_too_large"`, `size_bytes` (when the
-//! request said its size) and `limit_bytes`. Nothing is burned.
+//! Every call that takes a body has a ceiling (`server.*_max_request_bytes`,
+//! 1 MiB by default), on the HTTP routes and over AIR alike. A body over it is
+//! refused with `413` before it is parsed, with `error`,
+//! `code: "request_too_large"`, `size_bytes` (when the request said its size)
+//! and `limit_bytes`. Nothing is burned.
 //!
 //! Not mounted, on purpose:
 //!
@@ -30,9 +35,9 @@
 //! - `/swap`: PSP to FSP is out of scope, and Service Points are not exchanged peer to
 //!   peer.
 //!
-//! There is no authentication and no TLS. A note authorizes its own spend, so a
-//! caller can only burn notes they hold. Bind to localhost, or put it behind
-//! something that adds TLS.
+//! There is no authentication and no TLS, which is why `server.bind` must be a
+//! loopback address. A note authorizes its own spend, so a caller can only burn
+//! notes they hold.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -620,8 +625,7 @@ fn limited<S: Clone + Send + Sync + 'static>(
 
 type RotState = (Arc<AppState>, SharedRotating);
 
-/// What `GET /keys` returns. Shared by the HTTP route and the AIR listener, so
-/// that the two cannot differ.
+/// The keys call: the public key for each denomination now in force.
 fn keys_response(state: &AppState, rot: &SharedRotating) -> Result<api::KeysResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let rot = Some(Arc::clone(rot));
@@ -631,13 +635,7 @@ fn keys_response(state: &AppState, rot: &SharedRotating) -> Result<api::KeysResp
     })
 }
 
-async fn keys_handler(
-    State((state, rot)): State<RotState>,
-) -> Result<Json<api::KeysResponse>, ApiFailure> {
-    keys_response(&state, &rot).map(Json)
-}
-
-/// What `POST /check-state` returns (shared with the AIR listener): for each
+/// The check-state call: for each
 /// nonce, whether it is spent in either live key set.
 fn check_state_response(
     state: &AppState,
@@ -657,13 +655,6 @@ fn check_state_response(
         );
     }
     Ok(api::CheckStateResponse { spent })
-}
-
-async fn check_state_handler(
-    State((state, rot)): State<RotState>,
-    Json(req): Json<api::CheckStateRequest>,
-) -> Result<Json<api::CheckStateResponse>, ApiFailure> {
-    check_state_response(&state, &rot, req).map(Json)
 }
 
 /// Issued and redeemed over every generation, the deleted ones included.
@@ -690,7 +681,7 @@ async fn audit_handler(
     }))
 }
 
-/// What `GET /keysets` returns (shared with the AIR listener).
+/// The keysets call.
 fn keysets_response(state: &AppState, rot: &SharedRotating) -> Result<KeysetsResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let rot = Some(Arc::clone(rot));
@@ -710,13 +701,7 @@ fn keysets_response(state: &AppState, rot: &SharedRotating) -> Result<KeysetsRes
     })
 }
 
-async fn keysets_handler(
-    State((state, rot)): State<RotState>,
-) -> Result<Json<KeysetsResponse>, ApiFailure> {
-    keysets_response(&state, &rot).map(Json)
-}
-
-/// What `GET /rotation` returns (shared with the AIR listener).
+/// The rotation call.
 fn rotation_response(
     state: &AppState,
     rot: &SharedRotating,
@@ -727,22 +712,13 @@ fn rotation_response(
     Ok(rotor.window())
 }
 
-/// `GET /rotation`: public and read-only, the same shape as fsp-mint's.
-async fn rotation_handler(
-    State((state, rot)): State<RotState>,
-) -> Result<Json<crate::rotation::RotationResponse>, ApiFailure> {
-    rotation_response(&state, &rot).map(Json)
-}
-
-/// A call with a body, over AIR: the same ceiling, the same parse and the same
-/// refusals as the HTTP route of the same name, and the same answer.
+/// A call with a body, over AIR: the ceiling, then the parse, then the call.
 ///
 /// - A body over `limit` bytes is refused with the `413` JSON (`request_too_large`,
 ///   `size_bytes`, `limit_bytes`), before it is parsed.
-/// - A body that does not parse as `Q` is refused with `malformed_request`. (HTTP
-///   answers with axum's own rejection text; the AIR refusal is signed JSON.)
-/// - What `call` refuses with a 4xx is a signed refusal with the same JSON the
-///   HTTP route returns (`error`, `code`, and anything else such as `spent`).
+/// - A body that does not parse as `Q` is refused with `malformed_request`.
+/// - What `call` refuses with a 4xx is a signed refusal with its JSON (`error`,
+///   `code`, and anything else such as `spent`).
 /// - A 5xx, or a reply that cannot be encoded, is "cannot answer now": nothing
 ///   of the mint's state is told to the wallet, and a retry is safe, because
 ///   what changes state is idempotent by request hash.
@@ -788,15 +764,14 @@ where
     }
 }
 
-/// What the AIR listener says to one kind of request: the JSON body the HTTP
-/// route of the same name returns, byte for byte (`serde_json`, the same as
-/// axum's `Json`), or a signed "cannot answer now" where the route would fail
-/// (the mint lock is poisoned, or a rotation step failed), or, for the calls
-/// with a body, a signed refusal where the route would answer 4xx. `None` for a
-/// kind this mint does not serve, which the listener skips.
+/// What the AIR listener says to one kind of request: the JSON body of the
+/// call, or a signed "cannot answer now" where the call fails (the mint lock is
+/// poisoned, or a rotation step failed), or, for the calls with a body, a
+/// signed refusal for a 4xx outcome. `None` for a kind this mint does not
+/// serve, which the listener skips.
 ///
-/// `body` is the request body (empty for the reads); `limits` are the same
-/// ceilings the HTTP routes have, so the same request is refused in both.
+/// `body` is the request body (empty for the reads); `limits` are the ceilings
+/// (`server.*_max_request_bytes`, the same ones `/melt` and `/burns` have).
 pub fn air_served(
     state: &AppState,
     rot: &SharedRotating,
@@ -848,11 +823,10 @@ pub fn air_served(
     })
 }
 
-/// What `POST /rollover` returns (shared with the AIR listener): move notes of
-/// the previous (or current) keyset to fresh notes of the same amounts on the
-/// current keyset. The answer is stored by request hash before any note is
-/// marked spent, so a resend, over HTTP or AIR, returns the same stored answer
-/// and a crash in the middle is finished by the next resend.
+/// The rollover call: move notes of the previous (or current) keyset to fresh
+/// notes of the same amounts on the current keyset. The answer is stored by
+/// request hash before any note is marked spent, so a resend returns the same
+/// stored answer and a crash in the middle is finished by the next resend.
 fn rollover_response(
     state: &AppState,
     rot: &SharedRotating,
@@ -879,15 +853,6 @@ fn rollover_response(
     }
 }
 
-/// `POST /rollover`.
-async fn rollover_handler(
-    State((state, rot)): State<RotState>,
-    Json(req): Json<RolloverRequest>,
-    max_notes: usize,
-) -> Result<Json<crate::rotation::RolloverResponse>, ApiFailure> {
-    rollover_response(&state, &rot, &req, max_notes).map(Json)
-}
-
 /// The API with the default ceilings.
 pub fn router(state: Arc<AppState>, health: Arc<Health>, melts: SharedMelts) -> Router {
     router_with(state, health, melts, Limits::default())
@@ -902,9 +867,9 @@ pub fn router_with(
     router_full(state, health, melts, limits, None)
 }
 
-/// The API, with key rotation when `rot` is given: then `/keys`,
-/// `/check-state` and `/audit` span both live key sets, and `GET /rotation`
-/// and `POST /rollover` are mounted.
+/// The API, with key rotation when `rot` is given: then `/audit` spans both
+/// live key sets. The wallet-facing calls (keys, keysets, rotation, rollover,
+/// check-state) are not routes: they are answered over AIR (`air_served`).
 pub fn router_full(
     state: Arc<AppState>,
     health: Arc<Health>,
@@ -922,22 +887,6 @@ pub fn router_full(
         .with_state((Arc::clone(&state), melts, rot.clone()));
     if let Some(rot) = rot {
         return Router::new()
-            .route("/keys", get(keys_handler))
-            .route("/rotation", get(rotation_handler))
-            .route("/keysets", get(keysets_handler))
-            .route(
-                "/rollover",
-                limited(
-                    post(move |state: State<RotState>, req: Json<RolloverRequest>| {
-                        rollover_handler(state, req, limits.rollover_notes)
-                    }),
-                    limits.rollover_bytes,
-                ),
-            )
-            .route(
-                "/check-state",
-                limited(post(check_state_handler), limits.check_state_bytes),
-            )
             .route(
                 "/audit",
                 get(audit_handler)
@@ -948,11 +897,6 @@ pub fn router_full(
             .merge(health_routes);
     }
     Router::new()
-        .route("/keys", get(api::get_keys))
-        .route(
-            "/check-state",
-            limited(post(api::check_state), limits.check_state_bytes),
-        )
         .route(
             "/audit",
             get(api::audit).layer(middleware::from_fn_with_state(audit_network, add_network)),

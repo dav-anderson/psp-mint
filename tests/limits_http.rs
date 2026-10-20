@@ -1,6 +1,13 @@
-//! Body ceilings on the PSP's HTTP API: a body over a route's ceiling is
-//! refused with `413` and a JSON body before it is parsed, and nothing is
-//! burned.
+//! Body ceilings: a body over a route's ceiling is refused with the `413` JSON
+//! body (`request_too_large`) before it is parsed, and nothing is burned.
+//!
+//! `/melt` and `/burns` are the SPI's, over HTTP, where the refusal is a `413`.
+//! The wallet's check-state is over AIR, through the mint's real listener on a
+//! real `air_server` (see `common`), where the same body comes back as a signed
+//! refusal. The ceiling is tried over AIR at 4 KiB; the 1 MiB default is
+//! asserted as a value and by a request that is answered under it.
+
+mod common;
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -10,7 +17,8 @@ use mint_server::api::{CheckStateRequest, CheckStateResponse};
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
 use psp_mint::melts::MeltLog;
-use psp_mint::server::{BurnsRequest, Health, Limits};
+use psp_mint::rotation::{Rollovers, Rotor};
+use psp_mint::server::{BurnsRequest, Health, Limits, Rotating, SharedRotating};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 
@@ -29,24 +37,36 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-async fn start(name: &str, limits: Option<Limits>) -> (String, Arc<AppState>) {
+const T: u64 = 1_800_000_000;
+
+/// A rotating mint (the one `serve` runs) with its HTTP server for `/melt` and
+/// `/burns`, and the pieces to put an AIR listener on it.
+async fn start(
+    name: &str,
+    limits: Option<Limits>,
+) -> (String, Arc<AppState>, SharedRotating, Limits) {
     let dir = scratch(name);
-    let logic = psp_mint::mint::open(&dir, Amount::from_units(1024)).unwrap();
+    let (rotor, logic) = Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, T).unwrap();
+    let rot = Rotating::new(rotor, Rollovers::open(&dir).unwrap());
     let state = psp_mint::server::app_state(logic);
+    let limits = limits.unwrap_or_default();
     let melts = Arc::new(Mutex::new(
         MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
     ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let health = Health::new(100);
-    let app = match limits {
-        Some(limits) => psp_mint::server::router_with(Arc::clone(&state), health, melts, limits),
-        None => psp_mint::server::router(Arc::clone(&state), health, melts),
-    };
+    let app = psp_mint::server::router_full(
+        Arc::clone(&state),
+        health,
+        melts,
+        limits,
+        Some(Arc::clone(&rot)),
+    );
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (format!("http://{addr}"), state)
+    (format!("http://{addr}"), state, rot, limits)
 }
 
 fn issued_note(state: &AppState, amount: Amount) -> (Note, Keypair) {
@@ -135,7 +155,7 @@ fn spent(state: &AppState, nonce: Nonce) -> bool {
 
 #[tokio::test]
 async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
-    let (base, state) = start(
+    let (base, state, _rot, _limits) = start(
         "melt",
         Some(Limits {
             melt_bytes: 4096,
@@ -179,7 +199,7 @@ async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
 /// ceiling.
 #[tokio::test]
 async fn a_chunked_body_over_the_ceiling_is_refused_too() {
-    let (base, _state) = start(
+    let (base, _state, _rot, _limits) = start(
         "chunked",
         Some(Limits {
             burns_bytes: 4096,
@@ -215,7 +235,17 @@ async fn a_chunked_body_over_the_ceiling_is_refused_too() {
 
 #[tokio::test]
 async fn by_default_every_route_with_a_body_takes_up_to_one_mib() {
-    let (base, state) = start("defaults", None).await;
+    let defaults = Limits::default();
+    assert_eq!(
+        (
+            defaults.melt_bytes,
+            defaults.burns_bytes,
+            defaults.rollover_bytes,
+            defaults.check_state_bytes
+        ),
+        (MIB, MIB, MIB, MIB)
+    );
+    let (base, state, rot, limits) = start("defaults", None).await;
     let (note, _) = issued_note(&state, Amount::from_units(1));
     let check = CheckStateRequest {
         nonces: vec![note.nonce],
@@ -224,15 +254,12 @@ async fn by_default_every_route_with_a_body_takes_up_to_one_mib() {
         nonces: vec![note.nonce],
     };
 
-    let (status, body) = post(&base, "/check-state", padded(&check, MIB)).await;
-    assert_eq!(status, 200, "{body}");
-    let parsed: CheckStateResponse = serde_json::from_value(body).unwrap();
-    assert_eq!(parsed.spent, vec![false]);
-    let (status, body) = declared(&base, "/check-state", MIB + 1).await;
-    assert_eq!(
-        (status, body["limit_bytes"].as_u64()),
-        (413, Some(MIB as u64))
-    );
+    // The wallet's check-state is over AIR, and answered under the defaults.
+    {
+        let air = common::Air::start(&state, &rot, limits);
+        let parsed: CheckStateResponse = air.post_ok("/check-state", &check);
+        assert_eq!(parsed.spent, vec![false]);
+    }
 
     let (status, _) = post(&base, "/burns", padded(&burns, MIB)).await;
     assert_eq!(status, 200);
@@ -249,6 +276,36 @@ async fn by_default_every_route_with_a_body_takes_up_to_one_mib() {
     );
 }
 
+/// The check-state ceiling, over AIR: a body over it is refused with the same
+/// JSON as the HTTP routes', before it is parsed; one at it is answered.
+#[tokio::test]
+async fn a_check_state_over_the_ceiling_is_refused_before_parsing() {
+    let (_base, state, rot, limits) = start(
+        "check-state",
+        Some(Limits {
+            check_state_bytes: 4096,
+            ..Limits::default()
+        }),
+    )
+    .await;
+    let air = common::Air::start(&state, &rot, limits);
+    let (note, _) = issued_note(&state, Amount::from_units(1));
+    let check = CheckStateRequest {
+        nonces: vec![note.nonce],
+    };
+
+    let (status, body) = air.post_bytes("/check-state", &padded(&check, 4097));
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["code"], "request_too_large");
+    assert_eq!(body["limit_bytes"], 4096);
+    assert_eq!(body["size_bytes"], 4097);
+
+    let (status, body) = air.post_bytes("/check-state", &padded(&check, 4096));
+    assert_eq!(status, 200, "{body}");
+    let parsed: CheckStateResponse = serde_json::from_value(body).unwrap();
+    assert_eq!(parsed.spent, vec![false]);
+}
+
 /// A ceiling above axum's own 2 MB default is honoured, not cut short by it.
 #[tokio::test]
 async fn a_ceiling_above_two_megabytes_is_the_one_in_force() {
@@ -260,21 +317,21 @@ async fn a_ceiling_above_two_megabytes_is_the_one_in_force() {
         rollover_notes: 1000,
         check_state_bytes: big,
     };
-    let (base, state) = start("big", Some(limits)).await;
+    let (base, state, _rot, _limits) = start("big", Some(limits)).await;
     let (note, _) = issued_note(&state, Amount::from_units(1));
-    let check = CheckStateRequest {
+    let burns = BurnsRequest {
         nonces: vec![note.nonce],
     };
-    let (status, body) = post(&base, "/check-state", padded(&check, big)).await;
+    let (status, body) = post(&base, "/burns", padded(&burns, big)).await;
     assert_eq!(status, 200, "{body}");
-    let (status, _) = declared(&base, "/check-state", big + 1).await;
+    let (status, _) = declared(&base, "/burns", big + 1).await;
     assert_eq!(status, 413);
 }
 
 /// A refusal for a reason other than size keeps the usual error body.
 #[tokio::test]
 async fn under_the_ceiling_a_bad_melt_is_still_a_400_with_an_error() {
-    let (base, state) = start("bad", None).await;
+    let (base, state, _rot, _limits) = start("bad", None).await;
     let amount = Amount::from_units(2);
     let (note, keypair) = issued_note(&state, amount);
     let request = psp_mint::server::PspMeltRequest {

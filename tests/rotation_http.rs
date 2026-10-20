@@ -1,6 +1,13 @@
-//! Key rotation over HTTP: generation 0 is the existing mint, the first issue
-//! starts the clock, notes of the previous set are spendable and can be rolled
-//! over until the next rotation, then they are lost.
+//! Key rotation: generation 0 is the existing mint, the first issue starts the
+//! clock, notes of the previous set are spendable and can be rolled over until
+//! the next rotation, then they are lost.
+//!
+//! The wallet's calls (rotation, keysets, rollover, check-state) go over AIR,
+//! through the mint's real listener on a real `air_server` (see `common`). The
+//! calls that stay on HTTP, because they are local to the SPI (`/melt`,
+//! `/audit`), go to the HTTP server.
+
+mod common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -37,6 +44,9 @@ struct Mint {
     base: String,
     state: Arc<AppState>,
     rot: SharedRotating,
+    /// The wallet side of the mint's AIR listener. Holds the turn on the shared
+    /// AIR server until the mint drops.
+    air: common::Air,
 }
 
 async fn start(dir: &Path, clock: u64) -> Mint {
@@ -50,6 +60,7 @@ async fn start_with(dir: &Path, clock: u64, limits: psp_mint::server::Limits) ->
     let melts = Arc::new(Mutex::new(
         MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
     ));
+    let air = common::Air::start(&state, &rot, limits);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = psp_mint::server::router_full(
@@ -64,6 +75,7 @@ async fn start_with(dir: &Path, clock: u64, limits: psp_mint::server::Limits) ->
         base: format!("http://{addr}"),
         state,
         rot,
+        air,
     }
 }
 
@@ -90,7 +102,11 @@ impl Mint {
         let signature = bdhke::unblind_message(&out.0, &r, &logic.public_keys()[&amount]);
         (Note { nonce, signature }, kp)
     }
+    /// A read: `/audit` is the SPI's, over HTTP; the rest are the wallet's, over AIR.
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
+        if path != "/audit" {
+            return self.air.get(path);
+        }
         reqwest::get(format!("{}{path}", self.base))
             .await
             .unwrap()
@@ -100,7 +116,12 @@ impl Mint {
             .await
             .unwrap()
     }
+    /// A call with a body: `/melt` is the SPI's, over HTTP; the rest are the
+    /// wallet's, over AIR (a refusal reads as `400`, see `common`).
     async fn post(&self, path: &str, body: &impl serde::Serialize) -> (u16, serde_json::Value) {
+        if path != "/melt" {
+            return self.air.post_json(path, body);
+        }
         let r = reqwest::Client::new()
             .post(format!("{}{path}", self.base))
             .json(body)
@@ -610,15 +631,15 @@ async fn the_rollover_has_its_own_body_ceiling_and_note_cap() {
     let ids: KeysetsResponse = m.get("/keysets").await;
     let prev = ids.previous.clone().unwrap();
 
-    // a body over the ceiling is refused before it is parsed: 413
-    let r = reqwest::Client::new()
-        .post(format!("{}/rollover", m.base))
-        .header("content-type", "application/json")
-        .body(vec![b' '; 4097])
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status().as_u16(), 413);
+    // a body over the ceiling is refused before it is parsed, with the 413
+    // body (over AIR, a signed refusal)
+    let (code, body) = m.air.post_bytes("/rollover", &vec![b' '; 4097]);
+    assert_eq!(code, 400, "{body}");
+    assert_eq!(body["code"], "request_too_large", "{body}");
+    assert_eq!(
+        (body["limit_bytes"].as_u64(), body["size_bytes"].as_u64()),
+        (Some(4096), Some(4097))
+    );
 
     // two notes with the cap at one: refused, and nothing is burned
     let (r1, _, _) = rollover(&a, one, &prev, &ids.current);

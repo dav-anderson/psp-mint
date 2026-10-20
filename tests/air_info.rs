@@ -2,9 +2,9 @@
 //! wallet's mint-info, keys, keysets, rotation, rollover and check-state requests
 //! are answered, signed by the mint DID key, and checked by the same code the
 //! wallet runs (`sp_wire::air_request::ask`). The calls run against a real mint
-//! and are compared with what its HTTP routes return; the rollover is the first
-//! that changes the mint's state, so it is also resent, refused, tampered with
-//! and run at its full size (1000 notes).
+//! and are compared with what the mint serves when it is called in this process;
+//! the rollover is the first that changes the mint's state, so it is also
+//! resent, refused, tampered with and run at its full size (1000 notes).
 //!
 //! The AIR client always dials port 5702 (upstream item 12), so these tests
 //! need that port free; `local_server::start` says so when it is not. One server
@@ -21,7 +21,6 @@ use mint_server::api::CheckStateRequest;
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, transaction_sighash};
 use psp_mint::air_listener::{self, NEXT_FILE, Serve, Settings};
-use psp_mint::melts::MeltLog;
 use psp_mint::rotation::{RolloverRequest, RolloverResponse, Rollovers, RotationResponse, Rotor};
 use psp_mint::server::{Health, KeysetsResponse, Limits, Rotating, SharedRotating};
 use rand::rngs::OsRng;
@@ -34,7 +33,8 @@ use sp_wire::air_request::envelope::{
 };
 use sp_wire::air_request::{
     KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROLLOVER, KIND_ROTATION,
-    MintInfo, STATUS_REFUSED, STATUS_UNAVAILABLE, VerifyError, local_server, verify_receipt,
+    MintInfo, STATUS_REFUSED, STATUS_UNAVAILABLE, Served, VerifyError, local_server,
+    verify_receipt,
 };
 use sp_wire::seal::SecretKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
@@ -663,12 +663,9 @@ fn the_listener_without_a_counter_probes_from_zero_and_skips_answered_slots() {
 
 // ---------------------------------------------------------------- keys, keysets, rotation
 
-/// A real mint (a rotating one, with a manual clock, so `/rotation` is the same
-/// from one call to the next) with its HTTP routes served in this process, and
-/// the listener's `serve` for it.
+/// A real mint (a rotating one, with a manual clock, so the rotation answer is
+/// the same from one call to the next), and the listener's `serve` for it.
 struct RealMint {
-    rt: tokio::runtime::Runtime,
-    base: String,
     state: Arc<AppState>,
     rot: SharedRotating,
     health: Arc<Health>,
@@ -680,35 +677,12 @@ fn real_mint(dir: &Path) -> RealMint {
 }
 
 fn real_mint_with(dir: &Path, limits: Limits) -> RealMint {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
     let (rotor, logic) =
         Rotor::open_at(dir, Amount::from_units(1024), 1, 1, 1_800_000_000).unwrap();
     let rot = Rotating::new(rotor, Rollovers::open(dir).unwrap());
     let state = psp_mint::server::app_state(logic);
-    let melts = Arc::new(Mutex::new(
-        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
-    ));
     let health = Health::for_network(100, NETWORK);
-    let app = psp_mint::server::router_full(
-        Arc::clone(&state),
-        Arc::clone(&health),
-        melts,
-        limits,
-        Some(Arc::clone(&rot)),
-    );
-    let base = rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        base
-    });
     RealMint {
-        rt,
-        base,
         state,
         rot,
         health,
@@ -729,19 +703,37 @@ impl RealMint {
         })
     }
 
-    /// The bytes of the HTTP route's body.
-    fn http(&self, path: &str) -> Vec<u8> {
-        self.rt.block_on(async {
-            reqwest::get(format!("{}{path}", self.base))
-                .await
-                .unwrap()
-                .error_for_status()
-                .unwrap()
-                .bytes()
-                .await
-                .unwrap()
-                .to_vec()
-        })
+    /// What the mint answers to `kind` with `body` when it is called in this
+    /// process, as the listener calls it.
+    fn served(&self, kind: u8, body: &[u8]) -> Option<Served> {
+        psp_mint::server::air_served(
+            &self.state,
+            &self.rot,
+            &self.health,
+            &self.limits,
+            kind,
+            body,
+        )
+    }
+
+    /// The body of an answered call made in this process.
+    fn served_body(&self, kind: u8, body: &[u8]) -> Vec<u8> {
+        match self.served(kind, body) {
+            Some(Served::Body(bytes)) => bytes,
+            Some(Served::Refused(body)) => {
+                panic!(
+                    "expected an answer, got a refusal: {}",
+                    String::from_utf8_lossy(&body)
+                )
+            }
+            Some(Served::Unavailable) => panic!("expected an answer, got 'unavailable'"),
+            None => panic!("expected an answer, the kind is not served"),
+        }
+    }
+
+    /// The same request handed straight to the mint is answered with `want`.
+    fn assert_served(&self, kind: u8, body: &[u8], want: &[u8]) {
+        assert_eq!(self.served_body(kind, body).as_slice(), want);
     }
 }
 
@@ -757,7 +749,7 @@ fn ask_any(cfg: &AskConfig, flight: &mut InFlight) -> Result<Verified, AskError>
 }
 
 #[test]
-fn keys_keysets_and_rotation_are_what_the_http_routes_return() {
+fn keys_keysets_and_rotation_are_answered_with_what_the_mint_serves() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("keys-real");
@@ -765,18 +757,15 @@ fn keys_keysets_and_rotation_are_what_the_http_routes_return() {
     let listener = start_serving(&server, &key, &dir, mint.serve());
     let cfg = config(&server, &did, 10, 3);
 
-    for (kind, path) in [
-        (KIND_KEYS, "/keys"),
-        (KIND_KEYSETS, "/keysets"),
-        (KIND_ROTATION, "/rotation"),
+    for (kind, name) in [
+        (KIND_KEYS, "keys"),
+        (KIND_KEYSETS, "keysets"),
+        (KIND_ROTATION, "rotation"),
     ] {
         let mut flight = InFlight::of(kind);
         let v = ask_any(&cfg, &mut flight).unwrap();
-        assert_eq!(
-            v.body(),
-            &mint.http(path)[..],
-            "{path}: the AIR body is the HTTP body, byte for byte"
-        );
+        mint.assert_served(kind, b"", v.body());
+        assert!(!v.body().is_empty(), "{name}");
         assert_eq!(v.reply.status, 0);
         // The receipt verifies from the DID alone.
         verify_receipt(&did, &v.receipt).unwrap();
@@ -820,8 +809,7 @@ fn a_mint_that_cannot_answer_says_so_in_a_signed_reply() {
     let listener = start_serving(&server, &key, &dir, mint.serve());
     let cfg = config(&server, &did, 10, 3);
 
-    // A thread panics while it holds the mint: the lock is poisoned, and the
-    // HTTP routes would answer 500.
+    // A thread panics while it holds the mint: the lock is poisoned.
     let state = Arc::clone(&mint.state);
     let _ = thread::spawn(move || {
         let _held = state.logic.lock().unwrap();
@@ -999,25 +987,11 @@ impl RealMint {
     /// previous keyset. Returns the notes, the previous and the current keyset.
     fn rotated(&self, n: usize) -> (Vec<(Note, Keypair)>, String, String) {
         let notes: Vec<_> = (0..n).map(|_| self.issue(Amount::from_units(1))).collect();
-        let _ = self.http("/rotation");
+        let _ = self.served_body(KIND_ROTATION, b"");
         self.set_clock(T + H);
-        let keysets: KeysetsResponse = serde_json::from_slice(&self.http("/keysets")).unwrap();
+        let keysets: KeysetsResponse =
+            serde_json::from_slice(&self.served_body(KIND_KEYSETS, b"")).unwrap();
         (notes, keysets.previous.unwrap(), keysets.current)
-    }
-
-    /// POST `body` to an HTTP route: the status and the bytes of the answer.
-    fn http_post(&self, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
-        self.rt.block_on(async {
-            let r = reqwest::Client::new()
-                .post(format!("{}{path}", self.base))
-                .header("content-type", "application/json")
-                .body(body.to_vec())
-                .send()
-                .await
-                .unwrap();
-            let status = r.status().as_u16();
-            (status, r.bytes().await.unwrap().to_vec())
-        })
     }
 }
 
@@ -1085,7 +1059,7 @@ fn spent_of(v: &Verified) -> Vec<bool> {
 }
 
 #[test]
-fn rollover_and_check_state_are_what_the_http_routes_return() {
+fn rollover_and_check_state_are_answered_and_the_rollover_is_applied_once() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("roll-real");
@@ -1096,16 +1070,10 @@ fn rollover_and_check_state_are_what_the_http_routes_return() {
     let (notes, prev, current) = mint.rotated(3);
     let check = check_of(&notes);
 
-    // Before: nothing is spent. The AIR body is the HTTP body, byte for byte.
+    // Before: nothing is spent. The AIR body is what the mint serves.
     let before = ask_body(&cfg, KIND_CHECK_STATE, &check).unwrap();
     assert_eq!(spent_of(&before), vec![false; 3]);
-    let (code, http) = mint.http_post("/check-state", &check);
-    assert_eq!(code, 200);
-    assert_eq!(
-        before.body(),
-        &http[..],
-        "check-state: the AIR body is the HTTP body"
-    );
+    mint.assert_served(KIND_CHECK_STATE, &check, before.body());
     assert_eq!(before.reply.status, STATUS_ANSWERED);
     verify_receipt(&did, &before.receipt).unwrap();
 
@@ -1119,22 +1087,15 @@ fn rollover_and_check_state_are_what_the_http_routes_return() {
     assert_eq!(answer.outcomes.len(), 3);
     verify_receipt(&did, &over_air.receipt).unwrap();
 
-    // The same request over HTTP is answered from the stored answer: the same
-    // bytes. (It is also the proof that the AIR call was applied once and
-    // stored by request hash, the way an HTTP call is.)
-    let (code, http) = mint.http_post("/rollover", &body);
-    assert_eq!(code, 200, "{}", String::from_utf8_lossy(&http));
-    assert_eq!(
-        over_air.body(),
-        &http[..],
-        "rollover: the AIR body is the HTTP body"
-    );
+    // The same request handed straight to the mint is answered from the stored
+    // answer: the same bytes. (It is also the proof that the AIR call was
+    // applied once and stored by request hash.)
+    mint.assert_served(KIND_ROLLOVER, &body, over_air.body());
 
-    // After: the notes are spent, over AIR and over HTTP alike.
+    // After: the notes are spent, over AIR and as the mint serves it.
     let after = ask_body(&cfg, KIND_CHECK_STATE, &check).unwrap();
     assert_eq!(spent_of(&after), vec![true; 3]);
-    let (_, http) = mint.http_post("/check-state", &check);
-    assert_eq!(after.body(), &http[..]);
+    mint.assert_served(KIND_CHECK_STATE, &check, after.body());
     listener.stop().unwrap();
 }
 
@@ -1206,7 +1167,7 @@ fn a_resent_rollover_is_answered_again_and_not_applied_twice() {
 }
 
 #[test]
-fn refusals_are_signed_replies_with_the_http_text() {
+fn refusals_are_signed_replies_with_the_mints_text() {
     let server = server();
     let (key, did) = mint_key();
     let dir = scratch("roll-refused");
@@ -1221,25 +1182,32 @@ fn refusals_are_signed_replies_with_the_http_text() {
     let cfg = config(&server, &did, 10, 3);
     let (notes, prev, current) = mint.rotated(2);
 
-    // What AIR says to `body`, and what HTTP says: the same JSON, and the AIR
-    // reply is signed and a receipt like any other.
-    let same_as_http = |kind: u8, path: &str, body: &[u8], code: &str| -> serde_json::Value {
+    // What AIR says to `body`, and what the mint serves: the same JSON, and the
+    // AIR reply is signed and a receipt like any other.
+    let same_as_served = |kind: u8, path: &str, body: &[u8], code: &str| -> serde_json::Value {
         let v = ask_body(&cfg, kind, body).unwrap();
         assert!(v.refused(), "{path}: expected a refusal");
         assert_eq!(v.reply.status, STATUS_REFUSED);
         let receipt = verify_receipt(&did, &v.receipt).unwrap();
         assert_eq!(receipt.status, STATUS_REFUSED);
-        let (status, http) = mint.http_post(path, body);
-        assert!(matches!(status, 400 | 413), "{path}: HTTP said {status}");
-        assert_eq!(v.body(), &http[..], "{path}: the refusal is the HTTP body");
+        match mint.served(kind, body) {
+            Some(Served::Refused(served)) => {
+                assert_eq!(
+                    v.body(),
+                    &served[..],
+                    "{path}: the refusal is the served body"
+                )
+            }
+            _ => panic!("{path}: the mint served no refusal"),
+        }
         let why: serde_json::Value = v.json().unwrap();
         assert_eq!(why["code"], code, "{why}");
         why
     };
 
-    // More notes than the cap: the HTTP 400 `refused`, nothing is spent.
+    // More notes than the cap: a 400 `refused`, nothing is spent.
     let two = json_bytes(&rollover_of(&notes, &prev, &current));
-    let why = same_as_http(KIND_ROLLOVER, "/rollover", &two, "refused");
+    let why = same_as_served(KIND_ROLLOVER, "/rollover", &two, "refused");
     assert!(
         why["error"].as_str().unwrap().contains("1 to 1 notes"),
         "{why}"
@@ -1248,7 +1216,7 @@ fn refusals_are_signed_replies_with_the_http_text() {
     // An unknown keyset: the keyset's own code.
     let one = &notes[..1];
     let nope = json_bytes(&rollover_of(one, &prev, "no-such-keyset"));
-    same_as_http(
+    same_as_served(
         KIND_ROLLOVER,
         "/rollover",
         &nope,
@@ -1261,7 +1229,7 @@ fn refusals_are_signed_replies_with_the_http_text() {
         (KIND_ROLLOVER, "/rollover"),
         (KIND_CHECK_STATE, "/check-state"),
     ] {
-        let why = same_as_http(kind, path, &big, sp_wire::codes::REQUEST_TOO_LARGE);
+        let why = same_as_served(kind, path, &big, sp_wire::codes::REQUEST_TOO_LARGE);
         assert_eq!(why["size_bytes"], 4097);
         assert_eq!(why["limit_bytes"], 4096);
     }
@@ -1312,7 +1280,7 @@ fn a_mint_that_cannot_answer_a_rollover_says_so_in_a_signed_reply() {
     .join();
     assert!(mint.state.logic.is_poisoned());
 
-    // Requests that parse and would reach the mint: the HTTP routes would be 500.
+    // Requests that parse and would reach the mint.
     for (kind, body) in [
         (KIND_ROLLOVER, &br#"{"inputs":[],"outputs":[]}"#[..]),
         (KIND_CHECK_STATE, &br#"{"nonces":[]}"#[..]),
@@ -1459,10 +1427,9 @@ fn a_full_rollover_of_a_thousand_notes_goes_over_air() {
     println!("its answer is {} bytes", v.body().len());
     verify_receipt(&did, &v.receipt).unwrap();
 
-    // The same bytes over HTTP: the stored answer, equal byte for byte.
-    let (code, http) = mint.http_post("/rollover", &body);
-    assert_eq!(code, 200);
-    assert_eq!(v.body(), &http[..]);
+    // The same bytes handed straight to the mint: the stored answer, equal byte
+    // for byte.
+    mint.assert_served(KIND_ROLLOVER, &body, v.body());
 
     // And all 1000 inputs are spent: the check-state request is full size too.
     let check = check_of(&notes);

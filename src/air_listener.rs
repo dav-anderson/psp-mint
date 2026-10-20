@@ -1,9 +1,9 @@
-//! The AIR listener: answers a wallet's read-only requests over AIR, beside the
-//! HTTP API. Off unless `air.enabled` is true. The calls are **mint info** (what
-//! `GET /health` reports) and the keys calls, **keys**, **keysets** and
-//! **rotation** (`GET /keys`, `/keysets`, `/rotation`); the reply body is what
-//! the HTTP route returns, built by the same code. The HTTP routes stay, for
-//! local use, and every other call is still HTTP.
+//! The AIR listener: answers a wallet's requests over AIR, the only way wallets
+//! reach this mint. It always runs under `serve`. The calls are **mint info**
+//! (what `GET /health` reports), the keys calls, **keys**, **keysets** and
+//! **rotation**, **rollover** and **check-state**; the reply body is built by
+//! `server::air_served`. What is left on HTTP is local to the SPI and the
+//! operator: `/melt`, `/burns`, `/audit` and `/health`.
 //!
 //! The design (REQUEST-DESIGN.md in sandbox-mint) and the wire (envelopes,
 //! addresses, signing) are in `sp_wire::air_request`; this module is the mint's
@@ -12,9 +12,8 @@
 //! - The mint holds reads on the next `air.held_reads` mailbox slots of its DID
 //!   (`mailbox_secret(DID, j)`; anyone can write a slot, only the mint can open
 //!   it). A slot that fills is opened with the mint DID key
-//!   (`mint_did_key.json`), answered with what the HTTP route of the request's
-//!   kind returns now (for mint info: `status`, `wire_version`, `network`),
-//!   signed with the same key, sealed to
+//!   (`mint_did_key.json`), answered with the call's result (for mint info:
+//!   `status`, `wire_version`, `network`), signed with the same key, sealed to
 //!   the wallet's one-off key `R`, and `Create`d in the reply cell only the
 //!   wallet and the mint can compute.
 //! - **Create first, no read-then-write.** The reply cell is write-once, so the
@@ -31,17 +30,17 @@
 //!   which is harmless.
 //! - **Garbage is skipped.** A cell that does not open, is malformed, is of an
 //!   unknown kind or names a key that is not one is logged and skipped. Every
-//!   call is read-only, so junk changes no state; the answer to a valid request
-//!   costs the mint one short lock, as the HTTP route does.
+//!   call that changes state is idempotent by request hash, and junk changes no
+//!   state; the answer to a valid request costs the mint one short lock.
 //! - **A call the mint cannot answer now** (the mint lock is poisoned, or a
-//!   rotation step failed: the HTTP route would be a 500) gets a signed reply
+//!   rotation step failed) gets a signed reply
 //!   with status `unavailable` and no body, so the wallet fails at once and says
 //!   why, instead of waiting out its tries.
 //! - **If the AIR client gives up** (the session was refused or killed: more than
 //!   [`LOST_LIMIT`] held reads end within [`LOST_WINDOW_SECS`] seconds, or a
-//!   `Create` fails three times) the listener returns an error and ends. The HTTP
-//!   side keeps running. A restart of psp-mint (or of the whole process) starts
-//!   it again from `next`. A restart of the AIR server needs nothing: the client
+//!   `Create` fails three times) the listener returns an error and ends, and
+//!   psp-mint exits with status 1 (a mint no wallet can reach is not running),
+//!   so that a supervisor starts it again from `next`. A restart of the AIR server needs nothing: the client
 //!   reconnects and its held reads resume (shown by the prototype).
 //!
 //! Held reads left behind by a stopped listener are never cleaned up by the AIR
@@ -232,8 +231,8 @@ pub async fn run(
                 if losses.len() > LOST_LIMIT {
                     return Err(format!(
                         "the AIR session is gone (more than {LOST_LIMIT} held reads ended in \
-                         {LOST_WINDOW_SECS} s). The HTTP API keeps running; restart psp-mint to \
-                         start the listener again, which resumes from slot {next}"
+                         {LOST_WINDOW_SECS} s). psp-mint exits so that a supervisor can start it \
+                         again, and the listener resumes from slot {next}"
                     ));
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;

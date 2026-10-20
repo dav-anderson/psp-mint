@@ -209,13 +209,17 @@ fn run_once(settings: &Settings) -> Result<(), Box<dyn Error>> {
     settings.cycle(&state, &rot, &mut records, &did, false)
 }
 
-/// Run the HTTP API and rescan the wallet every `scan.interval_secs`, in one
-/// process. The mint's database can only be opened by one process, so this
+/// Run the AIR listener (the only way wallets reach the mint), the local HTTP
+/// API (`/melt`, `/burns`, `/audit`, `/health`) and rescan the wallet every
+/// `scan.interval_secs`, in one process. The mint's database can only be opened by one process, so this
 /// cannot run at the same time as a one-shot run.
 fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     let bind = settings.config.bind.clone();
     let limits = settings.config.limits();
     let interval = Duration::from_secs(settings.config.scan_interval_secs);
+    // AIR is the only way wallets reach this mint, so serve does not start
+    // without it.
+    settings.config.require_air()?;
     settings.verify_network()?;
 
     let (logic, rot) = settings.open_mint()?;
@@ -224,8 +228,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     let did = settings.did_key()?;
     let scan_rot = Arc::clone(&rot);
     let air_rot = Arc::clone(&rot);
-    // `air.enabled`: answer mint-info, keys, keysets and rotation requests over
-    // AIR, on a thread of its own.
+    // The AIR listener answers wallets' requests, on a thread of its own.
     // Settings are read before `settings` moves into the scan thread.
     let air = settings.config.air_listener(&settings.data_dir);
 
@@ -238,16 +241,14 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     let melts: server::SharedMelts = Arc::new(Mutex::new(MeltLog::open(
         &settings.data_dir.join("melt_memos.json"),
     )?));
-    if let Some(air) = air {
-        start_air_listener(
-            air,
-            did,
-            Arc::clone(&state),
-            air_rot,
-            Arc::clone(&health),
-            limits,
-        )?;
-    }
+    start_air_listener(
+        air,
+        did,
+        Arc::clone(&state),
+        air_rot,
+        Arc::clone(&health),
+        limits,
+    )?;
 
     // A plain thread, not a task: the price fetch uses a blocking HTTP client,
     // which must not run on the async runtime.
@@ -287,7 +288,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
         .build()?;
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::bind(&bind).await?;
-        println!("psp-mint api listening on http://{bind}");
+        println!("psp-mint local api (melt, burns, audit, health) listening on http://{bind}");
         axum::serve(
             listener,
             server::router_full(state, health, melts, limits, Some(rot)),
@@ -301,11 +302,11 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     })
 }
 
-/// Start the AIR listener (`air.enabled`) on its own thread. It answers
-/// mint-info, keys, keysets and rotation requests with what the HTTP routes
-/// return at that moment (`server::air_served`). If it fails
-/// (the AIR client gave up) it says so and ends; the HTTP API keeps running,
-/// and a restart starts the listener again, from the stored slot counter.
+/// Start the AIR listener on its own thread. It answers wallets' requests
+/// (`server::air_served`). If it fails (the AIR client gave up) it says so and
+/// the process exits with status 1, so that the service manager starts it again
+/// and the listener resumes from the stored slot counter: a mint that no wallet
+/// can reach is not running.
 fn start_air_listener(
     air: psp_mint::air_listener::Settings,
     did: SecretKey,
@@ -322,12 +323,15 @@ fn start_air_listener(
             };
             match psp_mint::air_listener::run_blocking(&air, &did, &serve) {
                 Ok(()) => eprintln!("AIR listener: stopped"),
-                Err(e) => eprintln!(
-                    "AIR listener failed: {e}\nThe HTTP API keeps running; the listener is off until psp-mint is restarted"
-                ),
+                Err(e) => {
+                    eprintln!(
+                        "AIR listener failed: {e}\nExiting so that a supervisor can restart the process"
+                    );
+                    std::process::exit(1);
+                }
             }
         })?;
-    println!("AIR listener starting (air.enabled is true)");
+    println!("AIR listener starting");
     Ok(())
 }
 
@@ -384,8 +388,10 @@ fn migrate() -> Result<(), Box<dyn Error>> {
 const USAGE: &str = "\
 psp-mint [--mainnet | --regtest | --signet | --testnet] [command]
 
-  serve                                    The HTTP API and the wallet scan, in
-                                           one process.
+  serve                                    The AIR listener (needs air.server
+                                           and air.host), the local HTTP API
+                                           and the wallet scan, in one
+                                           process.
   run                                      The default. Scan the wallet once,
                                            settle what it can, and exit. For
                                            testing.

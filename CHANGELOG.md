@@ -2,6 +2,22 @@
 
 psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.5.0 (unreleased): HTTP gone where AIR has replaced it
+
+Wallets reach this mint over AIR and only over AIR. The HTTP routes that AIR replaced are removed, with the code only they used; what is left on HTTP is local to the SPI and the operator.
+
+**Behaviour change.**
+
+- **HTTP is gone for the wallet's calls.** `GET /keys`, `GET /keysets`, `GET /rotation`, `POST /rollover` and `POST /check-state` are no longer routes (in either router); a request for one is a `404`. They are answered by the AIR listener (kinds 2 to 6), with the same bodies and the same ceilings. `/melt`, `/burns`, `/audit` and `/health` stay on HTTP: the SPI uses them.
+- **AIR is required.** `serve` stops at start if `air.server` (`PSP_AIR_SERVER`) or `air.host` (`PSP_AIR_HOST`) is missing, with a message that names the setting. Other commands do not need them.
+- **`air.enabled` (`PSP_AIR_ENABLED`) is gone.** The listener always runs. A file or an environment that still sets it stops the mint when the settings load, with a message that says to delete it (a setting that does nothing, silently, would look like a choice).
+- **`server.bind` (`PSP_BIND`) must be a loopback address.** The settings refuse any other IP when they load (any command). The default `127.0.0.1:3000` is unchanged.
+- **A listener that fails ends the process** (exit status 1, message on stderr), so that a supervisor restarts it and it resumes from its counter. It used to log and leave the HTTP server running, which is now a mint nobody can reach.
+
+**Removed.** The handlers and routes above, the unrotating router's `/keys`, `/check-state` and the rotation routes, and the code only they used. `server::router` (without rotation) serves `/audit`, `/melt`, `/burns` and `/health`; `router_full` with rotation serves the same four. `main.rs` always builds the rotating mint. The functions that build the wallet calls' answers (`keys_response`, `keysets_response`, `rotation_response`, `rollover_response`, `check_state_response`) are kept: `air_served` calls them.
+
+**Tests.** The tests of the removed routes call the AIR listener instead, on a real `air_server` in the test process (new `tests/common`): `rotation_http.rs` (rotation, keysets, rollover and check-state), `api.rs` (keys and check-state, and a test that the five routes are `404` on HTTP), `limits_http.rs` (the check-state ceiling at 4097 and 4096 bytes over AIR; the 3 MiB ceiling test now runs on `/burns`). `/melt`, `/burns`, `/audit` and `/health` stay HTTP, as `network_http.rs`. `air_info.rs` no longer compares AIR replies with HTTP routes, which are gone. A refusal over AIR is read as `400`; a ceiling is told apart by `code` (`request_too_large`).
+
 ## 0.4.0 (unreleased)
 
 **AIR 3.0.0 (unreleased).** Comments and docs follow sp-wire's move to air 3.0.0 (`ff41c09`) and air_server 1.0.0 (`ec6ac1f`); no code changes. The local AIR checkouts for a build are now on the branch `air3-export-secretkey` (3.0.0 plus the `SecretKey` export), and air_server is at 1.0.0.

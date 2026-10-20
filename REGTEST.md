@@ -152,10 +152,10 @@ Notes on running it:
 
 ## 8. Run the PSP server
 
-`serve` runs the HTTP API and rescans the wallet on a timer, in one process. Stop the one-shot run first if it is going. For testing, use a short interval:
+`serve` runs the AIR listener, the local HTTP API and the wallet scan on a timer, in one process. Stop the one-shot run first if it is going. `serve` needs the AIR server it listens on: `PSP_AIR_SERVER` is that server's public key (66 hex characters) and `PSP_AIR_HOST` its host (`127.0.0.1` for the one bundled with the SPI). For testing, use a short interval:
 
 ```
-PSP_SCAN_INTERVAL_SECS=10 cargo run -- --regtest serve
+PSP_AIR_SERVER=<air server key> PSP_AIR_HOST=127.0.0.1 PSP_SCAN_INTERVAL_SECS=10 cargo run -- --regtest serve
 ```
 
 It prints the settings first, the same list as in step 7 except that the interval comes from the environment:
@@ -170,12 +170,11 @@ psp-mint settings: no config file, so defaults and the environment:
 then `scanning wallet psp-regtest every 10 s` and `psp-mint api listening on http://127.0.0.1:3000`. With a 10 s interval `/health` fails after 3 × 10 + 60 = 90 s without a successful scan. In another terminal:
 
 ```
-curl -s http://127.0.0.1:3000/keys
 curl -s http://127.0.0.1:3000/audit
 curl -s http://127.0.0.1:3000/health
 ```
 
-`/keys` lists a public key for each denomination (1 to 16,777,216, 25 keys). `/audit` shows `issued`, `redeemed` and `outstanding`. To watch a payment move through, send one (step 5), mine 1 block (step 6) and wait for a scan: the server prints `price locked at ... USD/BTC, waiting: 1 of 6 confirmations`. Mine 5 more blocks and after the next scan it settles and prints the signatures. `/audit` then shows the issued total. Stop it with Ctrl-C.
+(The mint's keys are not on HTTP: a wallet asks for them over AIR.) `/audit` shows `issued`, `redeemed` and `outstanding`. To watch a payment move through, send one (step 5), mine 1 block (step 6) and wait for a scan: the server prints `price locked at ... USD/BTC, waiting: 1 of 6 confirmations`. Mine 5 more blocks and after the next scan it settles and prints the signatures. `/audit` then shows the issued total. Stop it with Ctrl-C.
 
 Scan failures (for example the node being down) are printed and retried on the next interval. Payments that are already settled are not printed again.
 
