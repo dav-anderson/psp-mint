@@ -41,8 +41,32 @@ use sp_wire::{ServiceDid, WIRE_VERSION};
 
 const NETWORK: &str = "regtest";
 
-fn server() -> ServerRef {
-    local_server::start().expect("a local AIR server (is port 5702 free?)")
+/// One test at a time on the shared AIR server. It has a single storage worker,
+/// so tests running in parallel starve each other past their timeouts.
+static AIR_TURN: Mutex<()> = Mutex::new(());
+
+/// The shared server plus this test's turn on it; the turn ends when this drops,
+/// whether the test passed, failed or panicked.
+struct Server {
+    server: ServerRef,
+    _turn: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for Server {
+    type Target = ServerRef;
+
+    fn deref(&self) -> &ServerRef {
+        &self.server
+    }
+}
+
+fn server() -> Server {
+    let turn = AIR_TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let server = local_server::start().expect("a local AIR server (is port 5702 free?)");
+    Server {
+        server,
+        _turn: turn,
+    }
 }
 
 fn scratch(name: &str) -> PathBuf {
