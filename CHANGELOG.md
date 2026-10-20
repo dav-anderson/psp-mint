@@ -4,6 +4,8 @@ psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-co
 
 ## 0.4.0 (unreleased)
 
+**AIR 3.0.0 (unreleased).** Comments and docs follow sp-wire's move to air 3.0.0 (`ff41c09`) and air_server 1.0.0 (`ec6ac1f`); no code changes. The local AIR checkouts for a build are now on the branch `air3-export-secretkey` (3.0.0 plus the `SecretKey` export), and air_server is at 1.0.0.
+
 **Wire version 3: the service ID is the 33-byte AIR DID.** Builds on `sp-wire` 0.5.0 (`WIRE_VERSION` 3). `Cargo.toml` still names `sp-wire` by `tag = "v0.4.0"`, which moves when the new release is tagged (until then a local `[patch]` is used, see the README of `sp-wire`). `GET /health` reports `wire_version` 3 because it reads the constant. No other code changed: the PSP has no service in any request or file, only the storage policy.
 
 - `storage.mint_state` (`PSP_STORAGE_MINT_STATE`) takes DIDs, 66 hex characters starting `02` or `03`. The 32-byte x-only form is refused when the config loads, with a message that says to use the DID, and a 33-byte DID is no longer reduced to its x coordinate.
