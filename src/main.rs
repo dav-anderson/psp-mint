@@ -4,11 +4,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mint_server::state::AppState;
 use mint_types::Amount;
 use psp_mint::config::{self, Config};
+use psp_mint::delivery::Deliverer;
 use psp_mint::melts::MeltLog;
 use psp_mint::network::{self, Network};
 use psp_mint::price::Lazy;
@@ -119,6 +120,55 @@ impl Settings {
         seal::load_or_generate(&self.data_dir.join(seal::KEY_FILENAME))
     }
 
+    /// The writer of delivery records, when `air.server` and `air.host` are set
+    /// (they need no setting of their own: it is the AIR server the listener
+    /// uses). `serve` requires them; a one-shot `run` can go without.
+    fn deliverer(&self, key: &SecretKey) -> Option<Deliverer> {
+        let cfg = &self.config;
+        if cfg.air_server.is_empty() || cfg.air_host.is_empty() {
+            return None;
+        }
+        let air = cfg.air_listener(&self.data_dir);
+        Some(Deliverer::new(air.server, air.timeout_secs, key.clone()))
+    }
+
+    /// Write the records of every purchase that is owed one and has none stored.
+    /// Never fails a scan: what could not be written is printed and tried again
+    /// on the next pass.
+    fn deliver(&self, deliverer: &mut Option<Deliverer>, records: &mut Records, quiet: bool) {
+        match deliverer {
+            Some(deliverer) => {
+                deliverer.pass(records, Instant::now());
+            }
+            None => {
+                let waiting = records.undelivered().len();
+                if waiting > 0 && !quiet {
+                    println!(
+                        "{waiting} purchase(s) are waiting for their signatures to be delivered over \
+                         AIR; air.server and air.host are not set, so they stay in the records"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Forfeit every payment whose reconciliation window has closed with the
+    /// payment still open: the mint keeps the BTC and owes nothing, and `/audit`
+    /// shows it apart. Never fails a scan.
+    fn forfeit(&self, records: &mut Records) {
+        match records.forfeit_expired(server::now_secs()) {
+            Ok(gone) => {
+                for txid in gone {
+                    println!(
+                        "forfeited {txid}: its reconciliation window closed with the payment \
+                         unsettled; the mint keeps the BTC"
+                    );
+                }
+            }
+            Err(e) => eprintln!("forfeit check failed, will retry: {e}"),
+        }
+    }
+
     fn records(&self) -> Result<Records, Box<dyn Error>> {
         Ok(Records::open_with_legacy(
             &self.data_dir.join("settlements.json"),
@@ -206,7 +256,12 @@ fn run_once(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let state = server::app_state(logic);
     let mut records = settings.records()?;
     let did = settings.did_key()?;
-    settings.cycle(&state, &rot, &mut records, &did, false)
+    let mut deliverer = settings.deliverer(&did);
+    let cycle = settings.cycle(&state, &rot, &mut records, &did, false);
+    // Delivery is tried even when the scan failed: what was issued before is owed.
+    settings.deliver(&mut deliverer, &mut records, false);
+    settings.forfeit(&mut records);
+    cycle
 }
 
 /// Run the AIR listener (the only way wallets reach the mint), the local HTTP
@@ -231,6 +286,8 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     // The AIR listener answers wallets' requests, on a thread of its own.
     // Settings are read before `settings` moves into the scan thread.
     let air = settings.config.air_listener(&settings.data_dir);
+    let mut deliverer = settings.deliverer(&did);
+    let records_path = settings.data_dir.join("settlements.json");
 
     // How long without a successful pass before `/health` fails:
     // `scan.health_intervals` intervals plus `scan.health_grace_secs`.
@@ -265,6 +322,10 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
                 Ok(()) => scan_health.record_scan(),
                 Err(e) => eprintln!("scan failed, will retry: {e}"),
             }
+            // After every scan, whether or not it worked: records that could not
+            // be written earlier are tried again here, with a backoff of their own.
+            settings.deliver(&mut deliverer, &mut records, true);
+            settings.forfeit(&mut records);
             thread::sleep(interval);
         }
     });
@@ -291,7 +352,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
         println!("psp-mint local api (melt, burns, audit, health) listening on http://{bind}");
         axum::serve(
             listener,
-            server::router_full(state, health, melts, limits, Some(rot)),
+            server::router_audited(state, health, melts, limits, Some(rot), Some(records_path)),
         )
         .with_graceful_shutdown(async {
             shutdown_signal().await;
@@ -389,12 +450,14 @@ const USAGE: &str = "\
 psp-mint [--mainnet | --regtest | --signet | --testnet] [command]
 
   serve                                    The AIR listener (needs air.server
-                                           and air.host), the local HTTP API
-                                           and the wallet scan, in one
-                                           process.
+                                           and air.host), the local HTTP API,
+                                           the wallet scan and the delivery of
+                                           each purchase's signatures over
+                                           AIR, in one process.
   run                                      The default. Scan the wallet once,
-                                           settle what it can, and exit. For
-                                           testing.
+                                           settle what it can, deliver what is
+                                           owed (when air.server and air.host
+                                           are set), and exit. For testing.
   config                                   Print the settings in use and where
                                            each came from.
   pubkey                                   Print the mint's DID public key (66

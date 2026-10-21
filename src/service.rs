@@ -178,6 +178,10 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
                 percent_text(terms.reconciliation_target_bps),
                 hex::encode(held.payer_did)
             ));
+            let days = terms.reconciliation_window_secs.div_ceil(86_400);
+            lines.push(format!(
+                "  the payer is told over AIR; if it is not settled within {days} day(s) the payment is forfeited and the mint keeps the BTC"
+            ));
         }
         Settlement::Issued(issue) => {
             lines.push(format!("  over/under: {} bps", issue.over_under_bps));
@@ -204,11 +208,14 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
                     hex::encode(issue.payer_did)
                 ));
             }
-            // "keyset <id>": the keyset that signed, so the payer unblinds with
-            // its keys (GET /keysets) even after a rotation.
+            // The lines below are a log. The payer does not claim from them: the
+            // same pairs, the keyset and its keys are written to the AIR server
+            // as the purchase's delivery record (see `delivery`).
+            //
+            // "keyset <id>": the keyset that signed.
             lines.push(format!("  keyset {}", issue.keyset));
-            // "signature <blind nonce> <signature>", so the payer can pair each
-            // signature with the output it blinded.
+            // "signature <blind nonce> <signature>": each signature with the
+            // blind nonce of the output it signs.
             for (blind_nonce, result) in issue.blind_nonces.iter().zip(&issue.results) {
                 match result {
                     Ok(signature) => {
@@ -539,6 +546,7 @@ mod tests {
             min_confirmations: 3,
             price_tolerance_bps: 50,
             reconciliation_target_bps: 150,
+            reconciliation_window_secs: 86_400,
         };
         let r = received("dd", 1);
         let waiting = describe_with(&r, &Settlement::Waiting { confirmations: 1 }, &terms);

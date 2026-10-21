@@ -13,6 +13,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sp_wire::air_request::delivery::Outcome;
 
 #[derive(Debug)]
 pub enum RecordsError {
@@ -52,9 +53,41 @@ pub enum Status {
     /// allows, so nothing was signed and the BTC is held. Kept under the
     /// payment and the payer's DID until the payer answers with a new request
     /// over AIR. That AIR exchange is not built yet, so today the record just
-    /// waits. It is never deleted automatically (see the README, "Underpayment").
+    /// waits, for the reconciliation window (`Record::open_until`); when the window
+    /// closes unsettled the payment is forfeited (`Record::forfeited_at`) and the
+    /// BTC stays with the mint. See the README, "Underpayment".
     #[serde(rename = "paid_unsettled")]
     PaidUnsettled,
+}
+
+/// What the payer is owed over AIR for one purchase, and whether it has been
+/// written yet (`sp_wire::air_request::delivery`). Made when the purchase is
+/// issued or rejected, from what was signed, and kept in the purchase's record so
+/// that a restart, or an AIR server that was down, loses nothing. The signatures
+/// are not kept anywhere else: `describe` only logs them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Delivery {
+    /// The payer's reply DID from the payload (66 hex characters): the one-off key
+    /// the record is sealed to.
+    pub reply_did: String,
+    /// The purchase id (64 hex characters): the hash of the unsealed payload.
+    pub purchase: String,
+    /// What the record says: the signatures and keysets, or the rejection.
+    pub outcome: Outcome,
+    /// The sealed record (hex), made on the first attempt to write it and kept, so
+    /// that a retry writes the same bytes. The AIR server answers a write to a
+    /// taken cell with what it holds, and the same bytes are how a write that
+    /// got through but was not acknowledged is told from another record.
+    #[serde(default)]
+    pub sealed: Option<String>,
+    /// True once the record is stored on the AIR server.
+    #[serde(default)]
+    pub delivered: bool,
+    /// Why the record can never be written, when that is so: the reply DID in the
+    /// payload is not a key, so nothing can be sealed to it. Retrying would
+    /// not help, so the delivery is left alone and the reason is kept here.
+    #[serde(default)]
+    pub abandoned: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +129,51 @@ pub struct Record {
     /// later be checked against what was actually paid. 0 on older records.
     #[serde(default)]
     pub value_sats: u64,
+    /// The record owed to the payer over AIR, when there is one: for an issued
+    /// purchase, for a payment held as `paid_unsettled`, and for a rejected one
+    /// whose payload could be read. Absent on records made before delivery existed
+    /// (they were never delivered, and their signatures were only logged), and on
+    /// a payment with no readable payload (no reply DID to address).
+    #[serde(default)]
+    pub delivery: Option<Delivery>,
+    /// Unix seconds at which the reconciliation window closes, for a payment that
+    /// is open: held (`paid_unsettled`), rejected with a readable reply DID, or
+    /// issued with a credit owed. `None` for a payment that is closed (or was never
+    /// open, such as a rejection with no reply DID, which the payer takes the loss
+    /// of). Whatever settles an open payment later must clear this.
+    #[serde(default)]
+    pub open_until: Option<u64>,
+    /// Unix seconds at which the window closed with the payment still open: the
+    /// payment is forfeited, the mint keeps the BTC (and owes no credit), and
+    /// `/audit` shows it apart.
+    #[serde(default)]
+    pub forfeited_at: Option<u64>,
+}
+
+/// A count of payments with what they were worth, for `/audit`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Tally {
+    pub payments: u64,
+    /// Sats of payments that got no notes (held, or rejected): all of the payment.
+    pub sats: u64,
+    /// USD cents of credit on payments that did get notes: the overpayment.
+    pub credit_cents: u64,
+}
+
+/// The payments the mint is holding open or has forfeited, for `/audit`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Reconciliation {
+    /// Open, inside their window.
+    pub open: Tally,
+    /// Their window closed unsettled.
+    pub forfeited: Tally,
+}
+
+impl Record {
+    /// True while the payment is inside its reconciliation window.
+    pub fn is_open(&self) -> bool {
+        self.open_until.is_some() && self.forfeited_at.is_none()
+    }
 }
 
 impl Record {
@@ -112,6 +190,9 @@ impl Record {
             payer_did: None,
             requested_units: 0,
             value_sats: 0,
+            delivery: None,
+            open_until: None,
+            forfeited_at: None,
         }
     }
 }
@@ -159,6 +240,9 @@ impl Records {
                 payer_did: None,
                 requested_units: 0,
                 value_sats: 0,
+                delivery: None,
+                open_until: None,
+                forfeited_at: None,
             });
         }
         if next.len() != records.rows.len() {
@@ -183,18 +267,92 @@ impl Records {
     }
 
     /// What the mint still owes one payer DID: every payment of theirs that
-    /// holds a credit or is paid but unsettled, as (txid, record), by txid.
-    /// Both kinds stay here until the AIR exchange that settles them exists;
-    /// nothing deletes them.
+    /// holds a credit or is paid but unsettled and has not been forfeited, as
+    /// (txid, record), by txid. Both kinds stay here until the AIR exchange that
+    /// settles them exists, or their window closes (`forfeit_expired`).
     pub fn owed_to(&self, payer_did: &str) -> Vec<(&str, &Record)> {
         self.rows
             .iter()
             .filter(|(_, r)| {
                 r.payer_did.as_deref() == Some(payer_did)
+                    && r.forfeited_at.is_none()
                     && (r.credit_cents > 0 || r.status == Status::PaidUnsettled)
             })
             .map(|(txid, r)| (txid.as_str(), r))
             .collect()
+    }
+
+    /// The purchases whose record has not been written to the AIR server yet and
+    /// still can be, as (txid, delivery), by txid.
+    pub fn undelivered(&self) -> Vec<(String, Delivery)> {
+        self.rows
+            .iter()
+            .filter_map(|(txid, r)| match &r.delivery {
+                Some(d) if !d.delivered && d.abandoned.is_none() => Some((txid.clone(), d.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Replace the delivery state of one purchase and write the file. An error if
+    /// there is no such record or it has no delivery.
+    pub fn put_delivery(&mut self, txid: &str, delivery: Delivery) -> Result<(), RecordsError> {
+        let mut record = match self.rows.get(txid) {
+            Some(r) if r.delivery.is_some() => r.clone(),
+            _ => {
+                return Err(RecordsError::Io(io::Error::other(format!(
+                    "{txid} has no delivery to update"
+                ))));
+            }
+        };
+        record.delivery = Some(delivery);
+        self.put(txid, record)
+    }
+
+    /// Mark forfeited every payment that is open and whose window closed at or
+    /// before `now`: the mint keeps the BTC and owes nothing. Returns the txids
+    /// marked, by txid. Nothing settles an open payment yet, so every one ends
+    /// here; the exchange that settles one will clear `open_until` first.
+    pub fn forfeit_expired(&mut self, now: u64) -> Result<Vec<String>, RecordsError> {
+        let due: Vec<String> = self
+            .rows
+            .iter()
+            .filter(|(_, r)| r.is_open() && r.open_until.is_some_and(|until| until <= now))
+            .map(|(txid, _)| txid.clone())
+            .collect();
+        let mut next = self.rows.clone();
+        for txid in &due {
+            if let Some(record) = next.get_mut(txid) {
+                record.forfeited_at = Some(now);
+            }
+        }
+        if !due.is_empty() {
+            self.write(&next)?;
+            self.rows = next;
+        }
+        Ok(due)
+    }
+
+    /// What is held open and what has been forfeited, for `/audit`.
+    pub fn reconciliation(&self) -> Reconciliation {
+        let mut out = Reconciliation::default();
+        for record in self.rows.values() {
+            if record.open_until.is_none() {
+                continue;
+            }
+            let tally = if record.forfeited_at.is_some() {
+                &mut out.forfeited
+            } else {
+                &mut out.open
+            };
+            tally.payments += 1;
+            if record.status == Status::Issued {
+                tally.credit_cents = tally.credit_cents.saturating_add(record.credit_cents);
+            } else {
+                tally.sats = tally.sats.saturating_add(record.value_sats);
+            }
+        }
+        out
     }
 
     pub fn len(&self) -> usize {
@@ -350,6 +508,179 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(value["t2"]["status"], "paid_unsettled");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn delivery(purchase: &str) -> Delivery {
+        Delivery {
+            reply_did: "02".to_string() + &"cc".repeat(32),
+            purchase: purchase.to_string(),
+            outcome: Outcome::Refused(sp_wire::air_request::delivery::Refused {
+                reason: "Overflow".to_string(),
+                ..Default::default()
+            }),
+            sealed: None,
+            delivered: false,
+            abandoned: None,
+        }
+    }
+
+    #[test]
+    fn a_record_from_before_delivery_has_none_and_is_never_listed_as_undelivered() {
+        let dir = scratch("no-delivery");
+        let path = dir.join("settlements.json");
+        fs::write(
+            &path,
+            r#"{"aa": {"locked_price_cents": 9, "issued": true, "over_under_bps": 5,
+                "status": "issued", "late": false, "skipped_units": 0,
+                "credit_cents": 0, "reason": null, "payer_did": null,
+                "requested_units": 3, "value_sats": 5000}}"#,
+        )
+        .unwrap();
+        let r = Records::open(&path).unwrap();
+        assert_eq!(r.get("aa").unwrap().delivery, None);
+        assert!(r.undelivered().is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undelivered_lists_the_records_not_yet_written_and_a_delivery_update_persists() {
+        let dir = scratch("undelivered");
+        let path = dir.join("settlements.json");
+        let mut r = Records::open(&path).unwrap();
+        let mut a = Record::locked(1, false);
+        a.status = Status::Rejected;
+        a.delivery = Some(delivery("p1"));
+        r.put("t1", a).unwrap();
+        let mut done = Record::locked(1, false);
+        done.status = Status::Rejected;
+        let mut d = delivery("p2");
+        d.delivered = true;
+        done.delivery = Some(d);
+        r.put("t2", done).unwrap();
+        r.put("t3", Record::locked(1, false)).unwrap();
+        let listed = r.undelivered();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "t1");
+
+        let mut sealed = delivery("p1");
+        sealed.sealed = Some("abcd".to_string());
+        r.put_delivery("t1", sealed.clone()).unwrap();
+        let reopened = Records::open(&path).unwrap();
+        assert_eq!(reopened.get("t1").unwrap().delivery, Some(sealed.clone()));
+        let mut delivered = sealed;
+        delivered.delivered = true;
+        let mut reopened = reopened;
+        reopened.put_delivery("t1", delivered).unwrap();
+        assert!(reopened.undelivered().is_empty());
+        // a record with no delivery cannot be given one this way
+        assert!(reopened.put_delivery("t3", delivery("p3")).is_err());
+        assert!(reopened.put_delivery("missing", delivery("p3")).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_record_from_before_the_window_has_none_and_is_never_open_or_forfeited() {
+        let dir = scratch("no-window");
+        let path = dir.join("settlements.json");
+        fs::write(
+            &path,
+            r#"{"aa": {"locked_price_cents": 9, "issued": false, "over_under_bps": -5000,
+                "status": "paid_unsettled", "late": false, "skipped_units": 5,
+                "credit_cents": 0, "reason": "held", "payer_did": null,
+                "requested_units": 5, "value_sats": 300}}"#,
+        )
+        .unwrap();
+        let mut r = Records::open(&path).unwrap();
+        let rec = r.get("aa").unwrap();
+        assert_eq!((rec.open_until, rec.forfeited_at), (None, None));
+        assert!(!rec.is_open());
+        // an old held payment has no window, so nothing forfeits it
+        assert!(r.forfeit_expired(u64::MAX).unwrap().is_empty());
+        assert_eq!(r.reconciliation(), Reconciliation::default());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn held(sats: u64, until: u64) -> Record {
+        let mut r = Record::locked(1, false);
+        r.status = Status::PaidUnsettled;
+        r.value_sats = sats;
+        r.open_until = Some(until);
+        r
+    }
+
+    #[test]
+    fn a_payment_whose_window_closes_unsettled_is_forfeited_once_and_shown_apart() {
+        let dir = scratch("forfeit");
+        let path = dir.join("settlements.json");
+        let mut r = Records::open(&path).unwrap();
+        r.put("held-soon", held(300, 100)).unwrap();
+        r.put("held-late", held(700, 200)).unwrap();
+        let mut rejected = held(500, 100);
+        rejected.status = Status::Rejected;
+        r.put("rejected", rejected).unwrap();
+        let mut credit = Record::locked(1, false);
+        credit.status = Status::Issued;
+        credit.issued = true;
+        credit.credit_cents = 250;
+        credit.value_sats = 9_000;
+        credit.open_until = Some(100);
+        r.put("credit", credit).unwrap();
+        // closed for good: no window
+        let mut closed = Record::locked(1, false);
+        closed.status = Status::Issued;
+        closed.value_sats = 1_000;
+        r.put("closed", closed).unwrap();
+
+        // inside the window nothing is forfeited, and all four are open
+        assert!(r.forfeit_expired(99).unwrap().is_empty());
+        let open = r.reconciliation();
+        assert_eq!(
+            (open.open.payments, open.open.sats, open.open.credit_cents),
+            (4, 300 + 700 + 500, 250)
+        );
+        assert_eq!(open.forfeited, Tally::default());
+
+        // the boundary is inclusive; the later window is still open
+        let gone = r.forfeit_expired(100).unwrap();
+        assert_eq!(gone, vec!["credit", "held-soon", "rejected"]);
+        let tally = r.reconciliation();
+        assert_eq!(
+            (
+                tally.forfeited.payments,
+                tally.forfeited.sats,
+                tally.forfeited.credit_cents
+            ),
+            (3, 300 + 500, 250)
+        );
+        assert_eq!((tally.open.payments, tally.open.sats), (1, 700));
+        assert!(r.get("held-late").unwrap().is_open());
+        assert_eq!(r.get("held-soon").unwrap().forfeited_at, Some(100));
+
+        // forfeited once: asking again later changes nothing, and it persists
+        assert!(r.forfeit_expired(10_000).unwrap() == vec!["held-late"]);
+        assert!(r.forfeit_expired(20_000).unwrap().is_empty());
+        let reopened = Records::open(&path).unwrap();
+        assert_eq!(reopened.get("held-soon").unwrap().forfeited_at, Some(100));
+        assert_eq!(
+            reopened.get("held-late").unwrap().forfeited_at,
+            Some(10_000)
+        );
+        assert_eq!(reopened.reconciliation().open, Tally::default());
+        assert_eq!(reopened.reconciliation().forfeited.payments, 4);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_forfeited_payment_is_no_longer_owed() {
+        let dir = scratch("forfeit-owed");
+        let mut r = Records::open(&dir.join("settlements.json")).unwrap();
+        let mut a = held(300, 100);
+        a.payer_did = Some("aa".repeat(33));
+        r.put("t1", a).unwrap();
+        assert_eq!(r.owed_to(&"aa".repeat(33)).len(), 1);
+        r.forfeit_expired(100).unwrap();
+        assert!(r.owed_to(&"aa".repeat(33)).is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 

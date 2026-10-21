@@ -19,7 +19,10 @@
 //! - `POST /burns`: for each nonce, whether it is spent and the memo it was burned
 //!   under. The ESP mint uses this to tell, on a retry, a note it burned itself
 //!   from a note that was burned by someone else.
-//! - `GET /audit`: issued, redeemed and outstanding totals.
+//! - `GET /audit`: issued, redeemed and outstanding totals, and (when `serve`
+//!   gives the router the settlement records) `reconciliation`: the payments
+//!   held open and the payments forfeited, each with a count, the sats of the
+//!   ones that got no notes and the USD cents of credit on the ones that did.
 //! - `GET /health`: `200` while the scanner is keeping up and the mint lock is
 //!   sound, `503` otherwise, with the time of the last successful scan.
 //!
@@ -39,6 +42,7 @@
 //! loopback address. A note authorizes its own spend, so a caller can only burn
 //! notes they hold.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -56,6 +60,7 @@ use mint_server::state::AppState;
 use mint_types::{Amount, MintInput, Nonce};
 
 use crate::melts::MeltLog;
+use crate::records::Records;
 use crate::rotation::{RolloverError, RolloverRequest, Rollovers, Rotor};
 
 // The wire types live in sp-wire; they are re-exported so the paths are unchanged.
@@ -223,6 +228,46 @@ async fn health_handler(
     // request or scan holds the mint.
     let (code, body) = health.report(state.logic.is_poisoned(), now_secs());
     (code, Json(body))
+}
+
+/// Add `"reconciliation"` to a JSON object reply (`/audit`), when the router was
+/// given the settlement records: the payments held open (inside their window) and
+/// the payments forfeited (the window closed unsettled; the mint keeps the BTC),
+/// kept apart from the issued, redeemed and outstanding totals. The records are
+/// read when the report is asked for, so it is as current as the last write. A
+/// file that cannot be read leaves the section out and says so on the log.
+async fn add_reconciliation(
+    State(records): State<Option<Arc<PathBuf>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let response = next.run(request).await;
+    let Some(path) = records else {
+        return response;
+    };
+    if !response.status().is_success() {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            match Records::open(&path) {
+                Ok(records) => {
+                    if let Ok(section) = serde_json::to_value(records.reconciliation()) {
+                        map.insert("reconciliation".into(), section);
+                    }
+                }
+                Err(e) => eprintln!("/audit: the reconciliation section was left out: {e}"),
+            }
+            let text = serde_json::Value::Object(map).to_string();
+            parts.headers.remove(header::CONTENT_LENGTH);
+            Response::from_parts(parts, Body::from(text))
+        }
+        _ => Response::from_parts(parts, Body::from(bytes)),
+    }
 }
 
 /// Add `"network"` to a JSON object reply (`/audit`), when the mint has one.
@@ -877,7 +922,22 @@ pub fn router_full(
     limits: Limits,
     rot: Option<SharedRotating>,
 ) -> Router {
+    router_audited(state, health, melts, limits, rot, None)
+}
+
+/// [`router_full`] with the path of `settlements.json`: `/audit` then also
+/// reports the payments held open and the payments forfeited (see
+/// `add_reconciliation`).
+pub fn router_audited(
+    state: Arc<AppState>,
+    health: Arc<Health>,
+    melts: SharedMelts,
+    limits: Limits,
+    rot: Option<SharedRotating>,
+    records: Option<PathBuf>,
+) -> Router {
     let audit_network = health.network().map(str::to_string);
+    let audit_records = records.map(Arc::new);
     let health_routes = Router::new()
         .route("/health", get(health_handler))
         .with_state((Arc::clone(&state), health));
@@ -890,6 +950,10 @@ pub fn router_full(
             .route(
                 "/audit",
                 get(audit_handler)
+                    .layer(middleware::from_fn_with_state(
+                        audit_records.clone(),
+                        add_reconciliation,
+                    ))
                     .layer(middleware::from_fn_with_state(audit_network, add_network)),
             )
             .with_state((Arc::clone(&state), rot))
@@ -899,7 +963,12 @@ pub fn router_full(
     Router::new()
         .route(
             "/audit",
-            get(api::audit).layer(middleware::from_fn_with_state(audit_network, add_network)),
+            get(api::audit)
+                .layer(middleware::from_fn_with_state(
+                    audit_records,
+                    add_reconciliation,
+                ))
+                .layer(middleware::from_fn_with_state(audit_network, add_network)),
         )
         .with_state(state)
         .merge(melt_routes)

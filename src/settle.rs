@@ -6,8 +6,10 @@ use mint_core::MintLogic;
 use mint_types::{Amount, BlindNonce, MintOutput, MintOutputError, MintOutputOutcome};
 
 use crate::payload::{self, DID_LEN, DecodeError};
-use crate::records::{Record, Records, RecordsError, Status};
+use crate::records::{Delivery, Record, Records, RecordsError, Status};
 use crate::scan::Received;
+use sp_wire::air_request::delivery::{Held, Outcome, Refused, Signed, SignedOutput, purchase_id};
+use sp_wire::psp::KeysetsResponse;
 
 /// A payment is priced when it is first seen with this many confirmations.
 pub const LOCK_CONFIRMATIONS: u32 = 1;
@@ -37,6 +39,11 @@ pub const PRICE_TOLERANCE_BPS: u128 = 100;
 ///   notes are signed and the mint keeps the remainder. If not, nothing is signed
 ///   and the payment is recorded as paid but unsettled.
 pub const PAYMENT_RECONCILIATION_TARGET_BPS: u128 = 1000;
+/// How long a credit, a held payment or a rejected purchase stays open (7 days,
+/// in seconds). In that time the payer can settle it (that exchange is not built
+/// yet); when it closes unsettled the mint forfeits the payment: it keeps the BTC
+/// and owes nothing. The operator sets it in days (`settle.reconciliation_window_days`).
+pub const RECONCILIATION_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
 
 /// The settlement rules a running mint uses. The defaults are the constants
 /// above; the operator sets them in `psp-mint.toml` (see `config`).
@@ -53,6 +60,9 @@ pub struct Terms {
     /// `settle.payment_reconciliation_target`, in basis points (1000 is 10%).
     /// See [`PAYMENT_RECONCILIATION_TARGET_BPS`].
     pub reconciliation_target_bps: u128,
+    /// `settle.reconciliation_window_days`, in seconds. See
+    /// [`RECONCILIATION_WINDOW_SECS`].
+    pub reconciliation_window_secs: u64,
 }
 
 impl Default for Terms {
@@ -62,6 +72,7 @@ impl Default for Terms {
             min_confirmations: MIN_CONFIRMATIONS,
             price_tolerance_bps: PRICE_TOLERANCE_BPS,
             reconciliation_target_bps: PAYMENT_RECONCILIATION_TARGET_BPS,
+            reconciliation_window_secs: RECONCILIATION_WINDOW_SECS,
         }
     }
 }
@@ -133,9 +144,11 @@ pub struct Issue {
 
 /// A payment that was short by more than the reconciliation target allows. Nothing
 /// was signed and the BTC is held. The record is kept under the payment's txid
-/// with the payer's DID. The AIR half (asking that DID for a new request that
-/// matches what was paid, checking it against this record, signing it, and marking
-/// the payment settled) is not built; until it is, the payment waits.
+/// with the payer's DID, and the payer is told over AIR (a `Held` delivery). The
+/// AIR half that would settle it (asking that DID for a new request that matches
+/// what was paid, checking it against this record, signing it, and marking the
+/// payment settled) is not built; until it is, the payment waits out its
+/// reconciliation window and is then forfeited.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Unsettled {
     pub payer_did: [u8; DID_LEN],
@@ -354,19 +367,108 @@ pub fn check(
     Ok(requested)
 }
 
+/// What a payment was worth at the locked price, in whole USD cents (rounded down).
+pub fn paid_cents(value_sats: u64, price_cents: u64) -> u64 {
+    let cents = u128::from(value_sats) * u128::from(price_cents) / SAT_CENTS_PER_CENT;
+    u64::try_from(cents).unwrap_or(u64::MAX)
+}
+
+fn now() -> u64 {
+    crate::server::now_secs()
+}
+
+/// What a payer is told when a purchase is rejected. The record's own `reason`
+/// stays the `Debug` text of the [`Rejection`].
+fn rejection_text(why: &Rejection) -> String {
+    match why {
+        Rejection::NoDataOutput => "the transaction has no single data output".to_string(),
+        Rejection::BadPayload(e) => format!("the payload could not be read: {e:?}"),
+        Rejection::UnknownDenomination(amount) => {
+            format!("no key for a note of {} units", amount.units)
+        }
+        Rejection::DuplicateBlindNonce => "the request uses the same blind nonce twice".to_string(),
+        Rejection::BlindNonceAlreadyUsed => {
+            "a blind nonce in the request was already signed".to_string()
+        }
+        Rejection::Overflow => "the total of the request is too large".to_string(),
+    }
+}
+
+/// The delivery of a rejection whose payload could be read, so it names a reply
+/// DID. `payload` is the unsealed payload, which identifies the purchase. The
+/// purchase stays open for the reconciliation window, like a held payment: the
+/// payer keeps it (and its reply key) and is told what was paid.
+fn refusal(
+    payload: &[u8],
+    did: &[u8; DID_LEN],
+    why: &Rejection,
+    value_sats: u64,
+    price_cents: u64,
+    terms: &Terms,
+) -> Delivery {
+    Delivery {
+        reply_did: hex::encode(did),
+        purchase: hex::encode(purchase_id(payload)),
+        outcome: Outcome::Refused(Refused {
+            reason: rejection_text(why),
+            paid_sats: value_sats,
+            paid_cents: paid_cents(value_sats, price_cents),
+            open_until: now().saturating_add(terms.reconciliation_window_secs),
+        }),
+        sealed: None,
+        delivered: false,
+        abandoned: None,
+    }
+}
+
+/// The PSP's live keysets as the keysets call gives them, from the mint
+/// (current) and, when it rotates, the previous one. Kept with a delivery so the
+/// payer can unblind from the record alone, whatever the keysets are by the time
+/// it reads it.
+fn keysets_of(current: &MintLogic, previous: Option<(&str, &MintLogic)>) -> KeysetsResponse {
+    let units = |keys: &std::collections::BTreeMap<Amount, secp256k1::PublicKey>| -> std::collections::BTreeMap<u64, secp256k1::PublicKey> {
+        keys.iter()
+            .map(|(amount, key)| (amount.units, *key))
+            .collect()
+    };
+    let current_id = crate::rotation::keyset_id(current.public_keys());
+    let mut keysets: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<u64, secp256k1::PublicKey>,
+    > = std::collections::BTreeMap::new();
+    keysets.insert(current_id.clone(), units(current.public_keys()));
+    if let Some((id, logic)) = previous {
+        keysets.insert(id.to_string(), units(logic.public_keys()));
+    }
+    KeysetsResponse {
+        current: current_id,
+        previous: previous.map(|(id, _)| id.to_string()),
+        keysets,
+    }
+}
+
 fn reject(
     records: &mut Records,
     txid: &str,
     mut record: Record,
     why: Rejection,
     over_under_bps: Option<i64>,
-    skipped_units: u64,
+    value_sats: u64,
+    delivery: Option<Delivery>,
 ) -> Result<Settlement, SettleError> {
     record.status = Status::Rejected;
     record.issued = false;
     record.over_under_bps = over_under_bps;
-    record.skipped_units = skipped_units;
+    record.skipped_units = 0;
+    record.value_sats = value_sats;
     record.reason = Some(format!("{why:?}"));
+    // A rejection whose payer can be told stays open, like a held payment; one
+    // with no readable payload has nobody to tell, and the payer takes the loss.
+    record.open_until = delivery.as_ref().and_then(|d| d.outcome.open_until());
+    if let Some(d) = &delivery {
+        record.payer_did = Some(d.reply_did.clone());
+    }
+    record.delivery = delivery;
     records.put(txid, record)?;
     Ok(Settlement::Rejected(why))
 }
@@ -449,11 +551,29 @@ pub fn settle_with_previous(
     }
 
     let Some(bytes) = &received.payload else {
-        return reject(records, txid, record, Rejection::NoDataOutput, None, 0);
+        return reject(
+            records,
+            txid,
+            record,
+            Rejection::NoDataOutput,
+            None,
+            received.value_sats,
+            None,
+        );
     };
     let payload = match payload::decode(bytes) {
         Ok(payload) => payload,
-        Err(e) => return reject(records, txid, record, Rejection::BadPayload(e), None, 0),
+        Err(e) => {
+            return reject(
+                records,
+                txid,
+                record,
+                Rejection::BadPayload(e),
+                None,
+                received.value_sats,
+                None,
+            );
+        }
     };
     let (issuer, issuer_keyset) = match (payload.keyset.as_deref(), previous) {
         (Some(named), Some((id, prev))) if named == id => (prev, id.to_string()),
@@ -462,7 +582,25 @@ pub fn settle_with_previous(
     let keys = issuer.public_keys();
     let requested = match check(|amount| keys.contains_key(&amount), &payload.outputs) {
         Ok(requested) => requested,
-        Err(why) => return reject(records, txid, record, why, None, 0),
+        Err(why) => {
+            let delivery = refusal(
+                bytes,
+                &payload.did,
+                &why,
+                received.value_sats,
+                price_cents,
+                terms,
+            );
+            return reject(
+                records,
+                txid,
+                record,
+                why,
+                None,
+                received.value_sats,
+                Some(delivery),
+            );
+        }
     };
     let assessment = assess_with(received.value_sats, price_cents, requested, terms);
     for output in &payload.outputs {
@@ -470,13 +608,22 @@ pub fn settle_with_previous(
             .is_blind_nonce_used(&output.blind_nonce)
             .map_err(|e| SettleError::Mint(e.to_string()))?;
         if used {
+            let delivery = refusal(
+                bytes,
+                &payload.did,
+                &Rejection::BlindNonceAlreadyUsed,
+                received.value_sats,
+                price_cents,
+                terms,
+            );
             return reject(
                 records,
                 txid,
                 record,
                 Rejection::BlindNonceAlreadyUsed,
                 Some(assessment.over_under_bps),
-                0,
+                received.value_sats,
+                Some(delivery),
             );
         }
     }
@@ -487,6 +634,10 @@ pub fn settle_with_previous(
         // Short beyond the target and no drop gets within it. Sign nothing, keep
         // the BTC, and record the payment under the payer's DID. This record is
         // the whole of the mint's side today; see `Unsettled`.
+        let until = now().saturating_add(terms.reconciliation_window_secs);
+        let reason = "the payment is short of the request by more than the PSP absorbs, and no \
+                      smaller request fits what was paid"
+            .to_string();
         let mut held = record;
         held.status = Status::PaidUnsettled;
         held.issued = false;
@@ -498,9 +649,28 @@ pub fn settle_with_previous(
              smaller request gets within it"
                 .to_string(),
         );
-        held.payer_did = Some(payer_did_hex);
+        held.payer_did = Some(payer_did_hex.clone());
         held.requested_units = requested;
         held.value_sats = received.value_sats;
+        held.open_until = Some(until);
+        // Tell the payer, so the wallet knows the payment is held and what was
+        // paid. Nothing is signed, so there is no crash window: this is the one
+        // write.
+        held.delivery = Some(Delivery {
+            reply_did: payer_did_hex,
+            purchase: hex::encode(purchase_id(bytes)),
+            outcome: Outcome::Held(Held {
+                reason,
+                paid_sats: received.value_sats,
+                paid_cents: paid_cents(received.value_sats, price_cents),
+                requested_units: requested,
+                over_under_bps: assessment.over_under_bps,
+                open_until: until,
+            }),
+            sealed: None,
+            delivered: false,
+            abandoned: None,
+        });
         records.put(txid, held)?;
         return Ok(Settlement::PaidUnsettled(Unsettled {
             payer_did: payload.did,
@@ -521,7 +691,12 @@ pub fn settle_with_previous(
     settled.payer_did = Some(payer_did_hex);
     settled.requested_units = requested;
     settled.value_sats = received.value_sats;
-    records.put(txid, settled)?;
+    // A credit is owed for the reconciliation window; after it the mint keeps
+    // the overpayment. Set in the first write, so it holds whatever happens next.
+    let open_until = (assessment.credit_cents > 0)
+        .then(|| now().saturating_add(terms.reconciliation_window_secs));
+    settled.open_until = open_until;
+    records.put(txid, settled.clone())?;
 
     // The set that signs is the one the payload names if it is live, else the
     // current one. PSP uses MintLogic::issue, not issue_with_key. Every PSP note of a given
@@ -529,16 +704,50 @@ pub fn settle_with_previous(
     // issue looks that key up by amount. issue_with_key is for mints whose key
     // depends on more than the amount, such as the ESP, where it also depends
     // on the note's terms. See the docs on MintLogic::issue in mint-core.
-    let results = plan
+    let results: Vec<Result<MintOutputOutcome, MintOutputError>> = plan
         .sign
         .iter()
         .map(|&i| issuer.issue(&payload.outputs[i]))
         .collect();
-    let blind_nonces = plan
+    let blind_nonces: Vec<BlindNonce> = plan
         .sign
         .iter()
         .map(|&i| payload.outputs[i].blind_nonce)
         .collect();
+    // Keep what the payer is owed in the record, so that delivering it survives a
+    // restart and an AIR server that is down. The purchase is issued by now, so a
+    // failure to write this is reported and does not undo it: the signatures are
+    // still in `describe`'s log.
+    let signatures: Vec<SignedOutput> = blind_nonces
+        .iter()
+        .zip(&results)
+        .filter_map(|(blind_nonce, result)| {
+            result.as_ref().ok().map(|signature| SignedOutput {
+                blind_nonce: blind_nonce.0.to_string(),
+                signature: signature.0.to_string(),
+            })
+        })
+        .collect();
+    settled.delivery = Some(Delivery {
+        reply_did: hex::encode(payload.did),
+        purchase: hex::encode(purchase_id(bytes)),
+        outcome: Outcome::Signed(Signed {
+            keyset: issuer_keyset.clone(),
+            signatures,
+            keysets: keysets_of(logic, previous),
+            skipped_units: plan.skipped_units,
+            credit_cents: assessment.credit_cents,
+            open_until: open_until.unwrap_or(0),
+        }),
+        sealed: None,
+        delivered: false,
+        abandoned: None,
+    });
+    if let Err(e) = records.put(txid, settled) {
+        eprintln!(
+            "{txid}: issued, but what the payer is owed could not be stored ({e}); the signatures are in the log only"
+        );
+    }
     Ok(Settlement::Issued(Issue {
         keyset: issuer_keyset,
         results,
@@ -1500,6 +1709,261 @@ mod tests {
         assert_eq!(rec.over_under_bps, Some(6666));
         assert!(!logic.is_blind_nonce_used(&point(3)).unwrap());
         assert_eq!(total(&logic), Amount::from_units(5));
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_issued_purchase_keeps_what_the_payer_is_owed_in_its_record() {
+        let (logic, mut records, dir) = fixture("delivery-issued");
+        let mut price = Price::at(BTC_10K);
+        let r = received("aa", 6, 5_000, Some(PAYLOAD_HEX));
+        let issue = issued(run(&logic, &mut records, &r, &mut price));
+        let reopened = Records::open(&dir.join("settlements.json")).unwrap();
+        let d = reopened.get("aa").unwrap().delivery.clone().unwrap();
+        assert!(!d.delivered);
+        assert_eq!(d.sealed, None);
+        assert_eq!(d.reply_did, DID_HEX);
+        assert_eq!(
+            d.purchase,
+            hex::encode(purchase_id(&hex::decode(PAYLOAD_HEX).unwrap()))
+        );
+        let Outcome::Signed(signed) = &d.outcome else {
+            panic!(
+                "an issued purchase delivers its signatures: {:?}",
+                d.outcome
+            );
+        };
+        assert_eq!(signed.keyset, issue.keyset);
+        assert_eq!(signed.signatures.len(), 2);
+        for ((nonce, result), pair) in issue
+            .blind_nonces
+            .iter()
+            .zip(&issue.results)
+            .zip(&signed.signatures)
+        {
+            assert_eq!(pair.blind_nonce, nonce.0.to_string());
+            assert_eq!(pair.signature, result.as_ref().unwrap().0.to_string());
+        }
+        assert_eq!(signed.keysets.current, issue.keyset);
+        assert_eq!(signed.keysets.previous, None);
+        assert!(signed.keysets.keysets.contains_key(&issue.keyset));
+        assert_eq!((signed.skipped_units, signed.credit_cents), (0, 0));
+        // a settled purchase is not looked at again, and keeps its delivery
+        assert_eq!(
+            run(&logic, &mut records, &r, &mut price),
+            Settlement::AlreadySettled(Status::Issued)
+        );
+        assert_eq!(records.get("aa").unwrap().delivery.as_ref(), Some(&d));
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_delivery_names_both_live_keysets_when_the_mint_rotates() {
+        let (current, mut records, _d1) = fixture("delivery-cur");
+        let (previous, _r2, _d2) = fixture("delivery-prev");
+        let (cur_id, prev_id) = (
+            crate::rotation::keyset_id(current.public_keys()),
+            crate::rotation::keyset_id(previous.public_keys()),
+        );
+        let r = received("aa", 6, 5_000, Some(PAYLOAD_HEX));
+        let mut price = Price::at(BTC_10K);
+        settle_with_previous(
+            &current,
+            Some((&prev_id, &previous)),
+            &mut records,
+            &r,
+            &mut || price.ask(),
+            &Terms::default(),
+        )
+        .unwrap();
+        let d = records.get("aa").unwrap().delivery.clone().unwrap();
+        let Outcome::Signed(signed) = d.outcome else {
+            panic!("signed");
+        };
+        assert_eq!(signed.keysets.current, cur_id);
+        assert_eq!(signed.keysets.previous.as_deref(), Some(prev_id.as_str()));
+        assert_eq!(signed.keysets.keysets.len(), 2);
+    }
+
+    #[test]
+    fn a_partial_fill_and_a_credit_say_so_in_the_delivery() {
+        let (logic, mut records, dir) = fixture("delivery-fill");
+        let mut price = Price::at(BTC_10K);
+        // 4,300 sats buys 4 of the 5 units asked: the 1 is dropped
+        let short = received("aa", 6, 4_300, Some(&payload_bytes(&[(4, 1), (1, 2)])));
+        let issue = issued(run(&logic, &mut records, &short, &mut price));
+        let Some(Delivery {
+            outcome: Outcome::Signed(signed),
+            ..
+        }) = records.get("aa").unwrap().delivery.clone()
+        else {
+            panic!("a delivery");
+        };
+        assert_eq!(signed.skipped_units, 1);
+        assert_eq!(signed.signatures.len(), issue.results.len());
+        assert_eq!(signed.signatures.len(), 1);
+        assert_eq!(signed.credit_cents, 0);
+
+        // 6,000 sats is 20% over: signed in full, and $0.10 is owed back
+        let over = received("bb", 6, 6_000, Some(&payload_bytes(&[(4, 3), (1, 4)])));
+        issued(run(&logic, &mut records, &over, &mut price));
+        let Some(Delivery {
+            outcome: Outcome::Signed(signed),
+            ..
+        }) = records.get("bb").unwrap().delivery.clone()
+        else {
+            panic!("a delivery");
+        };
+        assert_eq!((signed.skipped_units, signed.credit_cents), (0, 10));
+        assert_eq!(signed.signatures.len(), 2);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rejection_with_a_readable_payload_keeps_a_refusal_and_one_without_keeps_none() {
+        let (logic, mut records, dir) = fixture("delivery-refused");
+        let mut price = Price::at(BTC_10K);
+        let first = received("aa", 6, 5_000, Some(&payload_bytes(&[(4, 1), (1, 2)])));
+        issued(run(&logic, &mut records, &first, &mut price));
+
+        // a blind nonce already signed
+        let reused_hex = payload_bytes(&[(2, 3), (1, 2)]);
+        let reused = received("bb", 6, 5_000, Some(&reused_hex));
+        run(&logic, &mut records, &reused, &mut price);
+        let d = records.get("bb").unwrap().delivery.clone().unwrap();
+        assert_eq!(d.reply_did, hex::encode([7u8; 33]));
+        assert_eq!(
+            d.purchase,
+            hex::encode(purchase_id(&hex::decode(&reused_hex).unwrap()))
+        );
+        let Outcome::Refused(refused) = &d.outcome else {
+            panic!("a refusal: {:?}", d.outcome);
+        };
+        assert_eq!(
+            refused.reason,
+            rejection_text(&Rejection::BlindNonceAlreadyUsed)
+        );
+        // it says what was paid: 5,000 sats at $10,000 per BTC is $0.50
+        assert_eq!((refused.paid_sats, refused.paid_cents), (5_000, 50));
+        // and the purchase stays open for the reconciliation window
+        let until = records.get("bb").unwrap().open_until.expect("open");
+        assert_eq!(refused.open_until, until);
+        assert_window(until, RECONCILIATION_WINDOW_SECS);
+        assert_eq!(records.get("bb").unwrap().value_sats, 5_000);
+        assert!(!d.delivered);
+
+        // a denomination the mint has no key for
+        let unknown = received("cc", 6, 5_000, Some(&payload_bytes(&[(2048, 4)])));
+        run(&logic, &mut records, &unknown, &mut price);
+        let Some(Delivery {
+            outcome: Outcome::Refused(refused),
+            ..
+        }) = records.get("cc").unwrap().delivery.clone()
+        else {
+            panic!("a refusal");
+        };
+        assert!(refused.reason.contains("2048"), "{}", refused.reason);
+        assert!(refused.open_until > 0);
+
+        // nothing readable: no reply DID, so nothing can be addressed
+        for (txid, payload) in [("dd", None), ("ee", Some("00"))] {
+            let bad = received(txid, 6, 5_000, payload);
+            run(&logic, &mut records, &bad, &mut price);
+            let rec = records.get(txid).unwrap();
+            assert_eq!(rec.status, Status::Rejected);
+            assert_eq!(rec.delivery, None, "{txid}");
+            // nobody to tell, so no window: the payer takes the loss
+            assert_eq!(rec.open_until, None, "{txid}");
+            assert_eq!(rec.value_sats, 5_000, "{txid}");
+        }
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `until` is `window` seconds from about now.
+    fn assert_window(until: u64, window: u64) {
+        let now = crate::server::now_secs();
+        assert!(
+            until + 30 >= now + window && until <= now + window + 30,
+            "window closes at {until}, expected about {}",
+            now + window
+        );
+    }
+
+    #[test]
+    fn a_held_payment_delivers_a_held_record_with_what_was_paid() {
+        let (logic, mut records, dir) = fixture("delivery-held");
+        let mut price = Price::at(BTC_10K);
+        // far short: 1,000 sats is $0.10 against the $0.50 asked, so nothing is signed
+        let r = received("aa", 6, 1_000, Some(PAYLOAD_HEX));
+        assert!(matches!(
+            run(&logic, &mut records, &r, &mut price),
+            Settlement::PaidUnsettled(_)
+        ));
+        let rec = records.get("aa").unwrap();
+        let d = rec
+            .delivery
+            .clone()
+            .expect("a held payment tells the payer");
+        assert_eq!(d.reply_did, DID_HEX);
+        assert_eq!(
+            d.purchase,
+            hex::encode(purchase_id(&hex::decode(PAYLOAD_HEX).unwrap()))
+        );
+        let Outcome::Held(held) = &d.outcome else {
+            panic!("a held record: {:?}", d.outcome);
+        };
+        assert_eq!((held.paid_sats, held.paid_cents), (1_000, 10));
+        assert_eq!(held.requested_units, 5);
+        assert_eq!(Some(held.over_under_bps), rec.over_under_bps);
+        assert!(held.over_under_bps < 0);
+        assert_eq!(rec.open_until, Some(held.open_until));
+        assert_window(held.open_until, RECONCILIATION_WINDOW_SECS);
+        assert_eq!(rec.status, Status::PaidUnsettled);
+        assert_eq!(rec.forfeited_at, None);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_reconciliation_window_comes_from_the_terms_and_only_open_payments_have_one() {
+        let (logic, mut records, dir) = fixture("window");
+        let terms = Terms {
+            reconciliation_window_secs: 3_600,
+            ..Terms::default()
+        };
+        let mut price = Price::at(BTC_10K);
+        let mut go = |records: &mut Records, txid: &str, sats: u64, payload: &str| {
+            let r = received(txid, 6, sats, Some(payload));
+            settle_with(&logic, records, &r, &mut || price.ask(), &terms).unwrap()
+        };
+        // exact: closed, no window, and the signed record says nothing is owed
+        go(&mut records, "aa", 5_000, PAYLOAD_HEX);
+        let exact = records.get("aa").unwrap();
+        assert_eq!(exact.open_until, None);
+        let Outcome::Signed(signed) = &exact.delivery.as_ref().unwrap().outcome else {
+            panic!("signed");
+        };
+        assert_eq!((signed.credit_cents, signed.open_until), (0, 0));
+        // 20% over: signed in full, and the credit is open for the window
+        go(&mut records, "bb", 6_000, &payload_bytes(&[(4, 3), (1, 4)]));
+        let over = records.get("bb").unwrap();
+        let until = over.open_until.expect("a credit is open");
+        assert_window(until, 3_600);
+        assert_eq!(over.status, Status::Issued);
+        let Outcome::Signed(signed) = &over.delivery.as_ref().unwrap().outcome else {
+            panic!("signed");
+        };
+        assert_eq!((signed.credit_cents, signed.open_until), (10, until));
+        // short by a little: signed in part, the mint keeps the remainder, closed
+        go(&mut records, "cc", 4_300, &payload_bytes(&[(4, 5), (1, 6)]));
+        assert_eq!(records.get("cc").unwrap().open_until, None);
+        // held, with the same window
+        go(&mut records, "dd", 1_000, &payload_bytes(&[(4, 7), (1, 8)]));
+        assert_window(records.get("dd").unwrap().open_until.unwrap(), 3_600);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }

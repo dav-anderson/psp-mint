@@ -230,6 +230,13 @@ pub const SPECS: &[Spec] = &[
         what: "For a payment outside settle.price_tolerance, which is genuinely wrong: how far it may miss the requested amount before the mint stops absorbing the difference and reconciles it. Over by no more than this: the mint keeps the excess; over by more: the excess is recorded as credit for the payer's DID. Short: the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid, those notes are signed and the mint keeps the remainder; otherwise nothing is signed and the payment is held as paid but unsettled. Tighter is fairer to payers but sends more payments to credit or reconciliation; looser settles more automatically but keeps or forgoes more value. See the README.",
     },
     Spec {
+        key: "settle.reconciliation_window_days",
+        env: "PSP_RECONCILIATION_WINDOW_DAYS",
+        default: "7",
+        units: "days",
+        what: "How long a credit, a held payment (paid but unsettled) or a rejected purchase stays open, counted from when the mint settles the payment. The payer is told over AIR, and the window is in the record. When it closes with the payment still open, the mint forfeits it: it keeps the BTC, owes no credit, and /audit shows it apart. The payer's wallet deletes the purchase's key at the same time. Nothing settles an open payment yet, so today every one is forfeited when its window closes. 1 to 365.",
+    },
+    Spec {
         key: "mint.max_denomination_units",
         env: "PSP_MAX_DENOMINATION_UNITS",
         default: "16777216",
@@ -283,7 +290,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_AIR_TIMEOUT_SECS",
         default: "10",
         units: "seconds",
-        what: "How long the AIR server may take to answer one Create or Read before the listener counts the try as failed (a reply is tried three times).",
+        what: "How long the AIR server may take to answer one Create or Read before the listener counts the try as failed (a reply is tried three times), and how long a connection may take when the mint writes a delivery record.",
     },
 ];
 
@@ -312,6 +319,8 @@ pub struct Config {
     pub price_tolerance_bps: u64,
     /// `settle.payment_reconciliation_target` in basis points (1000 is 0.10).
     pub payment_reconciliation_target_bps: u64,
+    /// `settle.reconciliation_window_days`.
+    pub reconciliation_window_days: u64,
     pub max_denomination_units: u64,
     pub rotation_activation_hours: u64,
     pub rotation_period_hours: u64,
@@ -360,6 +369,7 @@ impl Config {
             min_confirmations: settle::MIN_CONFIRMATIONS,
             price_tolerance_bps: settle::PRICE_TOLERANCE_BPS as u64,
             payment_reconciliation_target_bps: settle::PAYMENT_RECONCILIATION_TARGET_BPS as u64,
+            reconciliation_window_days: settle::RECONCILIATION_WINDOW_SECS / 86_400,
             max_denomination_units: DEFAULT_MAX_DENOMINATION_UNITS,
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
@@ -458,6 +468,7 @@ impl Config {
             "settle.payment_reconciliation_target" => {
                 bps_to_fraction(self.payment_reconciliation_target_bps)
             }
+            "settle.reconciliation_window_days" => self.reconciliation_window_days.to_string(),
             "mint.max_denomination_units" => self.max_denomination_units.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
@@ -504,6 +515,9 @@ impl Config {
             }
             "settle.underpay_tolerance_bps" | "settle.credit_threshold_bps" => {
                 return Err(format!("{key} {RETIRED_TOLERANCES}"));
+            }
+            "settle.reconciliation_window_days" => {
+                self.reconciliation_window_days = whole(key, value)?
             }
             "mint.max_denomination_units" => self.max_denomination_units = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
@@ -623,6 +637,13 @@ impl Config {
             u64::from(self.lock_confirmations.max(1)),
             1000,
             "confirmations; at least settle.lock_confirmations, so the price is locked first",
+        );
+        range(
+            "settle.reconciliation_window_days",
+            self.reconciliation_window_days,
+            1,
+            365,
+            "days",
         );
         range(
             "mint.max_denomination_units",
@@ -763,6 +784,7 @@ impl Config {
             min_confirmations: self.min_confirmations,
             price_tolerance_bps: u128::from(self.price_tolerance_bps),
             reconciliation_target_bps: u128::from(self.payment_reconciliation_target_bps),
+            reconciliation_window_secs: self.reconciliation_window_days.saturating_mul(86_400),
         }
     }
 
@@ -1553,6 +1575,7 @@ mod tests {
                 min_confirmations: 10,
                 price_tolerance_bps: 100,
                 reconciliation_target_bps: 2500,
+                reconciliation_window_secs: 7 * 86_400,
             }
         );
         assert_eq!(c.price().timeout_secs, 4);
@@ -1865,6 +1888,50 @@ mod network_tests {
         )
         .unwrap_err();
         assert!(e.iter().any(|p| p.contains("retired")), "{e:?}");
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_reconciliation_window_is_seven_days_by_default_and_set_in_days() {
+        let mut c = Config::defaults("/h");
+        assert_eq!(c.reconciliation_window_days, 7);
+        assert_eq!(c.get("settle.reconciliation_window_days").unwrap(), "7");
+        assert_eq!(c.terms().reconciliation_window_secs, 7 * 86_400);
+        c.set("settle.reconciliation_window_days", "30").unwrap();
+        assert_eq!(c.terms().reconciliation_window_secs, 30 * 86_400);
+        assert!(c.validate().is_ok());
+        // a decimal or a sign is not a number of days
+        assert!(c.set("settle.reconciliation_window_days", "1.5").is_err());
+        assert!(c.set("settle.reconciliation_window_days", "-1").is_err());
+        for bad in ["0", "366"] {
+            c.set("settle.reconciliation_window_days", bad).unwrap();
+            let problems = c.validate().unwrap_err();
+            assert!(
+                problems
+                    .iter()
+                    .any(|p| p.starts_with("settle.reconciliation_window_days")),
+                "{bad}: {problems:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_reconciliation_window_can_come_from_the_file_and_the_environment() {
+        let d = dir("window");
+        fs::write(
+            d.join(FILE_NAME),
+            "[settle]\nreconciliation_window_days = 3\n",
+        )
+        .unwrap();
+        let loaded = load_with(&d, &env_of(&[("HOME", "/h")]), None).unwrap();
+        assert_eq!(loaded.config.reconciliation_window_days, 3);
+        let loaded = load_with(
+            &d,
+            &env_of(&[("HOME", "/h"), ("PSP_RECONCILIATION_WINDOW_DAYS", "14")]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(loaded.config.reconciliation_window_days, 14);
         fs::remove_dir_all(&d).unwrap();
     }
 }
