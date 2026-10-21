@@ -29,6 +29,7 @@ use std::thread::{self, JoinHandle};
 
 use mint_server::state::AppState;
 use psp_mint::air_listener::{self, Serve, Settings};
+use psp_mint::records::SharedRecords;
 use psp_mint::server::{self, Health, Limits, SharedRotating};
 use serde_json::Value;
 use sp_wire::ServiceDid;
@@ -37,8 +38,8 @@ use sp_wire::air_request::addr;
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::{
-    KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_SPEND, KIND_ROLLOVER,
-    KIND_ROTATION, STATUS_UNAVAILABLE, VerifyError, local_server,
+    KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_RECONCILE, KIND_PSP_SPEND,
+    KIND_ROLLOVER, KIND_ROTATION, STATUS_UNAVAILABLE, VerifyError, local_server,
 };
 use sp_wire::seal::SecretKey as DidKey;
 
@@ -123,6 +124,9 @@ impl Drop for Listener {
 pub struct Air {
     pub did: ServiceDid,
     cfg: AskConfig,
+    /// The same, with a short wait and one attempt, for a request that is not
+    /// meant to be answered (`ask_unanswered`).
+    quick: AskConfig,
     /// Dropped before `server`, so the listener has stopped when the turn ends.
     _listener: Listener,
     pub server: Server,
@@ -136,6 +140,7 @@ fn kind_of(route: &str) -> u8 {
         "/rotation" => KIND_ROTATION,
         "/rollover" => KIND_ROLLOVER,
         "/spend" => KIND_PSP_SPEND,
+        "/reconcile" => KIND_PSP_RECONCILE,
         "/check-state" => KIND_CHECK_STATE,
         "/health" => KIND_MINT_INFO,
         other => panic!("{other} is not a call the PSP mint answers over AIR"),
@@ -159,6 +164,26 @@ impl Air {
     /// under a new mint key and a slot counter of its own. The turn is held until
     /// this drops.
     pub fn start(state: &Arc<AppState>, rot: &SharedRotating, limits: Limits) -> Air {
+        Air::start_with(state, rot, None, limits)
+    }
+
+    /// As [`Air::start`], and the listener also settles reconciliation requests
+    /// (kind 15) against `records`, as `psp-mint serve` does.
+    pub fn start_with_records(
+        state: &Arc<AppState>,
+        rot: &SharedRotating,
+        records: &SharedRecords,
+        limits: Limits,
+    ) -> Air {
+        Air::start_with(state, rot, Some(Arc::clone(records)), limits)
+    }
+
+    fn start_with(
+        state: &Arc<AppState>,
+        rot: &SharedRotating,
+        records: Option<SharedRecords>,
+        limits: Limits,
+    ) -> Air {
         let server = server();
         let key = DidKey::new();
         let did = addr::key_to_did(&key.public_key());
@@ -166,22 +191,25 @@ impl Air {
         let rot = Arc::clone(rot);
         let health = Health::new(100);
         let serve: Arc<Serve> = Arc::new(move |kind: u8, body: &[u8]| {
-            server::air_served(&state, &rot, &health, &limits, kind, body)
+            server::air_served_with(&state, &rot, records.as_ref(), &health, &limits, kind, body)
         });
         let listener = start_serving(&server, &key, scratch(), serve);
-        let cfg = AskConfig {
+        let config = |reply_wait_secs, attempts| AskConfig {
             server: server.server.clone(),
             mint: did.clone(),
             wire_version: WIRE_VERSION,
             network: "regtest".to_string(),
-            reply_wait_secs: 30,
-            attempts: 3,
+            reply_wait_secs,
+            attempts,
             max_skew_secs: 300,
             timeout_secs: 10,
         };
+        let cfg = config(30, 3);
+        let quick = config(3, 1);
         Air {
             did,
             cfg,
+            quick,
             _listener: listener,
             server,
         }
@@ -189,11 +217,21 @@ impl Air {
 
     /// Send one request of `kind` with `body` and return the verified reply.
     pub fn ask(&self, kind: u8, body: &[u8]) -> Result<Verified, AskError> {
+        self.ask_with(&self.cfg, kind, body)
+    }
+
+    /// A request the mint is not meant to answer (a refused reconciliation):
+    /// waits a few seconds for a reply once and returns what the asker meets, an
+    /// error. A reply, if there were one, would be returned as `Ok`.
+    pub fn ask_unanswered(&self, kind: u8, body: &[u8]) -> Result<Verified, AskError> {
+        self.ask_with(&self.quick, kind, body)
+    }
+
+    fn ask_with(&self, cfg: &AskConfig, kind: u8, body: &[u8]) -> Result<Verified, AskError> {
         async fn go(cfg: &AskConfig, flight: &mut InFlight) -> Result<Verified, AskError> {
             let client = client::connect(&cfg.server).await?;
             ask(&client, cfg, flight, &mut |_| Ok(())).await
         }
-        let cfg = &self.cfg;
         let body = body.to_vec();
         block_on_new_runtime(move || async move {
             let mut flight = InFlight::with_body(kind, body);

@@ -8,7 +8,11 @@ use mint_types::{Amount, BlindNonce, MintOutput, MintOutputError, MintOutputOutc
 use crate::payload::{self, DID_LEN, DecodeError};
 use crate::records::{Delivery, Record, Records, RecordsError, Status};
 use crate::scan::Received;
-use sp_wire::air_request::delivery::{Held, Outcome, Refused, Signed, SignedOutput, purchase_id};
+use sp_wire::air_request::KIND_PSP_RECONCILE;
+use sp_wire::air_request::delivery::{
+    FORFEIT_NOTICE, Held, Outcome, ReconcileRules, Refused, SEND_CORRECTED_REQUEST,
+    SEND_CREDIT_CLAIM, Signed, SignedOutput, purchase_id,
+};
 use sp_wire::psp::KeysetsResponse;
 
 /// A payment is priced when it is first seen with this many confirmations.
@@ -40,9 +44,10 @@ pub const PRICE_TOLERANCE_BPS: u128 = 100;
 ///   and the payment is recorded as paid but unsettled.
 pub const PAYMENT_RECONCILIATION_TARGET_BPS: u128 = 1000;
 /// How long a credit, a held payment or a rejected purchase stays open (14 days,
-/// in seconds). In that time the payer can settle it (that exchange is not built
-/// yet); when it closes unsettled the mint forfeits the payment: it keeps the BTC
-/// and owes nothing. The operator sets it in days (`settle.reconciliation_window_days`).
+/// in seconds). In that time the payer can settle it with a reconciliation over
+/// AIR (kind 15, [`crate::reconcile`]); when it closes unsettled the mint forfeits
+/// the payment: it keeps the BTC and owes nothing. The operator sets it in days
+/// (`settle.reconciliation_window_days`).
 pub const RECONCILIATION_WINDOW_SECS: u64 = 14 * 24 * 60 * 60;
 
 /// The settlement rules a running mint uses. The defaults are the constants
@@ -77,6 +82,140 @@ impl Default for Terms {
     }
 }
 
+/// `reconciliation.max_attempts` by default: the requests refused for their
+/// content that are counted against a payment. The second exists only for the
+/// keyset-rotation race.
+pub const DEFAULT_MAX_ATTEMPTS: u32 = 2;
+/// `reconciliation.round_up_from` by default, in cents: a credit's remainder of
+/// 9 cents or more rounds up to the next whole PSP unit.
+pub const DEFAULT_ROUND_UP_FROM_CENTS: u64 = 9;
+
+/// The fees and limits of reconciliation (`reconciliation.*` and
+/// `delivery.read_fee`), in PSP units unless it says otherwise. Every one is an
+/// operator setting, and fees are 0 by default. They are fixed for a payment when
+/// its window opens (see [`corrected_rules`] and [`credit_rules`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileTerms {
+    /// `reconciliation.fee`: taken from what a reconciliation issues.
+    pub fee_units: u64,
+    /// `reconciliation.max_attempts`: how many refused requests are counted.
+    pub max_attempts: u32,
+    /// `reconciliation.write_fee`: the cost of one kind 15 write, prepaid by the
+    /// SPI for the wallet and taken from what is issued, once.
+    pub write_fee_units: u64,
+    /// `reconciliation.round_up_from`, in cents (1 to 10).
+    pub round_up_from_cents: u64,
+    /// `delivery.read_fee`: the read cost the PSP prepays for each record a payer
+    /// must read, the first delivery and the follow-up.
+    pub read_fee_units: u64,
+}
+
+impl Default for ReconcileTerms {
+    fn default() -> Self {
+        ReconcileTerms {
+            fee_units: 0,
+            max_attempts: DEFAULT_MAX_ATTEMPTS,
+            write_fee_units: 0,
+            round_up_from_cents: DEFAULT_ROUND_UP_FROM_CENTS,
+            read_fee_units: 0,
+        }
+    }
+}
+
+/// Everything settlement is run under: the [`Terms`] and the [`ReconcileTerms`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Policy {
+    pub terms: Terms,
+    pub fees: ReconcileTerms,
+}
+
+/// A credit in whole PSP units, and the cents rounding left over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreditUnits {
+    pub units: u64,
+    /// The remainder the PSP keeps (rounded down).
+    pub kept_cents: u64,
+    /// The cents the PSP gives away (rounded up).
+    pub given_cents: u64,
+}
+
+/// Round a credit in cents to whole PSP units (10 cents each). With
+/// `whole = credit_cents / 10` and `rest = credit_cents % 10`: when `rest` is
+/// above 0 and at least `round_up_from_cents`, the credit rounds up to `whole + 1`
+/// units and the PSP gives away `10 - rest` cents; otherwise it rounds down to
+/// `whole` and the PSP keeps `rest`. At the default of 9, X.9 and above rounds up,
+/// so the PSP gives away at most 1 cent and keeps at most 8; 10 never rounds up.
+pub fn credit_units(credit_cents: u64, round_up_from_cents: u64) -> CreditUnits {
+    let (whole, rest) = (credit_cents / 10, credit_cents % 10);
+    if rest > 0 && rest >= round_up_from_cents {
+        CreditUnits {
+            units: whole + 1,
+            kept_cents: 0,
+            given_cents: 10 - rest,
+        }
+    } else {
+        CreditUnits {
+            units: whole,
+            kept_cents: rest,
+            given_cents: 0,
+        }
+    }
+}
+
+fn rules(send: &str, due_units: u64, open_until: u64, fees: &ReconcileTerms) -> ReconcileRules {
+    ReconcileRules {
+        send: send.to_string(),
+        kind: KIND_PSP_RECONCILE,
+        due_units,
+        reconciliation_fee_units: fees.fee_units,
+        // The first record and the follow-up.
+        read_prepaid_units: fees.read_fee_units.saturating_mul(2),
+        write_prepaid_units: fees.write_fee_units,
+        open_until,
+        max_attempts: fees.max_attempts,
+        on_failure: FORFEIT_NOTICE.to_string(),
+    }
+}
+
+/// The rules of a held payment or a rejected purchase: what one corrected request
+/// must carry. `due_units` is what the payment buys at the locked price, less the
+/// first record's read cost, the fee, the one prepaid write and the follow-up's
+/// read cost, floored at 0.
+pub fn corrected_rules(
+    value_sats: u64,
+    price_cents: u64,
+    open_until: u64,
+    fees: &ReconcileTerms,
+) -> ReconcileRules {
+    let due = allowed_units(value_sats, price_cents)
+        .saturating_sub(fees.read_fee_units)
+        .saturating_sub(fees.fee_units)
+        .saturating_sub(fees.write_fee_units)
+        .saturating_sub(fees.read_fee_units);
+    rules(SEND_CORRECTED_REQUEST, due, open_until, fees)
+}
+
+/// The rules of a credit claim. `units` is the credit in whole PSP units
+/// ([`credit_units`]); the first record's read cost already came off the payment
+/// before it was assessed, so only the fee, the prepaid write and the follow-up's
+/// read cost come off here. Floored at 0.
+pub fn credit_rules(units: u64, open_until: u64, fees: &ReconcileTerms) -> ReconcileRules {
+    let due = units
+        .saturating_sub(fees.fee_units)
+        .saturating_sub(fees.write_fee_units)
+        .saturating_sub(fees.read_fee_units);
+    rules(SEND_CREDIT_CLAIM, due, open_until, fees)
+}
+
+/// The sats that pay for `units` PSP units at the locked price, rounded up.
+fn sats_for_units(units: u64, price_cents: u64) -> u64 {
+    if units == 0 || price_cents == 0 {
+        return 0;
+    }
+    let sat_cents = u128::from(units) * SAT_CENTS_PER_UNIT;
+    u64::try_from(sat_cents.div_ceil(u128::from(price_cents))).unwrap_or(u64::MAX)
+}
+
 // A PSP unit is ten US cents: 10 PSP = 1 USD, paid in BTC. With the price in
 // USD cents per BTC, sats * price is worth that many (sat-cents):
 //   1 cent = 10^8 sat-cents (100,000,000 sats per BTC)
@@ -93,12 +232,20 @@ pub enum Rejection {
     DuplicateBlindNonce,
     BlindNonceAlreadyUsed,
     Overflow,
+    /// The payload was already used by another payment (one payload, two bitcoin
+    /// payments). The payload is one-time use; this payment is kept and audited
+    /// apart, and is never reconcilable.
+    DuplicatePayment,
 }
 
 #[derive(Debug)]
 pub enum SettleError {
     Records(RecordsError),
     Mint(String),
+    /// A thread panicked while holding the settlement records. Fatal, like a
+    /// poisoned mint lock: the pass fails, and `serve` exits for a supervisor to
+    /// restart it (see `service::lock_records`).
+    RecordsPoisoned,
 }
 
 impl fmt::Display for SettleError {
@@ -106,6 +253,7 @@ impl fmt::Display for SettleError {
         match self {
             SettleError::Records(e) => write!(f, "{e}"),
             SettleError::Mint(e) => write!(f, "mint store: {e}"),
+            SettleError::RecordsPoisoned => write!(f, "the settlement records lock is poisoned"),
         }
     }
 }
@@ -144,10 +292,10 @@ pub struct Issue {
 
 /// A payment that was short by more than the reconciliation target allows. Nothing
 /// was signed and the BTC is held. The record is kept under the payment's txid
-/// with the payer's DID, and the payer is told over AIR (a `Held` delivery). The
-/// AIR half that would settle it (asking that DID for a new request that matches
-/// what was paid, checking it against this record, signing it, and marking the
-/// payment settled) is not built; until it is, the payment waits out its
+/// with the payer's DID, and the payer is told over AIR (a `Held` delivery that
+/// carries the rules). The payer settles it with a corrected request over AIR
+/// (kind 15, [`crate::reconcile`]), which is checked against this record and the
+/// rules fixed when the window opened; if none arrives the payment waits out its
 /// reconciliation window and is then forfeited.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Unsettled {
@@ -391,6 +539,9 @@ fn rejection_text(why: &Rejection) -> String {
             "a blind nonce in the request was already signed".to_string()
         }
         Rejection::Overflow => "the total of the request is too large".to_string(),
+        Rejection::DuplicatePayment => {
+            "the payload was already used by another payment; a payload is one-time use".to_string()
+        }
     }
 }
 
@@ -404,8 +555,9 @@ fn refusal(
     why: &Rejection,
     value_sats: u64,
     price_cents: u64,
-    terms: &Terms,
+    policy: &Policy,
 ) -> Delivery {
+    let open_until = now().saturating_add(policy.terms.reconciliation_window_secs);
     Delivery {
         reply_did: hex::encode(did),
         purchase: hex::encode(purchase_id(payload)),
@@ -413,7 +565,13 @@ fn refusal(
             reason: rejection_text(why),
             paid_sats: value_sats,
             paid_cents: paid_cents(value_sats, price_cents),
-            open_until: now().saturating_add(terms.reconciliation_window_secs),
+            open_until,
+            rules: Some(corrected_rules(
+                value_sats,
+                price_cents,
+                open_until,
+                &policy.fees,
+            )),
         }),
         sealed: None,
         delivered: false,
@@ -447,24 +605,61 @@ fn keysets_of(current: &MintLogic, previous: Option<(&str, &MintLogic)>) -> Keys
     }
 }
 
+/// What a rejection records.
+struct Rejected {
+    why: Rejection,
+    over_under_bps: Option<i64>,
+    value_sats: u64,
+    /// The record owed to the payer, when the payload could be read and the
+    /// payment is not a duplicate.
+    delivery: Option<Delivery>,
+    /// The first record's read cost, prepaid; recorded when there is a delivery.
+    read_units: u64,
+    /// The txid of the first payment of the same payload, for a duplicate.
+    duplicate_of: Option<String>,
+}
+
+impl Rejected {
+    /// A rejection nobody can be told about: no readable payload, no delivery.
+    fn unreadable(why: Rejection, value_sats: u64) -> Self {
+        Rejected {
+            why,
+            over_under_bps: None,
+            value_sats,
+            delivery: None,
+            read_units: 0,
+            duplicate_of: None,
+        }
+    }
+}
+
 fn reject(
     records: &mut Records,
     txid: &str,
     mut record: Record,
-    why: Rejection,
-    over_under_bps: Option<i64>,
-    value_sats: u64,
-    delivery: Option<Delivery>,
+    rejected: Rejected,
 ) -> Result<Settlement, SettleError> {
+    let Rejected {
+        why,
+        over_under_bps,
+        value_sats,
+        delivery,
+        read_units,
+        duplicate_of,
+    } = rejected;
     record.status = Status::Rejected;
     record.issued = false;
     record.over_under_bps = over_under_bps;
     record.skipped_units = 0;
     record.value_sats = value_sats;
     record.reason = Some(format!("{why:?}"));
+    record.duplicate_of = duplicate_of;
     // A rejection whose payer can be told stays open, like a held payment; one
     // with no readable payload has nobody to tell, and the payer takes the loss.
+    // A duplicate has no delivery, so no window.
     record.open_until = delivery.as_ref().and_then(|d| d.outcome.open_until());
+    record.rules = delivery.as_ref().and_then(|d| d.outcome.rules().cloned());
+    record.read_prepaid_units = if delivery.is_some() { read_units } else { 0 };
     if let Some(d) = &delivery {
         record.payer_did = Some(d.reply_did.clone());
     }
@@ -515,6 +710,27 @@ pub fn settle_with_previous(
     price: &mut dyn FnMut() -> Result<u64, String>,
     terms: &Terms,
 ) -> Result<Settlement, SettleError> {
+    let policy = Policy {
+        terms: *terms,
+        fees: ReconcileTerms::default(),
+    };
+    settle_ruled(logic, previous, records, received, price, &policy)
+}
+
+/// `settle_with_previous` under the settlement terms and the reconciliation fees.
+/// A payment whose payload was already used by another is rejected as a duplicate
+/// (no delivery, no window). The first delivery's read cost comes off the paid
+/// value before it is assessed. The delivery of a purchase that opens a window
+/// carries the rules, fixed here.
+pub fn settle_ruled(
+    logic: &MintLogic,
+    previous: Option<(&str, &MintLogic)>,
+    records: &mut Records,
+    received: &Received,
+    price: &mut dyn FnMut() -> Result<u64, String>,
+    policy: &Policy,
+) -> Result<Settlement, SettleError> {
+    let (terms, fees) = (&policy.terms, &policy.fees);
     let txid = received.txid.as_str();
     if let Some(existing) = records.get(txid) {
         if existing.status != Status::Locked {
@@ -555,10 +771,7 @@ pub fn settle_with_previous(
             records,
             txid,
             record,
-            Rejection::NoDataOutput,
-            None,
-            received.value_sats,
-            None,
+            Rejected::unreadable(Rejection::NoDataOutput, received.value_sats),
         );
     };
     let payload = match payload::decode(bytes) {
@@ -568,13 +781,31 @@ pub fn settle_with_previous(
                 records,
                 txid,
                 record,
-                Rejection::BadPayload(e),
-                None,
-                received.value_sats,
-                None,
+                Rejected::unreadable(Rejection::BadPayload(e), received.value_sats),
             );
         }
     };
+    // The payload is one-time use. A second payment that carries it buys nothing:
+    // it is kept and audited apart, with no delivery (the cell is the first
+    // payment's) and no window.
+    let payer_did_hex = hex::encode(payload.did);
+    if let Some(first) =
+        records.first_of_purchase(&payer_did_hex, &hex::encode(purchase_id(bytes)), txid)
+    {
+        return reject(
+            records,
+            txid,
+            record,
+            Rejected {
+                why: Rejection::DuplicatePayment,
+                over_under_bps: None,
+                value_sats: received.value_sats,
+                delivery: None,
+                read_units: 0,
+                duplicate_of: Some(first),
+            },
+        );
+    }
     let (issuer, issuer_keyset) = match (payload.keyset.as_deref(), previous) {
         (Some(named), Some((id, prev))) if named == id => (prev, id.to_string()),
         _ => (logic, crate::rotation::keyset_id(logic.public_keys())),
@@ -589,20 +820,29 @@ pub fn settle_with_previous(
                 &why,
                 received.value_sats,
                 price_cents,
-                terms,
+                policy,
             );
             return reject(
                 records,
                 txid,
                 record,
-                why,
-                None,
-                received.value_sats,
-                Some(delivery),
+                Rejected {
+                    why,
+                    over_under_bps: None,
+                    value_sats: received.value_sats,
+                    delivery: Some(delivery),
+                    read_units: fees.read_fee_units,
+                    duplicate_of: None,
+                },
             );
         }
     };
-    let assessment = assess_with(received.value_sats, price_cents, requested, terms);
+    // The first delivery's read is prepaid by the PSP: its cost comes off what was
+    // paid before the payment is assessed. With the default fee of 0 nothing changes.
+    let assessed_sats = received
+        .value_sats
+        .saturating_sub(sats_for_units(fees.read_fee_units, price_cents));
+    let assessment = assess_with(assessed_sats, price_cents, requested, terms);
     for output in &payload.outputs {
         let used = issuer
             .is_blind_nonce_used(&output.blind_nonce)
@@ -614,21 +854,24 @@ pub fn settle_with_previous(
                 &Rejection::BlindNonceAlreadyUsed,
                 received.value_sats,
                 price_cents,
-                terms,
+                policy,
             );
             return reject(
                 records,
                 txid,
                 record,
-                Rejection::BlindNonceAlreadyUsed,
-                Some(assessment.over_under_bps),
-                received.value_sats,
-                Some(delivery),
+                Rejected {
+                    why: Rejection::BlindNonceAlreadyUsed,
+                    over_under_bps: Some(assessment.over_under_bps),
+                    value_sats: received.value_sats,
+                    delivery: Some(delivery),
+                    read_units: fees.read_fee_units,
+                    duplicate_of: None,
+                },
             );
         }
     }
     let plan = plan(&payload.outputs, &assessment, terms);
-    let payer_did_hex = hex::encode(payload.did);
 
     if plan.unsettled {
         // Short beyond the target and no drop gets within it. Sign nothing, keep
@@ -653,6 +896,9 @@ pub fn settle_with_previous(
         held.requested_units = requested;
         held.value_sats = received.value_sats;
         held.open_until = Some(until);
+        let held_rules = corrected_rules(received.value_sats, price_cents, until, fees);
+        held.rules = Some(held_rules.clone());
+        held.read_prepaid_units = fees.read_fee_units;
         // Tell the payer, so the wallet knows the payment is held and what was
         // paid. Nothing is signed, so there is no crash window: this is the one
         // write.
@@ -666,6 +912,7 @@ pub fn settle_with_previous(
                 requested_units: requested,
                 over_under_bps: assessment.over_under_bps,
                 open_until: until,
+                rules: Some(held_rules),
             }),
             sealed: None,
             delivered: false,
@@ -696,6 +943,15 @@ pub fn settle_with_previous(
     let open_until = (assessment.credit_cents > 0)
         .then(|| now().saturating_add(terms.reconciliation_window_secs));
     settled.open_until = open_until;
+    // The rules of a claim are fixed here too, with the window: the credit in
+    // whole PSP units, the fees and the cap in force now.
+    let credit = credit_units(assessment.credit_cents, fees.round_up_from_cents);
+    settled.rules = open_until.map(|until| credit_rules(credit.units, until, fees));
+    if open_until.is_some() {
+        settled.kept_cents = credit.kept_cents;
+        settled.given_cents = credit.given_cents;
+    }
+    settled.read_prepaid_units = fees.read_fee_units;
     records.put(txid, settled.clone())?;
 
     // The set that signs is the one the payload names if it is live, else the
@@ -738,6 +994,7 @@ pub fn settle_with_previous(
             skipped_units: plan.skipped_units,
             credit_cents: assessment.credit_cents,
             open_until: open_until.unwrap_or(0),
+            rules: settled.rules.clone(),
         }),
         sealed: None,
         delivered: false,
@@ -1657,7 +1914,7 @@ mod tests {
     }
 
     #[test]
-    fn a_request_cannot_be_claimed_twice() {
+    fn a_request_cannot_be_claimed_twice_by_a_duplicate_payment() {
         let (logic, mut records, dir) = fixture("claim-twice");
         let mut price = Price::at(BTC_10K);
         // payment aa signs the 4 and drops the 1
@@ -1669,14 +1926,21 @@ mod tests {
             run(&logic, &mut records, &first, &mut price),
             Settlement::AlreadySettled(Status::Issued)
         );
-        // a second payment carrying the same request cannot claim the output
-        // that was already signed, whatever it pays
+        // a second payment carrying the same payload is a duplicate payment,
+        // whatever it pays: it signs nothing, has no delivery and no window. (A
+        // different payload that reuses a signed blind nonce is the case of
+        // `a_reused_blind_nonce_rejects_the_whole_payment_and_is_recorded`.)
         let second = received("bb", 6, 9_000, Some(PAYLOAD_HEX));
         assert_eq!(
             run(&logic, &mut records, &second, &mut price),
-            Settlement::Rejected(Rejection::BlindNonceAlreadyUsed)
+            Settlement::Rejected(Rejection::DuplicatePayment)
         );
         assert_eq!(total(&logic), Amount::from_units(4));
+        let dup = records.get("bb").unwrap();
+        assert_eq!(dup.status, Status::Rejected);
+        assert_eq!(dup.duplicate_of.as_deref(), Some("aa"));
+        assert!(dup.delivery.is_none());
+        assert_eq!(dup.open_until, None);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2146,6 +2410,342 @@ mod tests {
         assert_eq!(issue.credit_cents, 7);
         assert!(!issue.within_tolerance);
         assert_eq!(records.get("bb").unwrap().credit_cents, 7);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- the rules of a reconciliation, fixed when the window opens ----
+
+    /// The default policy with these fees.
+    fn with_fees(f: impl FnOnce(&mut ReconcileTerms)) -> Policy {
+        let mut policy = Policy::default();
+        f(&mut policy.fees);
+        policy
+    }
+
+    fn ruled(
+        logic: &MintLogic,
+        records: &mut Records,
+        r: &Received,
+        price: &mut Price,
+        policy: &Policy,
+    ) -> Settlement {
+        settle_ruled(logic, None, records, r, &mut || price.ask(), policy).unwrap()
+    }
+
+    #[test]
+    fn a_credit_rounds_to_whole_units_by_round_up_from() {
+        // 250 cents: 25 units, nothing left
+        assert_eq!(
+            credit_units(250, 9),
+            CreditUnits {
+                units: 25,
+                kept_cents: 0,
+                given_cents: 0
+            }
+        );
+        // 255: the 5 cents are kept; 258: the 8 are kept; 259: 1 cent is given
+        assert_eq!(credit_units(255, 9).kept_cents, 5);
+        assert_eq!(credit_units(255, 9).units, 25);
+        assert_eq!(credit_units(258, 9).kept_cents, 8);
+        assert_eq!(credit_units(258, 9).units, 25);
+        assert_eq!(
+            credit_units(259, 9),
+            CreditUnits {
+                units: 26,
+                kept_cents: 0,
+                given_cents: 1
+            }
+        );
+        // 10 never rounds up; 1 rounds up from 0.1 (but a rest of 0 is not a rest)
+        assert_eq!(credit_units(259, 10).units, 25);
+        assert_eq!(credit_units(259, 10).kept_cents, 9);
+        assert_eq!(credit_units(251, 1).units, 26);
+        assert_eq!(credit_units(251, 1).given_cents, 9);
+        assert_eq!(credit_units(250, 1).units, 25);
+        assert_eq!(credit_units(255, 5).units, 26);
+        assert_eq!(credit_units(255, 5).given_cents, 5);
+        // less than a unit
+        assert_eq!(credit_units(5, 9).units, 0);
+        assert_eq!(credit_units(5, 9).kept_cents, 5);
+    }
+
+    #[test]
+    fn the_rules_take_every_fee_off_what_is_due_and_floor_at_zero() {
+        let fees = ReconcileTerms {
+            fee_units: 1,
+            write_fee_units: 2,
+            read_fee_units: 3,
+            ..ReconcileTerms::default()
+        };
+        // 20 units paid: less the first read (3), the fee (1), the write (2) and
+        // the follow-up's read (3)
+        let held = corrected_rules(20_000, BTC_10K, 777, &fees);
+        assert_eq!(held.send, SEND_CORRECTED_REQUEST);
+        assert_eq!(held.kind, KIND_PSP_RECONCILE);
+        assert_eq!(held.due_units, 20 - 3 - 1 - 2 - 3);
+        assert_eq!(held.reconciliation_fee_units, 1);
+        assert_eq!(held.read_prepaid_units, 6);
+        assert_eq!(held.write_prepaid_units, 2);
+        assert_eq!(held.open_until, 777);
+        assert_eq!(held.max_attempts, DEFAULT_MAX_ATTEMPTS);
+        assert_eq!(held.on_failure, FORFEIT_NOTICE);
+        // the first read already came off the payment of a credit
+        let credit = credit_rules(10, 777, &fees);
+        assert_eq!(credit.send, SEND_CREDIT_CLAIM);
+        assert_eq!(credit.due_units, 10 - 1 - 2 - 3);
+        // fees beyond what there is leave nothing due, never a wrapped number
+        assert_eq!(corrected_rules(5_000, BTC_10K, 1, &fees).due_units, 0);
+        assert_eq!(credit_rules(2, 1, &fees).due_units, 0);
+        // with no fees the whole is due
+        let plain = ReconcileTerms::default();
+        assert_eq!(corrected_rules(20_000, BTC_10K, 1, &plain).due_units, 20);
+        assert_eq!(credit_rules(7, 1, &plain).due_units, 7);
+        assert_eq!(plain.max_attempts, 2);
+        assert_eq!(plain.round_up_from_cents, 9);
+    }
+
+    #[test]
+    fn a_held_payment_stores_the_rules_in_force_and_tells_the_payer_the_same() {
+        let (logic, mut records, dir) = fixture("rules-held");
+        let mut price = Price::at(BTC_10K);
+        let payload = payload_bytes(&[(64, 1), (1, 2)]);
+        // 30,000 sats buys 30 units of the 65 asked: held
+        let r = received("aa", 6, 30_000, Some(&payload));
+        assert!(matches!(
+            ruled(&logic, &mut records, &r, &mut price, &Policy::default()),
+            Settlement::PaidUnsettled(_)
+        ));
+        let rec = records.get("aa").unwrap();
+        let rules = rec.rules.clone().expect("a held payment has rules");
+        assert_eq!(rules.send, SEND_CORRECTED_REQUEST);
+        assert_eq!(rules.due_units, 30);
+        assert_eq!(rules.open_until, rec.open_until.unwrap());
+        assert_eq!(rules.max_attempts, 2);
+        assert_eq!(rec.read_prepaid_units, 0);
+        let Outcome::Held(held) = &rec.delivery.as_ref().unwrap().outcome else {
+            panic!("held");
+        };
+        assert_eq!(held.rules.as_ref(), Some(&rules));
+
+        // the same payment under fees: one unit of each, so 31 units paid less
+        // 1 (first read) 1 (fee) 1 (write) 1 (follow-up read)
+        let policy = with_fees(|f| {
+            f.fee_units = 1;
+            f.write_fee_units = 1;
+            f.read_fee_units = 1;
+            f.max_attempts = 3;
+        });
+        let r = received("bb", 6, 31_000, Some(&payload_bytes(&[(64, 3), (1, 4)])));
+        assert!(matches!(
+            ruled(&logic, &mut records, &r, &mut price, &policy),
+            Settlement::PaidUnsettled(_)
+        ));
+        let rec = records.get("bb").unwrap();
+        let rules = rec.rules.clone().unwrap();
+        assert_eq!(rules.due_units, 27);
+        assert_eq!(rules.reconciliation_fee_units, 1);
+        assert_eq!(rules.read_prepaid_units, 2);
+        assert_eq!(rules.write_prepaid_units, 1);
+        assert_eq!(rules.max_attempts, 3);
+        assert_eq!(rec.read_prepaid_units, 1);
+        // the earlier payment's rules are untouched by the later policy
+        assert_eq!(
+            records.get("aa").unwrap().rules.as_ref().unwrap().due_units,
+            30
+        );
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_rejected_purchase_with_a_readable_payload_opens_a_window_with_rules() {
+        let (logic, mut records, dir) = fixture("rules-refused");
+        let mut price = Price::at(BTC_10K);
+        // the same blind nonce twice: refused, with 8,000 sats (8 units) paid
+        let r = received("aa", 6, 8_000, Some(&payload_bytes(&[(2, 1), (1, 1)])));
+        assert_eq!(
+            ruled(&logic, &mut records, &r, &mut price, &Policy::default()),
+            Settlement::Rejected(Rejection::DuplicateBlindNonce)
+        );
+        let rec = records.get("aa").unwrap();
+        let rules = rec
+            .rules
+            .clone()
+            .expect("a refusal with a reply DID is open");
+        assert_eq!(
+            (rules.send.as_str(), rules.due_units),
+            (SEND_CORRECTED_REQUEST, 8)
+        );
+        let Outcome::Refused(refused) = &rec.delivery.as_ref().unwrap().outcome else {
+            panic!("refused");
+        };
+        assert_eq!(refused.rules.as_ref(), Some(&rules));
+        assert_eq!(refused.open_until, rules.open_until);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_credit_stores_its_claim_with_the_rounding_and_the_fees_in_force() {
+        let (logic, mut records, dir) = fixture("rules-credit");
+        let mut price = Price::at(BTC_10K);
+        // 5 units asked ($0.50); at $10,000 per BTC, S sats is S / 100 cents, so
+        // S = 7,500 is $0.75 and a credit of 25 cents
+        let cases = [
+            // (sats, round_up_from, credit, units, kept, given)
+            (7_000, 9, 20, 2, 0, 0),
+            (7_500, 9, 25, 2, 5, 0),
+            (7_800, 9, 28, 2, 8, 0),
+            (7_900, 9, 29, 3, 0, 1),
+            (7_900, 10, 29, 2, 9, 0),
+            (7_500, 5, 25, 3, 0, 5),
+        ];
+        for (i, &(sats, from, credit, units, kept, given)) in cases.iter().enumerate() {
+            let i = i as u8 * 2 + 1;
+            let policy = with_fees(|f| f.round_up_from_cents = from);
+            let txid = format!("tx{i}");
+            let r = received(&txid, 6, sats, Some(&payload_bytes(&[(4, i), (1, i + 1)])));
+            let issue = issued(ruled(&logic, &mut records, &r, &mut price, &policy));
+            assert_eq!(issue.credit_cents, credit, "{sats} sats");
+            let rec = records.get(&txid).unwrap();
+            let rules = rec.rules.clone().expect("a credit is claimable");
+            assert_eq!(rules.send, SEND_CREDIT_CLAIM);
+            assert_eq!(rules.due_units, units, "{sats} sats, round up from {from}");
+            assert_eq!(
+                (rec.kept_cents, rec.given_cents),
+                (kept, given),
+                "{sats}/{from}"
+            );
+            assert_eq!(rules.open_until, rec.open_until.unwrap());
+            let Outcome::Signed(signed) = &rec.delivery.as_ref().unwrap().outcome else {
+                panic!("signed");
+            };
+            assert_eq!(signed.rules.as_ref(), Some(&rules));
+        }
+        // a payment that is not owed a credit has no rules and no window
+        let r = received("exact", 6, 5_000, Some(&payload_bytes(&[(4, 31), (1, 32)])));
+        issued(ruled(
+            &logic,
+            &mut records,
+            &r,
+            &mut price,
+            &Policy::default(),
+        ));
+        let rec = records.get("exact").unwrap();
+        assert!(rec.rules.is_none() && rec.open_until.is_none());
+        let Outcome::Signed(signed) = &rec.delivery.as_ref().unwrap().outcome else {
+            panic!("signed");
+        };
+        assert!(signed.rules.is_none());
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_first_delivery_read_comes_off_what_was_paid_before_it_is_assessed() {
+        let (logic, mut records, dir) = fixture("read-fee");
+        let mut price = Price::at(BTC_10K);
+        let policy = with_fees(|f| f.read_fee_units = 1);
+        // 6,000 sats less the 1,000 the read costs is exactly the 5 units asked
+        let r = received("aa", 6, 6_000, Some(&payload_bytes(&[(4, 1), (1, 2)])));
+        let issue = issued(ruled(&logic, &mut records, &r, &mut price, &policy));
+        assert_eq!((issue.credit_cents, issue.over_under_bps), (0, 0));
+        let rec = records.get("aa").unwrap();
+        assert_eq!(rec.read_prepaid_units, 1);
+        assert!(rec.rules.is_none() && rec.open_until.is_none());
+        // 4,500 sats less the read is 3.5 units against the one note of 4 asked:
+        // held, with nothing to drop
+        let r = received("bb", 6, 4_500, Some(&payload_bytes(&[(4, 3)])));
+        assert!(matches!(
+            ruled(&logic, &mut records, &r, &mut price, &policy),
+            Settlement::PaidUnsettled(_)
+        ));
+        // 4 units paid, less the first read, the fee and the follow-up's read:
+        // 4 - 1 - 0 - 0 - 1 = 2
+        assert_eq!(
+            records.get("bb").unwrap().rules.as_ref().unwrap().due_units,
+            2
+        );
+        assert_eq!(records.get("bb").unwrap().read_prepaid_units, 1);
+        // with the fee at 0 an identical payment is not touched
+        let r = received("cc", 6, 5_000, Some(&payload_bytes(&[(4, 5), (1, 6)])));
+        issued(ruled(
+            &logic,
+            &mut records,
+            &r,
+            &mut price,
+            &Policy::default(),
+        ));
+        assert_eq!(records.get("cc").unwrap().read_prepaid_units, 0);
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_payment_of_the_same_payload_is_a_duplicate_with_no_window() {
+        let (logic, mut records, dir) = fixture("duplicate");
+        let mut price = Price::at(BTC_10K);
+        // the first is short and held, with a window and a delivery
+        let payload = payload_bytes(&[(64, 1), (1, 2)]);
+        let first = received("aa", 6, 30_000, Some(&payload));
+        assert!(matches!(
+            ruled(&logic, &mut records, &first, &mut price, &Policy::default()),
+            Settlement::PaidUnsettled(_)
+        ));
+        // the same payload paid again, in full: nothing is bought
+        let second = received("bb", 6, 65_000, Some(&payload));
+        assert_eq!(
+            ruled(
+                &logic,
+                &mut records,
+                &second,
+                &mut price,
+                &Policy::default()
+            ),
+            Settlement::Rejected(Rejection::DuplicatePayment)
+        );
+        let dup = records.get("bb").unwrap();
+        assert_eq!(dup.status, Status::Rejected);
+        assert_eq!(dup.duplicate_of.as_deref(), Some("aa"));
+        assert!(dup.delivery.is_none() && dup.rules.is_none() && dup.open_until.is_none());
+        assert_eq!(dup.value_sats, 65_000);
+        assert!(!dup.issued);
+        assert_eq!(total(&logic), Amount::ZERO);
+        // it never matches a reconciliation lookup: only the first does
+        let did_hex = "07".repeat(33);
+        let purchase = records
+            .get("aa")
+            .unwrap()
+            .delivery
+            .as_ref()
+            .unwrap()
+            .purchase
+            .clone();
+        assert_eq!(
+            records.matching(&did_hex, &purchase),
+            vec!["aa".to_string()]
+        );
+        // the first is untouched
+        assert_eq!(records.get("aa").unwrap().status, Status::PaidUnsettled);
+        // it is counted apart and is never forfeited
+        records.forfeit_expired(u64::MAX).unwrap();
+        let recon = records.reconciliation();
+        assert_eq!(recon.duplicates.payments, 1);
+        assert_eq!(recon.duplicates.sats, 65_000);
+        assert_eq!(recon.forfeited.payments, 1, "only the first payment");
+        assert_eq!(recon.forfeited.sats, 30_000);
+        // and a second settle of the duplicate does not look at it again
+        assert_eq!(
+            ruled(
+                &logic,
+                &mut records,
+                &second,
+                &mut price,
+                &Policy::default()
+            ),
+            Settlement::AlreadySettled(Status::Rejected)
+        );
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }

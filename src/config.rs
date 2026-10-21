@@ -81,6 +81,10 @@ pub struct Spec {
     pub what: &'static str,
 }
 
+/// The most a fee setting may be: 2^62 PSP units, far above anything real, so no sum
+/// of fees can overflow.
+pub const MAX_FEE_UNITS: u64 = 1 << 62;
+
 pub const SPECS: &[Spec] = &[
     Spec {
         key: "server.bind",
@@ -234,7 +238,42 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RECONCILIATION_WINDOW_DAYS",
         default: "14",
         units: "days",
-        what: "How long a credit, a held payment (paid but unsettled) or a rejected purchase stays open, counted from when the mint settles the payment. The payer is told over AIR, and the window is in the record. When it closes with the payment still open, the mint forfeits it: it keeps the BTC, owes no credit, and /audit shows it apart. The payer's wallet deletes the purchase's key at the same time. Nothing settles an open payment yet, so today every one is forfeited when its window closes. 1 to 365.",
+        what: "How long a credit, a held payment (paid but unsettled) or a rejected purchase stays open, counted from when the mint settles the payment. The payer is told over AIR, and the window is in the record. When it closes with the payment still open, the mint forfeits it: it keeps the BTC, owes no credit, and /audit shows it apart. The payer's wallet deletes the purchase's key at the same time. An open payment is settled by a reconciliation request over AIR (kind 15, see reconciliation.fee) before the window closes. 1 to 365.",
+    },
+    Spec {
+        key: "reconciliation.fee",
+        env: "PSP_RECONCILIATION_FEE",
+        default: "0",
+        units: "PSP units",
+        what: "The fee taken when a reconciliation settles an open payment (kind 15): a corrected request for a held or rejected payment, or the claim of a credit. It comes out of what the request may carry, so the request's outputs add up to the payment's value less this fee (and less reconciliation.write_fee and delivery.read_fee), and the PSP keeps the difference; /audit shows it apart as fees_units. It is fixed for a payment when its window opens, in the rules the first delivery carries, so a later change does not touch payments that are already open. 0 or more whole PSP units; 0 (the default) takes no fee.",
+    },
+    Spec {
+        key: "reconciliation.max_attempts",
+        env: "PSP_RECONCILIATION_MAX_ATTEMPTS",
+        default: "2",
+        units: "attempts",
+        what: "How many requests refused for their content a payment accepts before it ignores every further one and is left to be forfeited when its window closes. An attempt is a request signed by the right reply key, for an open payment, refused for its content, with a new hash; a bad signature, an unknown payment and an identical resend are not counted. A refused request gets no reply. The second attempt exists only for the rare keyset-rotation race, where the wallet built its notes on a keyset that left the live window. Fixed for a payment when its window opens. 1 to 1000; 2 by default.",
+    },
+    Spec {
+        key: "reconciliation.write_fee",
+        env: "PSP_RECONCILIATION_WRITE_FEE",
+        default: "0",
+        units: "PSP units",
+        what: "The cost of the one kind 15 write, which the SPI prepays on the wallet's behalf (bound to the open payment's reply key and capped by reconciliation.max_attempts). It is taken from what the request may carry, once per payment: the SPI absorbs the cost of a second attempt. /audit shows it as write_prepaid_units. Fixed for a payment when its window opens. 0 or more whole PSP units; 0 (the default) takes nothing. Only the amount is recorded today: the prepaid AIR write itself is not built (it waits on AIR).",
+    },
+    Spec {
+        key: "reconciliation.round_up_from",
+        env: "PSP_RECONCILIATION_ROUND_UP_FROM",
+        default: "9",
+        units: "cents, 1 to 10",
+        what: "The value is the cents remainder from which a credit rounds up to the next whole PSP unit: 1 means round up from 0.1, 9 (the default) from 0.9, and 10 never rounds up. A credit is in USD cents and a PSP unit is 10 cents, so a credit of 259 cents is 25 units and 9 cents over: at 9 it rounds up to 26 units and the SPI gives away 1 cent; at 10 it rounds down to 25 and the SPI keeps the 9 cents. At the default the SPI gives away at most 1 cent and keeps at most 8. /audit shows the cents kept and given away as rounding_kept_cents and rounding_given_cents. Fixed for a payment when its window opens.",
+    },
+    Spec {
+        key: "delivery.read_fee",
+        env: "PSP_DELIVERY_READ_FEE",
+        default: "0",
+        units: "PSP units",
+        what: "The read cost the PSP prepays for each record a payer must read: the first delivery record of a purchase, and the follow-up record, the answer to an accepted reconciliation request. The first one's cost comes off the bitcoin payment before it is assessed (the purchase buys that many units less); the follow-up's comes off what a reconciliation may carry. /audit shows it as read_prepaid_units. It is meant to be very small. Fixed for a payment when its window opens. 0 or more whole PSP units; 0 (the default) takes nothing. Only the amounts are recorded today: the prepaid AIR read itself is not built (it waits on AIR).",
     },
     Spec {
         key: "mint.max_denomination_units",
@@ -321,6 +360,16 @@ pub struct Config {
     pub payment_reconciliation_target_bps: u64,
     /// `settle.reconciliation_window_days`.
     pub reconciliation_window_days: u64,
+    /// `reconciliation.fee`, in PSP units.
+    pub reconciliation_fee: u64,
+    /// `reconciliation.max_attempts`.
+    pub reconciliation_max_attempts: u32,
+    /// `reconciliation.write_fee`, in PSP units.
+    pub reconciliation_write_fee: u64,
+    /// `reconciliation.round_up_from`, in cents.
+    pub reconciliation_round_up_from: u64,
+    /// `delivery.read_fee`, in PSP units.
+    pub delivery_read_fee: u64,
     pub max_denomination_units: u64,
     pub rotation_activation_hours: u64,
     pub rotation_period_hours: u64,
@@ -370,6 +419,11 @@ impl Config {
             price_tolerance_bps: settle::PRICE_TOLERANCE_BPS as u64,
             payment_reconciliation_target_bps: settle::PAYMENT_RECONCILIATION_TARGET_BPS as u64,
             reconciliation_window_days: settle::RECONCILIATION_WINDOW_SECS / 86_400,
+            reconciliation_fee: 0,
+            reconciliation_max_attempts: settle::DEFAULT_MAX_ATTEMPTS,
+            reconciliation_write_fee: 0,
+            reconciliation_round_up_from: settle::DEFAULT_ROUND_UP_FROM_CENTS,
+            delivery_read_fee: 0,
             max_denomination_units: DEFAULT_MAX_DENOMINATION_UNITS,
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
@@ -469,6 +523,11 @@ impl Config {
                 bps_to_fraction(self.payment_reconciliation_target_bps)
             }
             "settle.reconciliation_window_days" => self.reconciliation_window_days.to_string(),
+            "reconciliation.fee" => self.reconciliation_fee.to_string(),
+            "reconciliation.max_attempts" => self.reconciliation_max_attempts.to_string(),
+            "reconciliation.write_fee" => self.reconciliation_write_fee.to_string(),
+            "reconciliation.round_up_from" => self.reconciliation_round_up_from.to_string(),
+            "delivery.read_fee" => self.delivery_read_fee.to_string(),
             "mint.max_denomination_units" => self.max_denomination_units.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
@@ -519,6 +578,13 @@ impl Config {
             "settle.reconciliation_window_days" => {
                 self.reconciliation_window_days = whole(key, value)?
             }
+            "reconciliation.fee" => self.reconciliation_fee = whole(key, value)?,
+            "reconciliation.max_attempts" => self.reconciliation_max_attempts = whole(key, value)?,
+            "reconciliation.write_fee" => self.reconciliation_write_fee = whole(key, value)?,
+            "reconciliation.round_up_from" => {
+                self.reconciliation_round_up_from = whole(key, value)?
+            }
+            "delivery.read_fee" => self.delivery_read_fee = whole(key, value)?,
             "mint.max_denomination_units" => self.max_denomination_units = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
             "rotation.period_hours" => self.rotation_period_hours = whole(key, value)?,
@@ -644,6 +710,33 @@ impl Config {
             1,
             365,
             "days",
+        );
+        for (key, value) in [
+            ("reconciliation.fee", self.reconciliation_fee),
+            ("reconciliation.write_fee", self.reconciliation_write_fee),
+            ("delivery.read_fee", self.delivery_read_fee),
+        ] {
+            range(
+                key,
+                value,
+                0,
+                MAX_FEE_UNITS,
+                "whole PSP units; 0 takes no fee",
+            );
+        }
+        range(
+            "reconciliation.max_attempts",
+            u64::from(self.reconciliation_max_attempts),
+            1,
+            1000,
+            "attempts; at least one request must be allowed",
+        );
+        range(
+            "reconciliation.round_up_from",
+            self.reconciliation_round_up_from,
+            1,
+            10,
+            "cents; 10 never rounds up",
         );
         range(
             "mint.max_denomination_units",
@@ -775,6 +868,26 @@ impl Config {
             max_age_secs: self.price_max_age_secs,
             max_spread_bps: self.price_max_spread_bps,
             timeout_secs: self.price_timeout_secs,
+        }
+    }
+
+    /// The fees and limits of reconciliation (`reconciliation.*` and
+    /// `delivery.read_fee`).
+    pub fn fees(&self) -> settle::ReconcileTerms {
+        settle::ReconcileTerms {
+            fee_units: self.reconciliation_fee,
+            max_attempts: self.reconciliation_max_attempts,
+            write_fee_units: self.reconciliation_write_fee,
+            round_up_from_cents: self.reconciliation_round_up_from,
+            read_fee_units: self.delivery_read_fee,
+        }
+    }
+
+    /// The settlement rules and the reconciliation fees together.
+    pub fn policy(&self) -> settle::Policy {
+        settle::Policy {
+            terms: self.terms(),
+            fees: self.fees(),
         }
     }
 
@@ -1932,6 +2045,97 @@ mod network_tests {
         )
         .unwrap();
         assert_eq!(loaded.config.reconciliation_window_days, 21);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
+    #[test]
+    fn the_reconciliation_fees_and_limits_default_to_nothing_and_are_ranged() {
+        let mut c = Config::defaults("/h");
+        assert_eq!(c.get("reconciliation.fee").unwrap(), "0");
+        assert_eq!(c.get("reconciliation.max_attempts").unwrap(), "2");
+        assert_eq!(c.get("reconciliation.write_fee").unwrap(), "0");
+        assert_eq!(c.get("reconciliation.round_up_from").unwrap(), "9");
+        assert_eq!(c.get("delivery.read_fee").unwrap(), "0");
+        assert!(c.validate().is_ok());
+        let policy = c.policy();
+        assert_eq!(policy.fees, settle::ReconcileTerms::default());
+        assert_eq!(policy.terms, c.terms());
+
+        c.set("reconciliation.fee", "3").unwrap();
+        c.set("reconciliation.max_attempts", "5").unwrap();
+        c.set("reconciliation.write_fee", "2").unwrap();
+        c.set("reconciliation.round_up_from", "5").unwrap();
+        c.set("delivery.read_fee", "1").unwrap();
+        assert!(c.validate().is_ok());
+        let fees = c.policy().fees;
+        assert_eq!(
+            (
+                fees.fee_units,
+                fees.max_attempts,
+                fees.write_fee_units,
+                fees.round_up_from_cents,
+                fees.read_fee_units
+            ),
+            (3, 5, 2, 5, 1)
+        );
+
+        // out of range, or not a whole number
+        for (key, bad) in [
+            ("reconciliation.max_attempts", "0"),
+            ("reconciliation.max_attempts", "1001"),
+            ("reconciliation.round_up_from", "0"),
+            ("reconciliation.round_up_from", "11"),
+            ("reconciliation.fee", "4611686018427387905"),
+            ("delivery.read_fee", "4611686018427387905"),
+        ] {
+            let mut c = Config::defaults("/h");
+            c.set(key, bad).unwrap();
+            let problems = c.validate().unwrap_err();
+            assert!(
+                problems.iter().any(|p| p.starts_with(key)),
+                "{key}={bad}: {problems:?}"
+            );
+        }
+        for (key, bad) in [
+            ("reconciliation.fee", "1.5"),
+            ("reconciliation.write_fee", "-1"),
+            ("reconciliation.round_up_from", "0.9"),
+        ] {
+            assert!(c.set(key, bad).is_err(), "{key}={bad}");
+        }
+    }
+
+    #[test]
+    fn the_reconciliation_settings_come_from_the_file_and_the_environment() {
+        let d = dir("recon-settings");
+        fs::write(
+            d.join(FILE_NAME),
+            "[reconciliation]\nfee = 2\nmax_attempts = 3\nround_up_from = 10\n\n[delivery]\nread_fee = 1\n",
+        )
+        .unwrap();
+        let loaded = load_with(&d, &env_of(&[("HOME", "/h")]), None).unwrap();
+        let c = &loaded.config;
+        assert_eq!(
+            (
+                c.reconciliation_fee,
+                c.reconciliation_max_attempts,
+                c.reconciliation_round_up_from,
+                c.delivery_read_fee
+            ),
+            (2, 3, 10, 1)
+        );
+        let loaded = load_with(
+            &d,
+            &env_of(&[
+                ("HOME", "/h"),
+                ("PSP_RECONCILIATION_WRITE_FEE", "4"),
+                ("PSP_RECONCILIATION_FEE", "7"),
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(loaded.config.reconciliation_write_fee, 4);
+        assert_eq!(loaded.config.reconciliation_fee, 7, "the environment wins");
         fs::remove_dir_all(&d).unwrap();
     }
 }

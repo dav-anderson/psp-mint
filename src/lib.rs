@@ -6,6 +6,7 @@ pub mod mint;
 pub mod network;
 pub mod payload;
 pub mod price;
+pub mod reconcile;
 pub mod records;
 pub mod rotation;
 pub mod rpc;

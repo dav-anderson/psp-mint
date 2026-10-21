@@ -13,7 +13,7 @@ use psp_mint::delivery::Deliverer;
 use psp_mint::melts::MeltLog;
 use psp_mint::network::{self, Network};
 use psp_mint::price::Lazy;
-use psp_mint::records::Records;
+use psp_mint::records::{Records, SharedRecords};
 use psp_mint::rpc::Rpc;
 use psp_mint::settle::Settlement;
 use psp_mint::{rotation, scan, seal, server, service};
@@ -135,13 +135,20 @@ impl Settings {
     /// Write the records of every purchase that is owed one and has none stored.
     /// Never fails a scan: what could not be written is printed and tried again
     /// on the next pass.
-    fn deliver(&self, deliverer: &mut Option<Deliverer>, records: &mut Records, quiet: bool) {
+    fn deliver(&self, deliverer: &mut Option<Deliverer>, records: &Mutex<Records>, quiet: bool) {
         match deliverer {
             Some(deliverer) => {
-                deliverer.pass(records, Instant::now());
+                // The records are locked to plan and to apply, not while the
+                // records are written to the AIR server.
+                deliverer.pass_shared(records, Instant::now());
             }
             None => {
-                let waiting = records.undelivered().len();
+                let Ok(guard) = service::lock_records(records) else {
+                    eprintln!("delivery: the settlement records lock is poisoned; skipped");
+                    return;
+                };
+                let waiting = guard.undelivered().len();
+                drop(guard);
                 if waiting > 0 && !quiet {
                     println!(
                         "{waiting} purchase(s) are waiting for their signatures to be delivered over \
@@ -154,9 +161,14 @@ impl Settings {
 
     /// Forfeit every payment whose reconciliation window has closed with the
     /// payment still open: the mint keeps the BTC and owes nothing, and `/audit`
-    /// shows it apart. Never fails a scan.
-    fn forfeit(&self, records: &mut Records) {
-        match records.forfeit_expired(server::now_secs()) {
+    /// shows it apart. Never fails a scan. A poisoned records lock is logged and
+    /// skipped (the watcher exits the process).
+    fn forfeit(&self, records: &Mutex<Records>) {
+        let Ok(mut guard) = service::lock_records(records) else {
+            eprintln!("forfeit check skipped: the settlement records lock is poisoned");
+            return;
+        };
+        match guard.forfeit_expired(server::now_secs()) {
             Ok(gone) => {
                 for txid in gone {
                     println!(
@@ -185,7 +197,7 @@ impl Settings {
         &self,
         state: &AppState,
         rot: &server::SharedRotating,
-        records: &mut Records,
+        records: &Mutex<Records>,
         did: &SecretKey,
         quiet: bool,
     ) -> Result<(), Box<dyn Error>> {
@@ -197,12 +209,10 @@ impl Settings {
         )?;
         network::verify(&self.node()?, cfg.network)?;
         let checkpoint = scan::Checkpoint::load(&self.data_dir)?;
-        let since = scan::since(
-            &rpc,
-            checkpoint.as_ref(),
-            cfg.min_confirmations,
-            &records.unsettled(),
-        )?;
+        // The records are locked only to read what is unsettled, not while the
+        // wallet is scanned.
+        let unsettled = service::lock_records(records)?.unsettled();
+        let since = scan::since(&rpc, checkpoint.as_ref(), cfg.min_confirmations, &unsettled)?;
         let (found, ignored) = seal::open_payloads(did, since.received);
         if !quiet {
             if found.is_empty() && ignored == 0 {
@@ -224,9 +234,10 @@ impl Settings {
                 .refresh(&mut logic)?;
         }
         let price_config = cfg.price();
-        let terms = cfg.terms();
+        let policy = cfg.policy();
+        let terms = policy.terms;
         let mut price = Lazy::new(|| service::btc_usd_cents(price_config));
-        service::run_once_rotating(
+        service::run_once_shared(
             &state.logic,
             Some(&**rot),
             records,
@@ -240,7 +251,7 @@ impl Settings {
                     println!("{line}");
                 }
             },
-            &terms,
+            &policy,
         )?;
         // Only after every payment was processed: a failed pass reads the same
         // blocks again next time.
@@ -254,13 +265,13 @@ fn run_once(settings: &Settings) -> Result<(), Box<dyn Error>> {
     settings.verify_network()?;
     let (logic, rot) = settings.open_mint()?;
     let state = server::app_state(logic);
-    let mut records = settings.records()?;
+    let records = Mutex::new(settings.records()?);
     let did = settings.did_key()?;
     let mut deliverer = settings.deliverer(&did);
-    let cycle = settings.cycle(&state, &rot, &mut records, &did, false);
+    let cycle = settings.cycle(&state, &rot, &records, &did, false);
     // Delivery is tried even when the scan failed: what was issued before is owed.
-    settings.deliver(&mut deliverer, &mut records, false);
-    settings.forfeit(&mut records);
+    settings.deliver(&mut deliverer, &records, false);
+    settings.forfeit(&records);
     cycle
 }
 
@@ -279,7 +290,10 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
 
     let (logic, rot) = settings.open_mint()?;
     let state = server::app_state(logic);
-    let mut records = settings.records()?;
+    // One set of records, shared by the scan thread and the AIR listener (the
+    // reconciliation requests of kind 15 settle against it). Lock order, everywhere:
+    // records, then the mint, then the rotor.
+    let records: SharedRecords = Arc::new(Mutex::new(settings.records()?));
     let did = settings.did_key()?;
     let scan_rot = Arc::clone(&rot);
     let air_rot = Arc::clone(&rot);
@@ -303,6 +317,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
         did,
         Arc::clone(&state),
         air_rot,
+        Arc::clone(&records),
         Arc::clone(&health),
         limits,
     )?;
@@ -311,6 +326,8 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
     // which must not run on the async runtime.
     let scan_state = Arc::clone(&state);
     let scan_health = Arc::clone(&health);
+    let scan_records = Arc::clone(&records);
+    let watch_records = Arc::clone(&records);
     let scan = thread::spawn(move || {
         println!(
             "scanning wallet {} every {} s",
@@ -318,25 +335,31 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
             interval.as_secs()
         );
         loop {
-            match settings.cycle(&scan_state, &scan_rot, &mut records, &did, true) {
+            match settings.cycle(&scan_state, &scan_rot, &scan_records, &did, true) {
                 Ok(()) => scan_health.record_scan(),
                 Err(e) => eprintln!("scan failed, will retry: {e}"),
             }
             // After every scan, whether or not it worked: records that could not
             // be written earlier are tried again here, with a backoff of their own.
-            settings.deliver(&mut deliverer, &mut records, true);
-            settings.forfeit(&mut records);
+            settings.deliver(&mut deliverer, &scan_records, true);
+            settings.forfeit(&scan_records);
             thread::sleep(interval);
         }
     });
 
     // The scan loop never returns, so a finished scan thread means it panicked.
-    // A poisoned mint lock means a thread panicked while holding the mint. In
-    // both cases the process is no good: exit, and let a supervisor restart it.
+    // A poisoned mint lock means a thread panicked while holding the mint; a
+    // poisoned records lock means one panicked while holding the records. In
+    // all three cases the process is no good: exit, and let a supervisor restart it.
     let watch_state = Arc::clone(&state);
     thread::spawn(move || {
         loop {
-            if let Some(why) = server::fatal(&watch_state, scan.is_finished()) {
+            let why = server::fatal(&watch_state, scan.is_finished()).or_else(|| {
+                watch_records
+                    .is_poisoned()
+                    .then_some("the records lock is poisoned")
+            });
+            if let Some(why) = why {
                 eprintln!("fatal: {why}. Exiting so that a supervisor can restart the process");
                 std::process::exit(1);
             }
@@ -364,7 +387,8 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
 }
 
 /// Start the AIR listener on its own thread. It answers wallets' requests
-/// (`server::air_served`). If it fails (the AIR client gave up) it says so and
+/// (`server::air_served_with`, which settles kind 15 against the shared
+/// records). If it fails (the AIR client gave up) it says so and
 /// the process exits with status 1, so that the service manager starts it again
 /// and the listener resumes from the stored slot counter: a mint that no wallet
 /// can reach is not running.
@@ -373,6 +397,7 @@ fn start_air_listener(
     did: SecretKey,
     state: Arc<AppState>,
     rot: server::SharedRotating,
+    records: SharedRecords,
     health: Arc<server::Health>,
     limits: server::Limits,
 ) -> Result<(), Box<dyn Error>> {
@@ -380,7 +405,7 @@ fn start_air_listener(
         .name("air-listener".into())
         .spawn(move || {
             let serve = move |kind, body: &[u8]| {
-                server::air_served(&state, &rot, &health, &limits, kind, body)
+                server::air_served_with(&state, &rot, Some(&records), &health, &limits, kind, body)
             };
             match psp_mint::air_listener::run_blocking(&air, &did, &serve) {
                 Ok(()) => eprintln!("AIR listener: stopped"),

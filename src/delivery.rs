@@ -31,6 +31,7 @@
 //! payment whose payload cannot be read has no reply DID and no delivery at all.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use sp_wire::ServiceDid;
@@ -95,9 +96,45 @@ impl Deliverer {
     /// Write every record that is not stored yet and whose wait is over, at time
     /// `now`. Never fails: what went wrong is printed and counted.
     pub fn pass(&mut self, records: &mut Records, now: Instant) -> Report {
+        let (jobs, mut report) = self.plan(records, now);
+        if jobs.is_empty() {
+            return report;
+        }
+        let outcomes = self.write(&jobs);
+        self.apply(records, &jobs, outcomes, now, &mut report);
+        report
+    }
+
+    /// [`Deliverer::pass`] for the records the AIR listener shares. The records
+    /// lock is held to prepare the records (a local file) and again to mark them
+    /// stored, and **not while they are written to the AIR server**, so a
+    /// reconciliation request never waits for the network.
+    pub fn pass_shared(&mut self, records: &Mutex<Records>, now: Instant) -> Report {
+        let Some(mut guard) = lock(records) else {
+            return Report::default();
+        };
+        let (jobs, mut report) = self.plan(&mut guard, now);
+        drop(guard);
+        if jobs.is_empty() {
+            return report;
+        }
+        let outcomes = self.write(&jobs);
+        // Written but not marked: the next pass finds them undelivered and
+        // writes the same bytes, which the AIR server answers as already stored.
+        let Some(mut guard) = lock(records) else {
+            return report;
+        };
+        self.apply(&mut guard, &jobs, outcomes, now, &mut report);
+        report
+    }
+
+    /// The records to write now, sealed and saved (so every retry writes the same
+    /// bytes), with what was left alone or given up on. Touches the records file
+    /// only.
+    fn plan(&mut self, records: &mut Records, now: Instant) -> (Vec<Job>, Report) {
         let mut report = Report::default();
         let psp = addr::key_to_did(&self.key.public_key());
-        let mut jobs: Vec<(String, SecretKey, Vec<u8>)> = Vec::new();
+        let mut jobs: Vec<Job> = Vec::new();
         for (txid, delivery) in records.undelivered() {
             if self.waits.get(&txid).is_some_and(|w| w.next > now) {
                 report.waiting += 1;
@@ -113,14 +150,16 @@ impl Deliverer {
                 }
             }
         }
-        if jobs.is_empty() {
-            return report;
-        }
+        (jobs, report)
+    }
 
+    /// Write the records to the AIR server. Touches no records: this is the
+    /// network.
+    fn write(&self, jobs: &[Job]) -> Outcomes {
         let server = self.server.clone();
         let secs = self.timeout_secs;
-        let to_write: Vec<(String, SecretKey, Vec<u8>)> = jobs.clone();
-        let outcomes = block_on_new_runtime(move || async move {
+        let to_write: Vec<Job> = jobs.to_vec();
+        block_on_new_runtime(move || async move {
             let connect = tokio::time::timeout(Duration::from_secs(secs), client::connect(&server));
             let client = match connect.await {
                 Ok(Ok(client)) => client,
@@ -140,12 +179,23 @@ impl Deliverer {
             }
             Ok(out)
         })
-        .and_then(|r| r);
+        .and_then(|r| r)
+        .map_err(|e| e.to_string())
+    }
 
+    /// Mark what the writes found.
+    fn apply(
+        &mut self,
+        records: &mut Records,
+        jobs: &[Job],
+        outcomes: Outcomes,
+        now: Instant,
+        report: &mut Report,
+    ) {
         match outcomes {
             Err(e) => {
                 eprintln!("delivery: the AIR server could not be used ({e}); will retry");
-                for (txid, _, _) in &jobs {
+                for (txid, _, _) in jobs {
                     self.fail(txid, now);
                     report.failed += 1;
                 }
@@ -155,11 +205,11 @@ impl Deliverer {
                     match result {
                         Ok(Written::Created) => {
                             println!("delivery {txid}: record written");
-                            self.stored(records, &txid, &mut report);
+                            self.stored(records, &txid, report);
                         }
                         Ok(Written::AlreadyStored) => {
                             println!("delivery {txid}: record was already stored");
-                            self.stored(records, &txid, &mut report);
+                            self.stored(records, &txid, report);
                         }
                         Ok(Written::Different) => {
                             eprintln!(
@@ -182,7 +232,6 @@ impl Deliverer {
                 }
             }
         }
-        report
     }
 
     /// The sealed record of one purchase, made and saved if this is the first
@@ -301,6 +350,26 @@ impl Deliverer {
     }
 }
 
+/// A record to write: the purchase's txid, its cell and the sealed bytes.
+type Job = (String, SecretKey, Vec<u8>);
+
+/// What writing a pass to the AIR server found, by txid; an error when the
+/// server could not be used at all.
+type Outcomes = Result<Vec<(String, Result<Written, String>)>, String>;
+
+/// The records lock, or `None` (after saying so) if a thread panicked holding it.
+/// A poisoned lock is not recovered: see `service::lock_records`. The pass does
+/// nothing, and the watcher in `serve` exits the process.
+fn lock(records: &Mutex<Records>) -> Option<MutexGuard<'_, Records>> {
+    match records.lock() {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            eprintln!("delivery: the settlement records lock is poisoned; nothing written");
+            None
+        }
+    }
+}
+
 enum Prepared {
     Ready(SecretKey, Vec<u8>),
     Abandoned,
@@ -318,5 +387,35 @@ mod tests {
         // and a long run of failures does not overflow
         assert_eq!(retry_after(u32::MAX).as_secs(), LONGEST_RETRY_SECS);
         assert_eq!(retry_after(0).as_secs(), FIRST_RETRY_SECS);
+    }
+
+    #[test]
+    fn a_poisoned_records_lock_writes_nothing_and_does_not_recover() {
+        let dir = std::env::temp_dir().join(format!("psp-mint-poison-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let records = std::sync::Arc::new(Mutex::new(
+            Records::open(&dir.join("settlements.json")).unwrap(),
+        ));
+        let held = std::sync::Arc::clone(&records);
+        let died = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("a thread dies holding the records");
+        })
+        .join();
+        assert!(died.is_err());
+        assert!(records.is_poisoned());
+        // the server is never reached: the pass stops at the lock
+        let server = ServerRef {
+            name: "00".repeat(33),
+            host: "127.0.0.1".to_string(),
+        };
+        let mut deliverer = Deliverer::new(server, 1, SecretKey::new());
+        assert_eq!(
+            deliverer.pass_shared(&records, Instant::now()),
+            Report::default()
+        );
+        assert!(records.is_poisoned(), "the lock was not recovered");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

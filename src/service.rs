@@ -8,7 +8,7 @@ use mint_core::MintLogic;
 use crate::price::{self, Aggregate, Config};
 use crate::records::Records;
 use crate::scan::Received;
-use crate::settle::{self, Rejection, SettleError, Settlement, Terms};
+use crate::settle::{self, Policy, ReconcileTerms, Rejection, SettleError, Settlement, Terms};
 
 pub fn cents_text(cents: u64) -> String {
     format!("{}.{:02}", cents / 100, cents % 100)
@@ -85,42 +85,106 @@ pub fn run_once_rotating(
     report: &mut dyn FnMut(&Received, &Settlement),
     terms: &Terms,
 ) -> Result<(), SettleError> {
+    let policy = Policy {
+        terms: *terms,
+        fees: ReconcileTerms::default(),
+    };
     for received in found {
         let needs_price = received.confirmations >= terms.lock_confirmations
             && records.get(&received.txid).is_none();
         let fetched = if needs_price { Some(price()) } else { None };
+        let settlement = settle_one(logic, rotating, records, received, fetched, &policy)?;
+        report(received, &settlement);
+    }
+    Ok(())
+}
+
+/// `run_once_rotating` for the records the AIR listener shares (it reconciles
+/// payments in them), under the settlement terms and the reconciliation fees.
+///
+/// **Locks.** The records lock is taken for one payment at a time and never while
+/// the price is fetched, so a reconciliation request waits for at most one
+/// settlement (a few file writes), never for bitcoind or a price source. The
+/// order is fixed everywhere: the records, then the mint, then the rotor. A
+/// poisoned records lock fails the pass with `SettleError::RecordsPoisoned`, as a
+/// poisoned mint lock fails it with `SettleError::Mint`: a thread died in the
+/// middle of a settlement or a reconciliation, and `serve` is about to exit.
+pub fn run_once_shared(
+    logic: &Mutex<MintLogic>,
+    rotating: Option<&crate::server::Rotating>,
+    records: &Mutex<Records>,
+    found: &[Received],
+    price: &mut dyn FnMut() -> Result<u64, String>,
+    report: &mut dyn FnMut(&Received, &Settlement),
+    policy: &Policy,
+) -> Result<(), SettleError> {
+    for received in found {
+        let needs_price = {
+            let guard = lock_records(records)?;
+            received.confirmations >= policy.terms.lock_confirmations
+                && guard.get(&received.txid).is_none()
+        };
+        // No lock is held while the price is fetched.
+        let fetched = if needs_price { Some(price()) } else { None };
         let settlement = {
-            let guard = logic
-                .lock()
-                .map_err(|_| SettleError::Mint("mint lock is poisoned".to_string()))?;
-            let rotor = match rotating {
-                Some(r) => Some(
-                    r.rotor
-                        .lock()
-                        .map_err(|_| SettleError::Mint("rotor lock is poisoned".to_string()))?,
-                ),
-                None => None,
-            };
-            let previous = rotor
-                .as_ref()
-                .and_then(|r| r.previous.as_ref())
-                .map(|(keys, prev)| (keys.id.as_str(), prev));
-            settle::settle_with_previous(
-                &guard,
-                previous,
-                records,
-                received,
-                &mut || {
-                    fetched
-                        .clone()
-                        .unwrap_or_else(|| Err("price was not fetched".to_string()))
-                },
-                terms,
-            )?
+            let mut guard = lock_records(records)?;
+            settle_one(logic, rotating, &mut guard, received, fetched, policy)?
         };
         report(received, &settlement);
     }
     Ok(())
+}
+
+/// The records lock. If a thread panicked holding it the lock is **poisoned**
+/// and this fails with `SettleError::RecordsPoisoned`, never recovering: a panic
+/// means a thread died in the middle of a settlement or a reconciliation, and the
+/// watcher in `serve` exits the process for a supervisor to restart. Every caller
+/// treats it the same way: the scan pass fails (`run_once_shared`,
+/// `Settings::cycle`), and a delivery or forfeit pass logs and skips. The AIR
+/// listener answers nothing (`unavailable`, ignored).
+pub fn lock_records(
+    records: &Mutex<Records>,
+) -> Result<std::sync::MutexGuard<'_, Records>, SettleError> {
+    records.lock().map_err(|_| SettleError::RecordsPoisoned)
+}
+
+/// Settle one payment. The caller holds the records; the mint is locked first
+/// and the rotor second, as everywhere else.
+fn settle_one(
+    logic: &Mutex<MintLogic>,
+    rotating: Option<&crate::server::Rotating>,
+    records: &mut Records,
+    received: &Received,
+    fetched: Option<Result<u64, String>>,
+    policy: &Policy,
+) -> Result<Settlement, SettleError> {
+    let guard = logic
+        .lock()
+        .map_err(|_| SettleError::Mint("mint lock is poisoned".to_string()))?;
+    let rotor = match rotating {
+        Some(r) => Some(
+            r.rotor
+                .lock()
+                .map_err(|_| SettleError::Mint("rotor lock is poisoned".to_string()))?,
+        ),
+        None => None,
+    };
+    let previous = rotor
+        .as_ref()
+        .and_then(|r| r.previous.as_ref())
+        .map(|(keys, prev)| (keys.id.as_str(), prev));
+    settle::settle_ruled(
+        &guard,
+        previous,
+        records,
+        received,
+        &mut || {
+            fetched
+                .clone()
+                .unwrap_or_else(|| Err("price was not fetched".to_string()))
+        },
+        policy,
+    )
 }
 
 /// The lines printed for a payment.
@@ -607,5 +671,43 @@ mod tests {
                 .any(|l| l.contains("AIR request for a new matching request not built")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn a_poisoned_records_lock_fails_the_pass_and_settles_nothing() {
+        let (logic, records, dir) = fixture("poison");
+        let records = std::sync::Arc::new(Mutex::new(records));
+        let held = std::sync::Arc::clone(&records);
+        let died = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("a thread dies holding the records");
+        })
+        .join();
+        assert!(died.is_err());
+        assert!(records.is_poisoned());
+        assert!(matches!(
+            lock_records(&records),
+            Err(SettleError::RecordsPoisoned)
+        ));
+        let found = [received("aa", 6)];
+        let mut reported = 0;
+        let err = run_once_shared(
+            &logic,
+            None,
+            &records,
+            &found,
+            &mut || Ok(BTC_10K),
+            &mut |_, _| reported += 1,
+            &Policy::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SettleError::RecordsPoisoned), "{err}");
+        assert_eq!(reported, 0, "nothing was settled or reported");
+        assert_eq!(
+            logic.lock().unwrap().audit_totals().unwrap().0,
+            Amount::ZERO
+        );
+        assert!(records.is_poisoned(), "the lock was not recovered");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

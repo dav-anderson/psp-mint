@@ -1,8 +1,9 @@
 //! The AIR listener: answers a wallet's requests over AIR, the only way wallets
 //! reach this mint. It always runs under `serve`. The calls are **mint info**
 //! (what `GET /health` reports), the keys calls, **keys**, **keysets** and
-//! **rotation**, **rollover**, **check-state** and **spend**; the reply body is built by
-//! `server::air_served`. What is left on HTTP is local to the SPI and the
+//! **rotation**, **rollover**, **check-state**, **spend** and **reconcile** (kind 15,
+//! which is answered only when it is accepted: `Served::Ignored` writes no reply);
+//! the reply body is built by `server::air_served_with`. What is left on HTTP is local to the SPI and the
 //! operator: `/melt`, `/burns`, `/audit` and `/health`.
 //!
 //! The design (REQUEST-DESIGN.md in sandbox-mint) and the wire (envelopes,
@@ -151,7 +152,7 @@ impl Window<'_> {
 
 /// What the listener does with a request: given its kind and its body, the
 /// reply to it, or `None` for a kind not served (the cell is skipped). The
-/// mint's is [`crate::server::air_served`].
+/// mint's is [`crate::server::air_served_with`].
 pub type Serve = dyn Fn(u8, &[u8]) -> Option<Served> + Send + Sync;
 
 /// A [`Serve`] that answers mint info with `info` (what the mint reports now,

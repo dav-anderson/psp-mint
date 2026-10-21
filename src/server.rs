@@ -1,9 +1,10 @@
 //! The PSP's HTTP API, which is for this machine only, and the calls the AIR
 //! listener answers.
 //!
-//! Wallets reach the PSP over AIR and only over AIR (`air_served` is what the
-//! listener calls: mint info, keys, keysets, rotation, rollover, check-state
-//! and spend). What is left on HTTP is local to the SPI and the operator:
+//! Wallets reach the PSP over AIR and only over AIR (`air_served_with` is what the
+//! listener calls: mint info, keys, keysets, rotation, rollover, check-state,
+//! spend and reconcile, which settles an open payment against the shared
+//! settlement records and answers only an accepted request). What is left on HTTP is local to the SPI and the operator:
 //! the ESP mint's `/melt` and `/burns`, `/audit` and `/health`. The audit and
 //! the melt handlers are mint-server's, the same ones `mintd` uses, mounted
 //! over the PSP's own `MintLogic` in the same process. One process owns the
@@ -61,7 +62,7 @@ use mint_server::state::AppState;
 use mint_types::{Amount, MintInput, Nonce};
 
 use crate::melts::MeltLog;
-use crate::records::Records;
+use crate::records::{Records, SharedRecords};
 use crate::rotation::{
     PspSpendRequest, RolloverError, RolloverRequest, Rollovers, Rotor, SpendError,
 };
@@ -838,9 +839,24 @@ pub fn air_served(
     kind: u8,
     body: &[u8],
 ) -> Option<sp_wire::air_request::Served> {
+    air_served_with(state, rot, None, health, limits, kind, body)
+}
+
+/// [`air_served`] for a mint that also reconciles payments (kind 15): `records`
+/// is the settlement records, shared with the scan thread. Without them kind 15 is
+/// not answered. Lock order: the records, then the mint, then the rotor.
+pub fn air_served_with(
+    state: &AppState,
+    rot: &SharedRotating,
+    records: Option<&SharedRecords>,
+    health: &Health,
+    limits: &Limits,
+    kind: u8,
+    body: &[u8],
+) -> Option<sp_wire::air_request::Served> {
     use sp_wire::air_request::{
-        KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_SPEND, KIND_ROLLOVER,
-        KIND_ROTATION, Served,
+        KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_RECONCILE,
+        KIND_PSP_SPEND, KIND_ROLLOVER, KIND_ROTATION, Served,
     };
     fn read<T: serde::Serialize>(what: &str, result: Result<T, ApiFailure>) -> Served {
         match result {
@@ -880,6 +896,9 @@ pub fn air_served(
             body,
             |req: PspSpendRequest| spend_response(state, rot, &req, limits.rollover_notes),
         ),
+        // The corrected request or the credit claim of an open payment. It shares
+        // the rollover's two ceilings too. Only an accepted request is answered.
+        KIND_PSP_RECONCILE => reconcile_served(state, rot, records, limits, body),
         KIND_CHECK_STATE => post_served(
             "check-state",
             limits.check_state_bytes,
@@ -888,6 +907,96 @@ pub fn air_served(
         ),
         _ => return None,
     })
+}
+
+/// The reconciliation call (kind 15): the corrected request or the credit claim
+/// of an open payment. **Only an accepted request is answered.** Every other
+/// outcome is `Served::Ignored`: nothing is written to the reply cell, and the
+/// code and reason are only logged here. That includes a transient failure of the
+/// mint (a poisoned lock, a failed save), which the wallet meets by sending the
+/// identical request again.
+///
+/// Checked without any lock: the size, the shape and the signature of the
+/// reply key (not counted). Then the records, the mint and the rotor are locked,
+/// in that order, and `reconcile::reconcile` does the rest.
+fn reconcile_served(
+    state: &AppState,
+    rot: &SharedRotating,
+    records: Option<&SharedRecords>,
+    limits: &Limits,
+    body: &[u8],
+) -> sp_wire::air_request::Served {
+    use sp_wire::air_request::Served;
+    let ignored = |code: &str, why: &str, counted: bool| {
+        println!(
+            "AIR: reconciliation ignored ({code}{}): {why}",
+            if counted { ", counted" } else { "" }
+        );
+        Served::Ignored(format!("{code}: {why}"))
+    };
+    let Some(records) = records else {
+        return ignored(
+            sp_wire::codes::UNAVAILABLE,
+            "this mint was started without its settlement records",
+            false,
+        );
+    };
+    let early = |e: crate::reconcile::Ignore| ignored(&e.code, &e.why, e.counted);
+    if body.len() > limits.rollover_bytes {
+        return early(crate::reconcile::Ignore {
+            code: sp_wire::codes::REQUEST_TOO_LARGE.to_string(),
+            why: format!("{} bytes, at most {}", body.len(), limits.rollover_bytes),
+            counted: false,
+        });
+    }
+    let req: sp_wire::psp::ReconcileRequest = match serde_json::from_slice(body) {
+        Ok(req) => req,
+        Err(e) => {
+            return ignored(
+                sp_wire::codes::MALFORMED_REQUEST,
+                &format!("the request could not be read: {e}"),
+                false,
+            );
+        }
+    };
+    if let Err(e) = crate::reconcile::check_shape(&req, limits.rollover_notes) {
+        return early(e);
+    }
+    if let Err(e) = crate::reconcile::verify_signature(&req) {
+        return early(e);
+    }
+    let Ok(mut store) = records.lock() else {
+        return ignored(
+            sp_wire::codes::UNAVAILABLE,
+            "the records lock is poisoned",
+            false,
+        );
+    };
+    let Ok(mut logic) = state.logic.lock() else {
+        return ignored(
+            sp_wire::codes::UNAVAILABLE,
+            "the mint lock is poisoned",
+            false,
+        );
+    };
+    let r2 = Some(Arc::clone(rot));
+    let rotor = match rotor_of(&r2, &mut logic) {
+        Ok(rotor) => rotor.expect("rotating"),
+        Err((_, Json(why))) => {
+            return ignored(sp_wire::codes::UNAVAILABLE, &why.to_string(), false);
+        }
+    };
+    match crate::reconcile::reconcile(&mut store, &logic, &rotor, &req, now_secs()) {
+        Ok(answer) => match serde_json::to_vec(&answer) {
+            Ok(bytes) => Served::Body(bytes),
+            Err(e) => ignored(
+                sp_wire::codes::UNAVAILABLE,
+                &format!("the answer could not be encoded: {e}"),
+                false,
+            ),
+        },
+        Err(e) => early(e),
+    }
 }
 
 /// The rollover call: move notes of the previous (or current) keyset to fresh

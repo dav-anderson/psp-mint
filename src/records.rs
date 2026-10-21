@@ -13,7 +13,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use sp_wire::air_request::delivery::Outcome;
+use sp_wire::air_request::delivery::{Outcome, ReconcileRules};
+use sp_wire::psp::ReconcileResponse;
+
+/// The records, shared by the scan thread (settle, deliver, forfeit) and the AIR
+/// listener (reconcile). Lock order, everywhere: this, then the mint, then the
+/// rotor. Nothing holds it across bitcoind, a price fetch or a network write.
+pub type SharedRecords = std::sync::Arc<std::sync::Mutex<Records>>;
 
 #[derive(Debug)]
 pub enum RecordsError {
@@ -51,11 +57,12 @@ pub enum Status {
     Rejected,
     /// Paid, but short of the request by more than the reconciliation target
     /// allows, so nothing was signed and the BTC is held. Kept under the
-    /// payment and the payer's DID until the payer answers with a new request
-    /// over AIR. That AIR exchange is not built yet, so today the record just
-    /// waits, for the reconciliation window (`Record::open_until`); when the window
-    /// closes unsettled the payment is forfeited (`Record::forfeited_at`) and the
-    /// BTC stays with the mint. See the README, "Underpayment".
+    /// payment and the payer's DID until the payer answers with a corrected
+    /// request over AIR (kind 15, `crate::reconcile`), which settles it (the status
+    /// then becomes `Issued`). Until then the record waits, for the reconciliation
+    /// window (`Record::open_until`); when the window closes unsettled the payment
+    /// is forfeited (`Record::forfeited_at`) and the BTC stays with the mint. See
+    /// the README, "Underpayment".
     #[serde(rename = "paid_unsettled")]
     PaidUnsettled,
 }
@@ -88,6 +95,43 @@ pub struct Delivery {
     /// not help, so the delivery is left alone and the reason is kept here.
     #[serde(default)]
     pub abandoned: Option<String>,
+}
+
+/// One counted attempt at reconciling a payment that was refused for its content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    /// `ReconcileRequest::hash()` of the refused request.
+    pub hash: String,
+    /// The code it was refused with (`sp_wire::codes`).
+    pub code: String,
+    /// Unix seconds.
+    pub at: u64,
+}
+
+/// A reconciliation that was accepted and is being done: saved before anything is
+/// signed, so a crash is finished by the identical resend (see `crate::reconcile`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingReconcile {
+    /// `ReconcileRequest::hash()`.
+    pub hash: String,
+    /// The current epoch when it was accepted.
+    pub epoch: u64,
+    /// The keyset the request named.
+    pub keyset: String,
+    /// The blind nonces of the request (hex), so a record shows what is in flight.
+    pub nonces: Vec<String>,
+}
+
+/// The answer to the accepted reconciliation, kept by request hash: a resend of
+/// the same request gets it again and signs nothing more.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reconciled {
+    pub hash: String,
+    pub response: ReconcileResponse,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +192,53 @@ pub struct Record {
     /// `/audit` shows it apart.
     #[serde(default)]
     pub forfeited_at: Option<u64>,
+    /// The rules of the reconciliation, fixed when the window opened (the same
+    /// ones the first delivery carries): a request is checked against these, never
+    /// against the current settings. `None` for a payment that was never open, and
+    /// for a record from before reconciliation existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules: Option<ReconcileRules>,
+    /// The PSP units of the first delivery's read, prepaid by the PSP and taken
+    /// from the payment before it was assessed (`delivery.read_fee` at the time).
+    /// 0 when there is no delivery.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub read_prepaid_units: u64,
+    /// For a credit: the remainder the PSP keeps when it rounds down to whole PSP
+    /// units (`reconciliation.round_up_from`), in cents. Counted in `/audit` when
+    /// the credit is claimed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub kept_cents: u64,
+    /// For a credit: the cents the PSP gives away by rounding up.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub given_cents: u64,
+    /// For a payment that carried a payload already used by another payment (one
+    /// payload, two bitcoin payments): the txid of the first. It has no delivery
+    /// and no window, and is never reconcilable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duplicate_of: Option<String>,
+    /// Requests refused for their content, counted against `rules.max_attempts`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub attempts: u32,
+    /// Which requests those were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refusals: Vec<Refusal>,
+    /// A reconciliation accepted and not finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconcile_pending: Option<PendingReconcile>,
+    /// The accepted reconciliation's answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled: Option<Reconciled>,
+    /// Unix seconds at which a reconciliation settled the payment. `open_until` is
+    /// kept, so the history shows the window the payment had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_at: Option<u64>,
+    /// For a credit claim: the credit (USD cents) that was claimed.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub credit_claimed_cents: u64,
+}
+
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A count of payments with what they were worth, for `/audit`.
@@ -160,19 +251,44 @@ pub struct Tally {
     pub credit_cents: u64,
 }
 
-/// The payments the mint is holding open or has forfeited, for `/audit`.
+/// The payments the mint is holding open, has forfeited or has settled, and what
+/// reconciliation earned, for `/audit`. Old files read as 0.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Reconciliation {
     /// Open, inside their window.
     pub open: Tally,
     /// Their window closed unsettled.
     pub forfeited: Tally,
+    /// Settled by a reconciliation (kind 15). `sats` is the held or rejected
+    /// payments settled, `credit_cents` the credits claimed.
+    pub settled: Tally,
+    /// A payment that carried a payload already used by another payment. Kept at
+    /// once, never open, never reconcilable; apart from `forfeited`.
+    pub duplicates: Tally,
+    /// PSP units taken as `reconciliation.fee` from settled payments. PSP revenue,
+    /// never issued as notes.
+    pub fees_units: u64,
+    /// PSP units taken as `delivery.read_fee`: the first record of every purchase
+    /// that has one, and the follow-up of every settled reconciliation. Revenue.
+    pub read_prepaid_units: u64,
+    /// PSP units taken as `reconciliation.write_fee`, once per settled payment.
+    /// Revenue.
+    pub write_prepaid_units: u64,
+    /// Cents kept by rounding credits down, over the credits claimed.
+    pub rounding_kept_cents: u64,
+    /// Cents given away by rounding credits up, over the credits claimed.
+    pub rounding_given_cents: u64,
+    /// Requests refused for their content, counted against the cap, over every
+    /// payment: so an operator can answer a support request.
+    pub refused_attempts: u64,
 }
 
 impl Record {
-    /// True while the payment is inside its reconciliation window.
+    /// True while the payment is inside its reconciliation window and no
+    /// reconciliation has settled it. `open_until` stays on a settled or
+    /// forfeited record, as history.
     pub fn is_open(&self) -> bool {
-        self.open_until.is_some() && self.forfeited_at.is_none()
+        self.open_until.is_some() && self.forfeited_at.is_none() && self.settled_at.is_none()
     }
 }
 
@@ -193,6 +309,17 @@ impl Record {
             delivery: None,
             open_until: None,
             forfeited_at: None,
+            rules: None,
+            read_prepaid_units: 0,
+            kept_cents: 0,
+            given_cents: 0,
+            duplicate_of: None,
+            attempts: 0,
+            refusals: Vec::new(),
+            reconcile_pending: None,
+            reconciled: None,
+            settled_at: None,
+            credit_claimed_cents: 0,
         }
     }
 }
@@ -231,18 +358,9 @@ impl Records {
             next.entry(txid).or_insert_with(|| Record {
                 locked_price_cents: None,
                 issued: true,
-                over_under_bps: None,
                 status: Status::Issued,
-                late: false,
-                skipped_units: 0,
-                credit_cents: 0,
                 reason: Some("imported from processed_txids.json".to_string()),
-                payer_did: None,
-                requested_units: 0,
-                value_sats: 0,
-                delivery: None,
-                open_until: None,
-                forfeited_at: None,
+                ..Record::locked(0, false)
             });
         }
         if next.len() != records.rows.len() {
@@ -267,19 +385,54 @@ impl Records {
     }
 
     /// What the mint still owes one payer DID: every payment of theirs that
-    /// holds a credit or is paid but unsettled and has not been forfeited, as
-    /// (txid, record), by txid. Both kinds stay here until the AIR exchange that
-    /// settles them exists, or their window closes (`forfeit_expired`).
+    /// holds a credit or is paid but unsettled and has been neither forfeited nor
+    /// settled, as (txid, record), by txid. Both kinds stay here until a
+    /// reconciliation settles them (kind 15) or their window closes
+    /// (`forfeit_expired`).
     pub fn owed_to(&self, payer_did: &str) -> Vec<(&str, &Record)> {
         self.rows
             .iter()
             .filter(|(_, r)| {
                 r.payer_did.as_deref() == Some(payer_did)
                     && r.forfeited_at.is_none()
+                    && r.settled_at.is_none()
                     && (r.credit_cents > 0 || r.status == Status::PaidUnsettled)
             })
             .map(|(txid, r)| (txid.as_str(), r))
             .collect()
+    }
+
+    /// The txids of the payments that carry this purchase: `payer_did` is the
+    /// reply key and the delivery's `purchase` is the purchase id (both hex), by
+    /// txid. The lookup a reconciliation request is matched with. A duplicate payment
+    /// has neither, so it never matches.
+    pub fn matching(&self, reply_did: &str, purchase: &str) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter(|(_, r)| {
+                r.payer_did.as_deref() == Some(reply_did)
+                    && r.delivery.as_ref().is_some_and(|d| d.purchase == purchase)
+            })
+            .map(|(txid, _)| txid.clone())
+            .collect()
+    }
+
+    /// The txid of an earlier payment of the same purchase, other than `except`:
+    /// what makes a payment a duplicate.
+    pub fn first_of_purchase(
+        &self,
+        reply_did: &str,
+        purchase: &str,
+        except: &str,
+    ) -> Option<String> {
+        self.rows
+            .iter()
+            .find(|(txid, r)| {
+                txid.as_str() != except
+                    && r.payer_did.as_deref() == Some(reply_did)
+                    && r.delivery.as_ref().is_some_and(|d| d.purchase == purchase)
+            })
+            .map(|(txid, _)| txid.clone())
     }
 
     /// The purchases whose record has not been written to the AIR server yet and
@@ -311,13 +464,18 @@ impl Records {
 
     /// Mark forfeited every payment that is open and whose window closed at or
     /// before `now`: the mint keeps the BTC and owes nothing. Returns the txids
-    /// marked, by txid. Nothing settles an open payment yet, so every one ends
-    /// here; the exchange that settles one will clear `open_until` first.
+    /// marked, by txid. A payment a reconciliation settled is not open, and one
+    /// with a reconciliation accepted and not finished (`reconcile_pending`) is
+    /// skipped, so a request accepted before the close is finished.
     pub fn forfeit_expired(&mut self, now: u64) -> Result<Vec<String>, RecordsError> {
         let due: Vec<String> = self
             .rows
             .iter()
-            .filter(|(_, r)| r.is_open() && r.open_until.is_some_and(|until| until <= now))
+            .filter(|(_, r)| {
+                r.is_open()
+                    && r.reconcile_pending.is_none()
+                    && r.open_until.is_some_and(|until| until <= now)
+            })
             .map(|(txid, _)| txid.clone())
             .collect();
         let mut next = self.rows.clone();
@@ -333,10 +491,44 @@ impl Records {
         Ok(due)
     }
 
-    /// What is held open and what has been forfeited, for `/audit`.
+    /// What is held open, forfeited and settled, what reconciliation earned and
+    /// what was a duplicate, for `/audit`.
     pub fn reconciliation(&self) -> Reconciliation {
         let mut out = Reconciliation::default();
         for record in self.rows.values() {
+            out.read_prepaid_units = out
+                .read_prepaid_units
+                .saturating_add(record.read_prepaid_units);
+            out.refused_attempts = out
+                .refused_attempts
+                .saturating_add(u64::from(record.attempts));
+            if record.duplicate_of.is_some() {
+                out.duplicates.payments += 1;
+                out.duplicates.sats = out.duplicates.sats.saturating_add(record.value_sats);
+                continue;
+            }
+            if let Some(done) = &record.reconciled {
+                let r = &done.response;
+                out.settled.payments += 1;
+                if record.credit_claimed_cents > 0 {
+                    out.settled.credit_cents = out
+                        .settled
+                        .credit_cents
+                        .saturating_add(record.credit_claimed_cents);
+                    out.rounding_kept_cents = out.rounding_kept_cents.saturating_add(r.kept_cents);
+                    out.rounding_given_cents =
+                        out.rounding_given_cents.saturating_add(r.given_cents);
+                } else {
+                    out.settled.sats = out.settled.sats.saturating_add(record.value_sats);
+                }
+                out.fees_units = out.fees_units.saturating_add(r.fee_units);
+                out.read_prepaid_units =
+                    out.read_prepaid_units.saturating_add(r.read_prepaid_units);
+                out.write_prepaid_units = out
+                    .write_prepaid_units
+                    .saturating_add(r.write_prepaid_units);
+                continue;
+            }
             if record.open_until.is_none() {
                 continue;
             }
@@ -742,6 +934,195 @@ mod tests {
         assert!(!path.exists());
         fs::write(&legacy, "nope").unwrap();
         assert!(Records::open_with_legacy(&path, &legacy).is_err());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ---- reconciliation fields ----
+
+    /// A held payment of `payer` and `purchase`, as the matching looks at it.
+    fn of_purchase(payer: &str, purchase: &str, sats: u64, until: u64) -> Record {
+        let mut r = held(sats, until);
+        r.payer_did = Some(payer.to_string());
+        let mut d = delivery(purchase);
+        d.reply_did = payer.to_string();
+        r.delivery = Some(d);
+        r
+    }
+
+    #[test]
+    fn a_plain_record_is_written_without_the_reconciliation_fields_and_old_files_read() {
+        let dir = scratch("recon-fields");
+        let path = dir.join("settlements.json");
+        let mut r = Records::open(&path).unwrap();
+        r.put("aa", Record::locked(9, false)).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        for field in [
+            "rules",
+            "read_prepaid_units",
+            "kept_cents",
+            "given_cents",
+            "duplicate_of",
+            "attempts",
+            "refusals",
+            "reconcile_pending",
+            "reconciled",
+            "settled_at",
+            "credit_claimed_cents",
+        ] {
+            assert!(
+                !text.contains(field),
+                "{field} is written for a plain record"
+            );
+        }
+        // a file from before reconciliation reads, with the defaults
+        fs::write(
+            &path,
+            r#"{"aa": {"locked_price_cents": 9, "issued": false, "over_under_bps": null,
+                "status": "paid_unsettled", "late": false, "skipped_units": 5,
+                "credit_cents": 0, "reason": null, "payer_did": null,
+                "requested_units": 5, "value_sats": 100, "open_until": 50}}"#,
+        )
+        .unwrap();
+        let old = Records::open(&path).unwrap();
+        let rec = old.get("aa").unwrap();
+        assert!(rec.rules.is_none() && rec.reconciled.is_none() && rec.reconcile_pending.is_none());
+        assert_eq!(
+            (rec.attempts, rec.settled_at, rec.duplicate_of.clone()),
+            (0, None, None)
+        );
+        assert!(rec.is_open());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn matching_finds_a_purchase_by_reply_key_and_purchase_id_and_never_a_duplicate() {
+        let dir = scratch("matching");
+        let mut r = Records::open(&dir.join("settlements.json")).unwrap();
+        r.put("a", of_purchase("02aa", "p1", 100, 50)).unwrap();
+        r.put("b", of_purchase("02aa", "p2", 100, 50)).unwrap();
+        r.put("c", of_purchase("02bb", "p1", 100, 50)).unwrap();
+        // a duplicate has neither a payer nor a delivery
+        let mut dup = Record::locked(1, false);
+        dup.status = Status::Rejected;
+        dup.duplicate_of = Some("a".to_string());
+        r.put("d", dup).unwrap();
+        assert_eq!(r.matching("02aa", "p1"), vec!["a".to_string()]);
+        assert_eq!(r.matching("02bb", "p1"), vec!["c".to_string()]);
+        assert!(r.matching("02aa", "p3").is_empty());
+        assert_eq!(
+            r.first_of_purchase("02aa", "p1", "z"),
+            Some("a".to_string())
+        );
+        assert_eq!(r.first_of_purchase("02aa", "p1", "a"), None);
+        // two payments of one purchase are both found
+        r.put("e", of_purchase("02aa", "p1", 100, 50)).unwrap();
+        assert_eq!(r.matching("02aa", "p1").len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_settled_payment_is_not_open_not_owed_and_not_forfeited() {
+        let dir = scratch("settled");
+        let mut r = Records::open(&dir.join("settlements.json")).unwrap();
+        let mut done = of_purchase("02aa", "p1", 100, 50);
+        done.settled_at = Some(10);
+        assert!(!done.is_open());
+        r.put("done", done).unwrap();
+        assert!(r.owed_to("02aa").is_empty());
+        assert!(r.forfeit_expired(1_000).unwrap().is_empty());
+        assert_eq!(r.get("done").unwrap().forfeited_at, None);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_payment_with_a_reconciliation_pending_is_not_forfeited() {
+        let dir = scratch("pending");
+        let mut r = Records::open(&dir.join("settlements.json")).unwrap();
+        let mut pending = of_purchase("02aa", "p1", 100, 50);
+        pending.reconcile_pending = Some(PendingReconcile {
+            hash: "h".to_string(),
+            epoch: 0,
+            keyset: "k".to_string(),
+            nonces: Vec::new(),
+        });
+        r.put("pending", pending).unwrap();
+        r.put("plain", of_purchase("02bb", "p1", 100, 50)).unwrap();
+        assert_eq!(r.forfeit_expired(50).unwrap(), vec!["plain".to_string()]);
+        // it survives a reload with the pending entry
+        let again = Records::open(&dir.join("settlements.json")).unwrap();
+        assert!(again.get("pending").unwrap().reconcile_pending.is_some());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_report_counts_settled_duplicates_fees_rounding_and_refused_attempts() {
+        let dir = scratch("report");
+        let mut r = Records::open(&dir.join("settlements.json")).unwrap();
+        let response = |fee, read, write, kept, given| ReconcileResponse {
+            keyset: "k".to_string(),
+            signatures: Vec::new(),
+            keysets: sp_wire::psp::KeysetsResponse {
+                current: "k".to_string(),
+                previous: None,
+                keysets: Default::default(),
+            },
+            issued_units: 3,
+            fee_units: fee,
+            read_prepaid_units: read,
+            write_prepaid_units: write,
+            kept_cents: kept,
+            given_cents: given,
+        };
+        // a held payment settled: 4,000 sats, a fee of 2, the follow-up's read of
+        // 1 and the one write of 1 (the first read of 1 is on the record)
+        let mut a = of_purchase("02aa", "p1", 4_000, 50);
+        a.settled_at = Some(10);
+        a.status = Status::Issued;
+        a.read_prepaid_units = 1;
+        a.reconciled = Some(Reconciled {
+            hash: "h1".to_string(),
+            response: response(2, 1, 1, 0, 0),
+        });
+        r.put("a", a).unwrap();
+        // a credit claimed: 29 cents, 1 given
+        let mut b = of_purchase("02bb", "p1", 6_000, 50);
+        b.settled_at = Some(10);
+        b.status = Status::Issued;
+        b.issued = true;
+        b.credit_cents = 29;
+        b.credit_claimed_cents = 29;
+        b.reconciled = Some(Reconciled {
+            hash: "h2".to_string(),
+            response: response(0, 0, 0, 0, 1),
+        });
+        r.put("b", b).unwrap();
+        // one open with two refused attempts, one duplicate
+        let mut c = of_purchase("02cc", "p1", 700, 5_000);
+        c.attempts = 2;
+        r.put("c", c).unwrap();
+        let mut d = Record::locked(1, false);
+        d.status = Status::Rejected;
+        d.value_sats = 900;
+        d.duplicate_of = Some("c".to_string());
+        r.put("d", d).unwrap();
+
+        let report = r.reconciliation();
+        assert_eq!((report.settled.payments, report.settled.sats), (2, 4_000));
+        assert_eq!(report.settled.credit_cents, 29);
+        assert_eq!((report.open.payments, report.open.sats), (1, 700));
+        assert_eq!(report.forfeited, Tally::default());
+        assert_eq!(
+            (report.duplicates.payments, report.duplicates.sats),
+            (1, 900)
+        );
+        assert_eq!(report.fees_units, 2);
+        assert_eq!(report.read_prepaid_units, 2);
+        assert_eq!(report.write_prepaid_units, 1);
+        assert_eq!(
+            (report.rounding_kept_cents, report.rounding_given_cents),
+            (0, 1)
+        );
+        assert_eq!(report.refused_attempts, 2);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
