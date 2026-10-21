@@ -161,7 +161,7 @@ These steps apply only to a payment that is short by more than `settle.price_tol
 
 **The second half is not built.** It runs over AIR: the mint messages the payer's DID, saying what was received and asking for a new request that matches it. The payer returns the new request over AIR (not on chain, since it is already paid). The mint checks it against the stored payment (`value_sats`, the locked price and the payer DID in the record), signs it, and marks the payment settled so that it cannot be claimed twice. AIR messaging does not exist yet, so today the payment is only recorded, printed (`paid but unsettled ...`) and held. The payer is told over AIR that the payment is held, and what was paid (see "Signature delivery"). Nothing deletes the record, but the payment is open only for the reconciliation window (see "The reconciliation window"). A local stand-in for settling a held payment (like `esp-mint decline`) was considered and declined for now: the exchange happens over AIR, so the held payment waits for AIR.
 
-**An unanswered reconciliation is not kept open forever.** If the payer does not settle the payment within `settle.reconciliation_window_days` (7 by default), the mint marks it forfeited and keeps the bitcoin (see "The reconciliation window"). The record is never deleted; it stays, with `forfeited_at`.
+**An unanswered reconciliation is not kept open forever.** If the payer does not settle the payment within `settle.reconciliation_window_days` (14 by default), the mint marks it forfeited and keeps the bitcoin (see "The reconciliation window"). The record is never deleted; it stays, with `forfeited_at`.
 
 #### Overpayment
 
@@ -190,7 +190,7 @@ The mint delivers each purchase's signatures, or that the payment is held, or it
 
 ### The reconciliation window
 
-A payment that is not settled is not open forever. `settle.reconciliation_window_days` (`PSP_RECONCILIATION_WINDOW_DAYS`, 7 by default, 1 to 365) is how long a **credit**, a **held payment** and a **rejected purchase with a readable reply DID** stay open. It is an SPI setting, passed to `psp-mint` and into the settlement rules (`Terms.reconciliation_window_secs`).
+A payment that is not settled is not open forever. `settle.reconciliation_window_days` (`PSP_RECONCILIATION_WINDOW_DAYS`, 14 by default, 1 to 365) is how long a **credit**, a **held payment** and a **rejected purchase with a readable reply DID** stay open. It is an SPI setting, passed to `psp-mint` and into the settlement rules (`Terms.reconciliation_window_secs`).
 
 - **Stamped when the payment is handled.** `settle` sets the record's `open_until` to the time of settlement plus the window, in the same write that records the status, so the window holds whatever happens next. The same time is written into the record the payer is sent (`open_until`), and that is how the wallet learns it: the wallet has no setting for it.
 - **Forfeited when it closes.** After every scan, `Records::forfeit_expired(now)` marks each payment whose `open_until` is `now` or earlier and that is not forfeited yet: `forfeited_at` is set, the mint keeps the bitcoin, and the payment is no longer owed (`owed_to` skips it). The boundary is inclusive, so the mint and a wallet that deletes at the same instant agree. The mint prints `forfeited <txid>`. The payment stays in the settlement file.

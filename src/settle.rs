@@ -39,11 +39,11 @@ pub const PRICE_TOLERANCE_BPS: u128 = 100;
 ///   notes are signed and the mint keeps the remainder. If not, nothing is signed
 ///   and the payment is recorded as paid but unsettled.
 pub const PAYMENT_RECONCILIATION_TARGET_BPS: u128 = 1000;
-/// How long a credit, a held payment or a rejected purchase stays open (7 days,
+/// How long a credit, a held payment or a rejected purchase stays open (14 days,
 /// in seconds). In that time the payer can settle it (that exchange is not built
 /// yet); when it closes unsettled the mint forfeits the payment: it keeps the BTC
 /// and owes nothing. The operator sets it in days (`settle.reconciliation_window_days`).
-pub const RECONCILIATION_WINDOW_SECS: u64 = 7 * 24 * 60 * 60;
+pub const RECONCILIATION_WINDOW_SECS: u64 = 14 * 24 * 60 * 60;
 
 /// The settlement rules a running mint uses. The defaults are the constants
 /// above; the operator sets them in `psp-mint.toml` (see `config`).

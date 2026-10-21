@@ -232,7 +232,7 @@ pub const SPECS: &[Spec] = &[
     Spec {
         key: "settle.reconciliation_window_days",
         env: "PSP_RECONCILIATION_WINDOW_DAYS",
-        default: "7",
+        default: "14",
         units: "days",
         what: "How long a credit, a held payment (paid but unsettled) or a rejected purchase stays open, counted from when the mint settles the payment. The payer is told over AIR, and the window is in the record. When it closes with the payment still open, the mint forfeits it: it keeps the BTC, owes no credit, and /audit shows it apart. The payer's wallet deletes the purchase's key at the same time. Nothing settles an open payment yet, so today every one is forfeited when its window closes. 1 to 365.",
     },
@@ -1575,7 +1575,7 @@ mod tests {
                 min_confirmations: 10,
                 price_tolerance_bps: 100,
                 reconciliation_target_bps: 2500,
-                reconciliation_window_secs: 7 * 86_400,
+                reconciliation_window_secs: 14 * 86_400,
             }
         );
         assert_eq!(c.price().timeout_secs, 4);
@@ -1892,11 +1892,11 @@ mod network_tests {
     }
 
     #[test]
-    fn the_reconciliation_window_is_seven_days_by_default_and_set_in_days() {
+    fn the_reconciliation_window_is_fourteen_days_by_default_and_set_in_days() {
         let mut c = Config::defaults("/h");
-        assert_eq!(c.reconciliation_window_days, 7);
-        assert_eq!(c.get("settle.reconciliation_window_days").unwrap(), "7");
-        assert_eq!(c.terms().reconciliation_window_secs, 7 * 86_400);
+        assert_eq!(c.reconciliation_window_days, 14);
+        assert_eq!(c.get("settle.reconciliation_window_days").unwrap(), "14");
+        assert_eq!(c.terms().reconciliation_window_secs, 14 * 86_400);
         c.set("settle.reconciliation_window_days", "30").unwrap();
         assert_eq!(c.terms().reconciliation_window_secs, 30 * 86_400);
         assert!(c.validate().is_ok());
@@ -1927,11 +1927,11 @@ mod network_tests {
         assert_eq!(loaded.config.reconciliation_window_days, 3);
         let loaded = load_with(
             &d,
-            &env_of(&[("HOME", "/h"), ("PSP_RECONCILIATION_WINDOW_DAYS", "14")]),
+            &env_of(&[("HOME", "/h"), ("PSP_RECONCILIATION_WINDOW_DAYS", "21")]),
             None,
         )
         .unwrap();
-        assert_eq!(loaded.config.reconciliation_window_days, 14);
+        assert_eq!(loaded.config.reconciliation_window_days, 21);
         fs::remove_dir_all(&d).unwrap();
     }
 }

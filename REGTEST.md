@@ -149,7 +149,7 @@ Notes on running it:
 - **Denominations.** Notes are powers of two from 1 to 16,777,216 units (2^24, 25 keys), and a unit is $0.10. A request must use those, so 5 units is a 4 and a 1.
 - **Data outputs.** A transaction needs exactly one data output, holding the sealed payload. With none, or with more than one, it is recorded as rejected and nothing is issued. If the one data output does not open, the payment is ignored instead (above).
 - **Signatures.** The `signature` lines are a log. The signatures are stored in the payment's record (`delivery`) and written to the AIR server as one record the payer's wallet reads (`claim-psp`).
-- **Held and rejected payments** get a record too (that the payment is held, or the reason it was rejected, with what was received) and stay open for `settle.reconciliation_window_days` (7 by default; set `PSP_RECONCILIATION_WINDOW_DAYS=1` to watch it close). When the window ends the run prints `forfeited <txid>`, the record in `settlements.json` gets `forfeited_at`, the mint keeps the bitcoin, and `/audit` (under `serve`) lists the payment in `reconciliation.forfeited`.
+- **Held and rejected payments** get a record too (that the payment is held, or the reason it was rejected, with what was received) and stay open for `settle.reconciliation_window_days` (14 by default; set `PSP_RECONCILIATION_WINDOW_DAYS=1` to watch it close). When the window ends the run prints `forfeited <txid>`, the record in `settlements.json` gets `forfeited_at`, the mint keeps the bitcoin, and `/audit` (under `serve`) lists the payment in `reconciliation.forfeited`.
 
 ## 8. Run the PSP server
 
