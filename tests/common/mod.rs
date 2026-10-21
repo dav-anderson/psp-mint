@@ -37,8 +37,8 @@ use sp_wire::air_request::addr;
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::{
-    KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROLLOVER, KIND_ROTATION,
-    STATUS_UNAVAILABLE, VerifyError, local_server,
+    KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_SPEND, KIND_ROLLOVER,
+    KIND_ROTATION, STATUS_UNAVAILABLE, VerifyError, local_server,
 };
 use sp_wire::seal::SecretKey as DidKey;
 
@@ -135,6 +135,7 @@ fn kind_of(route: &str) -> u8 {
         "/keysets" => KIND_KEYSETS,
         "/rotation" => KIND_ROTATION,
         "/rollover" => KIND_ROLLOVER,
+        "/spend" => KIND_PSP_SPEND,
         "/check-state" => KIND_CHECK_STATE,
         "/health" => KIND_MINT_INFO,
         other => panic!("{other} is not a call the PSP mint answers over AIR"),

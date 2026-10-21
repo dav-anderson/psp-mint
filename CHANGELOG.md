@@ -4,6 +4,14 @@ psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-co
 
 ## 0.5.0 (unreleased): signatures delivered over AIR
 
+**A PSP spend with change over AIR (unreleased).** Needs the `KIND_PSP_SPEND` (14) and `PspSpendRequest` of the matching sp-wire.
+
+- **New: the spend (AIR kind 14).** Notes in, change out, an amount `pay` that is burned and never reissued, and a memo; the inputs must be worth the change plus `pay` exactly. Modelled on fsp-mint's spend, with the rollover's keysets (each input names its keyset; the change is signed by the current or the previous one) and the rollover's crash safety: the request is saved as pending with its notes before any burn, the burn is recorded, the change is signed (an output already claimed is signed again), and the answer is stored with `pay` added to the paid total in one write, only then is the reply made. A retry gets the stored answer and burns nothing more. Checks, cheapest first, with their codes: `no_inputs`, `too_many_items`, `memo_too_long`, `missing_keyset`, `nothing_to_pay` (a `pay` of 0 is a plain rollover), `not_exact` (summed in `u128`), `duplicate_input`, `duplicate_blind_nonce`, `bad_denomination`, `keyset_retired`, `unknown_keyset`, `bad_note`, `bad_spend_signature`, `note_spent_elsewhere` (with `spent`) and `note_held`.
+- **New: `/audit` has `paid`,** the PSP units burned as payments by spends, apart from what the ESP mint burns through `/melt` for exchanges. It is part of `redeemed`. It is kept in `rollovers.json` (new fields `spends` and `paid`, both defaulted, so old files read), saved in the same write as the answer it counts.
+- The spend shares the rollover's ceilings (`server.rollover_max_request_bytes`, `rollover.max_items`); no new setting. The memo is not recorded with the burn, so a payer's memo cannot pass for an exchange's in `/burns`. Rollover, `/melt` and purchases are unchanged. Fees stay 0.
+- Tests: `tests/spend.rs`, over AIR: a spend with change (and its retry); an exact spend with no change; inputs not equal to change + pay (including a `pay` that would wrap a `u64`); `pay` 0; a spent note, which is named; the same note in two spends; the previous, a retired and an unknown keyset, for the notes and for the change; the payment counted apart from an exchange's melt; a crash after the burn and a crash while signing, each finished by the retry with the payment counted once, and the held note refused to anyone else meanwhile; the shape checks and the ceilings; and a `rollovers.json` from before spends.
+- Docs: README (the new kind, the audit field, the settings it shares), DESIGN ("The spend").
+
 Builds on `sp-wire` 0.5.0 (`air_request::delivery`).
 
 A held or rejected purchase is delivered too, and every unsettled payment now has a reconciliation window (below, the last four items).

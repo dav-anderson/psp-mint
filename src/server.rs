@@ -2,8 +2,8 @@
 //! listener answers.
 //!
 //! Wallets reach the PSP over AIR and only over AIR (`air_served` is what the
-//! listener calls: mint info, keys, keysets, rotation, rollover and
-//! check-state). What is left on HTTP is local to the SPI and the operator:
+//! listener calls: mint info, keys, keysets, rotation, rollover, check-state
+//! and spend). What is left on HTTP is local to the SPI and the operator:
 //! the ESP mint's `/melt` and `/burns`, `/audit` and `/health`. The audit and
 //! the melt handlers are mint-server's, the same ones `mintd` uses, mounted
 //! over the PSP's own `MintLogic` in the same process. One process owns the
@@ -19,7 +19,8 @@
 //! - `POST /burns`: for each nonce, whether it is spent and the memo it was burned
 //!   under. The ESP mint uses this to tell, on a retry, a note it burned itself
 //!   from a note that was burned by someone else.
-//! - `GET /audit`: issued, redeemed and outstanding totals, and (when `serve`
+//! - `GET /audit`: issued, redeemed and outstanding totals, `paid` (the PSP units
+//!   burned as payments by PSP spends, kept apart from every other burn), and (when `serve`
 //!   gives the router the settlement records) `reconciliation`: the payments
 //!   held open and the payments forfeited, each with a count, the sats of the
 //!   ones that got no notes and the USD cents of credit on the ones that did.
@@ -61,7 +62,9 @@ use mint_types::{Amount, MintInput, Nonce};
 
 use crate::melts::MeltLog;
 use crate::records::Records;
-use crate::rotation::{RolloverError, RolloverRequest, Rollovers, Rotor};
+use crate::rotation::{
+    PspSpendRequest, RolloverError, RolloverRequest, Rollovers, Rotor, SpendError,
+};
 
 // The wire types live in sp-wire; they are re-exported so the paths are unchanged.
 pub use sp_wire::psp::{Burn, BurnsRequest, BurnsResponse, KeysetsResponse, PspMeltRequest};
@@ -702,11 +705,16 @@ fn check_state_response(
     Ok(api::CheckStateResponse { spent })
 }
 
-/// Issued and redeemed over every generation, the deleted ones included.
+/// Issued and redeemed over every generation, the deleted ones included, and
+/// `paid`: the PSP units burned as payments by PSP spends (kind 14), which is the
+/// SPI's revenue. `paid` is part of `redeemed` (the notes of a spend are
+/// redeemed whole, and the change is issued) and is counted apart from every
+/// other burn, such as what the ESP mint burns through `/melt` for exchanges.
 async fn audit_handler(
     State((state, rot)): State<RotState>,
-) -> Result<Json<api::AuditResponse>, ApiFailure> {
+) -> Result<Json<serde_json::Value>, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let shared = Arc::clone(&rot);
     let rot = Some(rot);
     let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
     let int = |e| failure(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"));
@@ -719,11 +727,16 @@ async fn audit_handler(
     let (ri, rd) = rotor.retired_totals();
     i += Amount::from_units(ri);
     d += Amount::from_units(rd);
-    Ok(Json(api::AuditResponse {
+    // Lock order: the mint, the rotor, then the rollovers (as a rollover does).
+    let paid = shared.rollovers.lock().map_err(|_| poisoned())?.paid();
+    let mut body = serde_json::to_value(api::AuditResponse {
         issued: i,
         redeemed: d,
         outstanding: Amount::from_units(i.units.saturating_sub(d.units)),
-    }))
+    })
+    .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    body["paid"] = serde_json::json!(paid);
+    Ok(Json(body))
 }
 
 /// The keysets call.
@@ -826,8 +839,8 @@ pub fn air_served(
     body: &[u8],
 ) -> Option<sp_wire::air_request::Served> {
     use sp_wire::air_request::{
-        KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_ROLLOVER, KIND_ROTATION,
-        Served,
+        KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_SPEND, KIND_ROLLOVER,
+        KIND_ROTATION, Served,
     };
     fn read<T: serde::Serialize>(what: &str, result: Result<T, ApiFailure>) -> Served {
         match result {
@@ -857,6 +870,15 @@ pub fn air_served(
             limits.rollover_bytes,
             body,
             |req: RolloverRequest| rollover_response(state, rot, &req, limits.rollover_notes),
+        ),
+        // A spend shares the rollover's two ceilings: the request's bytes
+        // (`server.rollover_max_request_bytes`) and the most notes
+        // (`rollover.max_items`), for the notes in and for the change out.
+        KIND_PSP_SPEND => post_served(
+            "spend",
+            limits.rollover_bytes,
+            body,
+            |req: PspSpendRequest| spend_response(state, rot, &req, limits.rollover_notes),
         ),
         KIND_CHECK_STATE => post_served(
             "check-state",
@@ -895,6 +917,42 @@ fn rollover_response(
             })),
         )),
         Err(RolloverError::Internal(e)) => Err(failure(StatusCode::INTERNAL_SERVER_ERROR, e)),
+    }
+}
+
+/// The spend call (kind 14): notes in, change out, an amount paid and burned.
+/// The answer is stored by request hash before the reply is made, so a resend
+/// returns the same stored answer and a crash in the middle is finished by the
+/// next resend (see `rotation::spend`).
+fn spend_response(
+    state: &AppState,
+    rot: &SharedRotating,
+    req: &PspSpendRequest,
+    max_items: usize,
+) -> Result<crate::rotation::PspSpendResponse, ApiFailure> {
+    // Cheap checks first, before the mint lock is taken.
+    if let Err(e) = crate::rotation::check_spend_shape(req, max_items) {
+        return Err(spend_failure(e));
+    }
+    let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let r2 = Some(Arc::clone(rot));
+    let rotor = rotor_of(&r2, &mut logic)?.expect("rotating");
+    let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
+    crate::rotation::spend(&logic, &rotor, &mut store, req, max_items).map_err(spend_failure)
+}
+
+fn spend_failure(e: SpendError) -> ApiFailure {
+    match e {
+        SpendError::Refused(code, why) => coded(StatusCode::BAD_REQUEST, code, why),
+        SpendError::Spent(i) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("input {i}: the note is already spent"),
+                "code": sp_wire::codes::NOTE_SPENT_ELSEWHERE,
+                "spent": [i],
+            })),
+        ),
+        SpendError::Internal(e) => failure(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
 

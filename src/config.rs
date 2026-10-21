@@ -101,14 +101,14 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_ROLLOVER_MAX_BYTES",
         default: "1048576",
         units: "bytes",
-        what: "The ceiling on one rollover request (1 MiB), which comes over AIR. A larger body is refused with 413 before it is parsed: nothing is burned.",
+        what: "The ceiling on one rollover request or one spend request (1 MiB), which come over AIR. A larger body is refused with 413 before it is parsed: nothing is burned.",
     },
     Spec {
         key: "rollover.max_items",
         env: "PSP_ROLLOVER_MAX_ITEMS",
         default: "1000",
         units: "notes",
-        what: "The most notes in one rollover request. More is refused 400 before anything is burned.",
+        what: "The most notes in one rollover request, and the most notes in and the most change outputs out of one spend request. More is refused 400 before anything is burned.",
     },
     Spec {
         key: "server.burns_max_request_bytes",

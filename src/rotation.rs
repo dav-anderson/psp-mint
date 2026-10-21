@@ -31,7 +31,10 @@ use serde::{Deserialize, Serialize};
 
 // The wire types live in sp-wire; they are re-exported so the paths are unchanged.
 pub use sp_wire::keyset::{KeysetWindow, RotationResponse, keyset_id};
-pub use sp_wire::psp::{MAX_ROLLOVER_NOTES, RolloverRequest, RolloverResponse};
+pub use sp_wire::psp::{
+    MAX_ROLLOVER_NOTES, MAX_SPEND_MEMO_BYTES, PspSpendRequest, PspSpendResponse, RolloverRequest,
+    RolloverResponse,
+};
 
 pub const FIRST_ISSUE_FILE: &str = "first_issue.json";
 /// The most retired keyset IDs kept: 1 MB of 8-byte IDs (131,072). A
@@ -599,6 +602,20 @@ pub struct Rollovers {
     /// take them meanwhile.
     #[serde(default)]
     holds: BTreeMap<String, Vec<String>>,
+    /// The answers to PSP spends (kind 14), by request hash. A spend uses the
+    /// same `pending`, `burned` and `holds` as a rollover, under its own hash
+    /// (the two hashes have different tags, so they never collide), so one
+    /// request in flight holds its notes against every other call. Absent in
+    /// files written before spends existed.
+    #[serde(default)]
+    spends: BTreeMap<String, PspSpendResponse>,
+    /// The PSP units burned as payments in finished spends: the sum of `pay`
+    /// over every answer ever stored in `spends`, kept apart from the answers
+    /// because answers of a retired keyset are pruned and the revenue must not
+    /// shrink with them. Saved in the same write as the answer it counts, so a
+    /// crash cannot count a payment twice or lose one. Absent in old files (0).
+    #[serde(default)]
+    paid: u64,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -628,11 +645,17 @@ impl Rollovers {
             .collect()
     }
 
-    /// Drop stored answers whose keyset was deleted.
+    /// The PSP units burned as payments by finished spends (see the field).
+    pub fn paid(&self) -> u64 {
+        self.paid
+    }
+
+    /// Drop stored answers (rollovers and spends) whose keyset was deleted.
     fn prune(&mut self, retired: impl Fn(&str) -> bool) {
-        let before = self.answers.len();
+        let before = self.answers.len() + self.spends.len();
         self.answers.retain(|_, a| !retired(&a.keyset));
-        if self.answers.len() != before {
+        self.spends.retain(|_, a| !retired(&a.keyset));
+        if self.answers.len() + self.spends.len() != before {
             let _ = self.save();
         }
     }
@@ -815,6 +838,271 @@ pub fn rollover(
         keys,
     };
     store.answers.insert(id.clone(), answer.clone());
+    store.pending.remove(&id);
+    store.burned.remove(&id);
+    store.holds.remove(&id);
+    store.save().map_err(Internal)?;
+    Ok(answer)
+}
+
+// ---- the spend --------------------------------------------------------------
+
+/// Why a spend was refused (`400`, with a code) or failed (`500`, retry).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SpendError {
+    /// Refused, with the `code` of the body. Nothing was burned.
+    Refused(&'static str, String),
+    /// Input `index` is already spent (`note_spent_elsewhere`, `spent: [index]`).
+    Spent(usize),
+    Internal(String),
+}
+
+fn refuse(code: &'static str, why: impl Into<String>) -> SpendError {
+    SpendError::Refused(code, why.into())
+}
+
+/// The checks of a spend that need neither the mint's keys nor its lock, cheapest
+/// first: how many notes, the memo, the keysets named, `pay`, then that the
+/// notes are worth the change plus `pay` exactly (in `u128`), then no note and
+/// no blind nonce twice. `max_items` is the most notes in and the most change
+/// outputs out (the rollover's `rollover.max_items`).
+pub fn check_spend_shape(req: &PspSpendRequest, max_items: usize) -> Result<(), SpendError> {
+    if req.inputs.is_empty() {
+        return Err(refuse("no_inputs", "a spend needs at least one note"));
+    }
+    if req.inputs.len() > max_items || req.outputs.len() > max_items {
+        return Err(refuse(
+            "too_many_items",
+            format!("a spend takes at most {max_items} notes and {max_items} change outputs"),
+        ));
+    }
+    if req.memo.len() > MAX_SPEND_MEMO_BYTES {
+        return Err(refuse(
+            "memo_too_long",
+            format!("the memo is at most {MAX_SPEND_MEMO_BYTES} bytes"),
+        ));
+    }
+    // The change needs a keyset to be signed with; a spend with no change has
+    // nothing to sign and needs none.
+    if req.input_keysets.len() != req.inputs.len()
+        || (!req.outputs.is_empty() && req.keyset.is_empty())
+    {
+        return Err(refuse(
+            sp_wire::codes::MISSING_KEYSET,
+            "every input needs its keyset (input_keysets) and the change needs one (keyset)",
+        ));
+    }
+    if req.pay == 0 {
+        return Err(refuse(
+            sp_wire::codes::NOTHING_TO_PAY,
+            "a spend must pay something: with pay 0 it is a rollover, which has its own call",
+        ));
+    }
+    let inputs: u128 = req.inputs.iter().map(|i| u128::from(i.amount.units)).sum();
+    let change: u128 = req.outputs.iter().map(|o| u128::from(o.amount.units)).sum();
+    if inputs != change + u128::from(req.pay) {
+        return Err(refuse(
+            sp_wire::codes::NOT_EXACT,
+            format!(
+                "the notes are worth {inputs}, the payment is {} and the change {change}: they must add up exactly",
+                req.pay
+            ),
+        ));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, input) in req.inputs.iter().enumerate() {
+        if !seen.insert(input.note.nonce) {
+            return Err(refuse(
+                "duplicate_input",
+                format!("input {i} is in the request twice"),
+            ));
+        }
+    }
+    let mut blinds = std::collections::HashSet::new();
+    for (o, output) in req.outputs.iter().enumerate() {
+        if !blinds.insert(output.blind_nonce) {
+            return Err(refuse(
+                "duplicate_blind_nonce",
+                format!("output {o} repeats a blind nonce"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Run a PSP spend. The caller holds the mint lock and the rotor.
+///
+/// It is a rollover (see [`rollover`]) whose outputs add up to the inputs less
+/// `pay`, and it takes the rollover's crash safety whole: the request is saved
+/// as pending, with the notes it holds, before anything is burned; the burn is
+/// recorded; the change is signed (a blind nonce already claimed is signed
+/// again, deterministically); and the answer is stored with `pay` added to the
+/// paid total in one write, only then is the reply made. A retry of the same
+/// request gets the stored answer; a retry after a crash finishes the request.
+///
+/// `pay` is burned and never reissued: the inputs are redeemed in full, the
+/// change is issued, and the difference is the mint's revenue.
+pub fn spend(
+    current: &MintLogic,
+    rotor: &Rotor,
+    store: &mut Rollovers,
+    req: &PspSpendRequest,
+    max_items: usize,
+) -> Result<PspSpendResponse, SpendError> {
+    use SpendError::*;
+    check_spend_shape(req, max_items)?;
+    for (i, input) in req.inputs.iter().enumerate() {
+        if !rotor.current.sk.contains_key(&input.amount) {
+            return Err(refuse(
+                "bad_denomination",
+                format!(
+                    "input {i}: {} is not a denomination of this mint",
+                    input.amount.units
+                ),
+            ));
+        }
+    }
+    for (o, output) in req.outputs.iter().enumerate() {
+        if !rotor.current.sk.contains_key(&output.amount) {
+            return Err(refuse(
+                "bad_denomination",
+                format!(
+                    "output {o}: {} is not a denomination of this mint",
+                    output.amount.units
+                ),
+            ));
+        }
+    }
+    // Answers for deleted keysets are of no use, so they go; a retry of one is
+    // answered from the spent list (`note_spent_elsewhere`).
+    store.prune(|k| rotor.is_retired(k));
+    let id = req.hash();
+    if let Some(done) = store.spends.get(&id) {
+        return Ok(done.clone());
+    }
+    let resumed = store.pending.contains_key(&id);
+    let proven = resumed && store.burned.contains(&id);
+    let others = store.held_nonces(&id);
+    let gen_of = |side: Side| -> (&MintLogic, &GenKeys) {
+        match side {
+            Side::Current => (current, &rotor.current),
+            Side::Previous => {
+                let (k, l) = rotor.previous.as_ref().expect("resolved");
+                (l, k)
+            }
+        }
+    };
+    // The change is signed by the live set the request names, current or
+    // previous (a spend with no change names none, and the answer names the
+    // current set). A set that is not live is refused, except for a request
+    // resumed after a crash, whose inputs are already burned: it is signed by
+    // the current set and the reply names it.
+    let (out_logic, out_keys) = if req.outputs.is_empty() {
+        (current, &rotor.current)
+    } else {
+        match rotor.resolve(&req.keyset) {
+            Ok(side) => gen_of(side),
+            Err(_) if resumed => (current, &rotor.current),
+            Err(e) => return Err(refuse(e.code(), e.why("the change"))),
+        }
+    };
+    let sighash = req.digest();
+    let mut plan: Vec<(&MintLogic, &SecretKey, &MintInput, bool)> = Vec::new();
+    for (i, input) in req.inputs.iter().enumerate() {
+        if others.contains(&hex::encode(input.note.nonce.0.serialize())) {
+            return Err(refuse(
+                sp_wire::codes::NOTE_HELD,
+                format!("input {i} is held by an unfinished request. Nothing was burned"),
+            ));
+        }
+        let (logic, keys) = match rotor.resolve(&req.input_keysets[i]) {
+            Ok(side) => gen_of(side),
+            // Started before its keyset was deleted: finished without burning
+            // only if the stored state proves this request burned it.
+            Err(_) if proven || rotor.burn_proven(input) => continue,
+            Err(e) if resumed => {
+                return Err(refuse(
+                    sp_wire::codes::BURN_NOT_PROVEN,
+                    format!(
+                        "input {i}: {}; this request was started before, but nothing stored proves its inputs were burned under this request, so it cannot be finished without them",
+                        e.why("its keyset")
+                    ),
+                ));
+            }
+            Err(e) => return Err(refuse(e.code(), e.why(&format!("input {i}")))),
+        };
+        logic.verify_note(input).map_err(|_| {
+            refuse(
+                "bad_note",
+                format!("input {i} is not a note of keyset {}", keys.id),
+            )
+        })?;
+        logic
+            .verify_spend_authorization(input, sighash)
+            .map_err(|_| {
+                refuse(
+                    "bad_spend_signature",
+                    format!("input {i}: the spend signature does not cover this request"),
+                )
+            })?;
+        let spent = logic
+            .is_spent(input.note.nonce)
+            .map_err(|e| Internal(e.to_string()))?;
+        if spent && !resumed {
+            return Err(Spent(i));
+        }
+        let sk = keys
+            .sk
+            .get(&input.amount)
+            .ok_or_else(|| refuse("bad_denomination", format!("input {i}: not a denomination")))?;
+        plan.push((logic, sk, input, spent));
+    }
+    if !resumed {
+        store.pending.insert(id.clone(), rotor.current.epoch);
+        store.holds.insert(
+            id.clone(),
+            req.inputs
+                .iter()
+                .map(|i| hex::encode(i.note.nonce.0.serialize()))
+                .collect(),
+        );
+        store.save().map_err(Internal)?;
+    }
+    for (logic, sk, input, spent) in plan {
+        if !spent {
+            logic
+                .redeem_with_key(sk, input, sighash)
+                .map_err(|e| Internal(e.to_string()))?;
+        }
+    }
+    if !proven {
+        store.burned.insert(id.clone());
+        store.save().map_err(Internal)?;
+    }
+    let mut outcomes = Vec::new();
+    let mut keys = Vec::new();
+    for o in &req.outputs {
+        let sk = &out_keys.sk[&o.amount];
+        let out = match out_logic.issue_with_key(sk, o) {
+            Ok(out) => out,
+            Err(mint_types::MintOutputError::BlindNonceAlreadyUsed) if resumed => {
+                MintOutputOutcome(bdhke::sign_message(sk, &o.blind_nonce.0))
+            }
+            Err(e) => return Err(Internal(e.to_string())),
+        };
+        outcomes.push(out);
+        keys.push(out_keys.pk[&o.amount]);
+    }
+    let answer = PspSpendResponse {
+        keyset: out_keys.id.clone(),
+        epoch: out_keys.epoch,
+        outcomes,
+        keys,
+        paid: req.pay,
+    };
+    // The answer and the payment it counts go in one write.
+    store.spends.insert(id.clone(), answer.clone());
+    store.paid = store.paid.saturating_add(req.pay);
     store.pending.remove(&id);
     store.burned.remove(&id);
     store.holds.remove(&id);

@@ -1,7 +1,7 @@
 //! The AIR listener: answers a wallet's requests over AIR, the only way wallets
 //! reach this mint. It always runs under `serve`. The calls are **mint info**
 //! (what `GET /health` reports), the keys calls, **keys**, **keysets** and
-//! **rotation**, **rollover** and **check-state**; the reply body is built by
+//! **rotation**, **rollover**, **check-state** and **spend**; the reply body is built by
 //! `server::air_served`. What is left on HTTP is local to the SPI and the
 //! operator: `/melt`, `/burns`, `/audit` and `/health`.
 //!

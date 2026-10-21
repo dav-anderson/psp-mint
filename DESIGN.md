@@ -282,9 +282,9 @@ It covers the BTC price moving between the payer working out the amount, the pri
 
 **Over** by no more than this: the mint keeps the excess; over by more: the whole excess is recorded as credit for the payer's DID. **Short:** the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid the mint signs those notes and keeps the remainder, otherwise it signs nothing and holds the payment as paid but unsettled. One setting for both directions.
 
-## The AIR listener (mint info, keys, keysets, rotation, rollover, check-state)
+## The AIR listener (mint info, keys, keysets, rotation, rollover, check-state, spend)
 
-These six are the calls a wallet makes. They were HTTP routes before 0.5.0 and are only AIR now; `/melt`, `/burns`, `/audit` and `/health` stay on a loopback HTTP server for the SPI and the operator.
+These seven are the calls a wallet makes. They were HTTP routes before 0.5.0 and are only AIR now; `/melt`, `/burns`, `/audit` and `/health` stay on a loopback HTTP server for the SPI and the operator.
 
 The long form is `air-sandbox/REQUEST-DESIGN.md` in sandbox-mint; the wire is `sp_wire::air_request`. What is specific to this mint:
 
@@ -301,6 +301,25 @@ The long form is `air-sandbox/REQUEST-DESIGN.md` in sandbox-mint; the wire is `s
 - **Cost.** A rollover runs on the listener's thread and holds the mint lock while it runs (a full 1000-note rollover verifies and signs in under a second in the test); the listener reads no further slots meanwhile, and the HTTP side waits for the lock as it does for the scanner. The reply cell, not the listener, carries the answer back, so a slow rollover delays other AIR requests.
 - **Privacy.** The request, body included, is sealed to the mint's DID, so the notes in a rollover are not visible to the AIR server; its size is.
 - **Test hook.** A panic in `serve` (for mint info, in the closure that builds the info) ends the listener thread the way a crash would, which is how the tests simulate a mint dying after it opened a request and before it replied.
+
+## The spend (AIR kind 14)
+
+A PSP spend with change is the one primitive that lets a wallet pay the SPI in PSP: notes in, change out, an amount `pay` that the mint burns. Before it, the mint's only swap was the rollover, which must return exactly the input amounts, and `/melt`, which is a loopback route the ESP mint uses for exchanges. Nothing in this section attaches a spend to another request; that and the wallet side come later.
+
+**Modelled on fsp-mint's spend** (kind 12): notes in, change out, an amount paid, a memo, and inputs = change + pay exactly, with a digest every input signs. It differs where psp-mint's structure does.
+
+- **Keysets are the rollover's.** Each input names its keyset (`input_keysets`) and is verified, and looked up in the spent list, of the keyset it names. The change is signed by the one live keyset `keyset` names, the current or the previous (fsp-mint always signs with its current set, so its digest has no such field). The digest covers that keyset and length-prefixes the input keysets.
+- **Spent lists are the mint's.** fsp-mint keeps its own spent lists in memory and a log per keyset, with group commit. The PSP's spent lists are mint-core's, one per generation, so a spend burns with `redeem_with_key` and signs with `issue_with_key`, as the rollover does, and takes the rollover's crash safety whole instead of a log of its own.
+- **Where the state lives.** In `rollovers.json`, beside the rollover answers and under the same lock order: new fields `spends` (answers by request hash) and `paid` (below), both `#[serde(default)]`, so a file written before spends reads as it did, and an older binary ignores the new fields. A spend uses the file's `pending`, `burned` and `holds` under its own hash (the digest and request hash have their own tags, `psp-mint/spend/v1` and `psp-mint/spend-request/v1`, so the hashes never meet a rollover's). That is what makes one request in flight hold its notes against every other call: a rollover, a `/melt` or another spend naming a held note is refused `note_held`.
+- **Ceilings are the rollover's** (`server.rollover_max_request_bytes`, `rollover.max_items`), and the memo's is the constant `MAX_SPEND_MEMO_BYTES` (256). A new setting for the spend can be added later; none was needed to make it possible to pay.
+- **The memo is not recorded with the burn.** `/burns` tells the ESP mint whether a note was burned under *its* memo; a memo chosen by a payer must not be able to look like one. The memo is only in the digest, which is what binds it.
+- **A spend with no change** (`outputs` empty) names no change keyset and is answered with the current one.
+
+**Check order, cheapest first, nothing burned before the last step:** shape and sizes with no lock (the note and change counts against the cap, the memo, the keysets named, `pay` > 0, then inputs = change + `pay` in `u128`, no note and no blind nonce twice); denominations; then under the mint lock the stored answer, the keysets, each note's proof and its spend signature over the digest, and the spent lists. A `pay` of 0 is refused `nothing_to_pay`: that request is a rollover.
+
+**Crash safety** is the rollover's, and the argument is the same, step by step. (1) The request is saved as pending, with the notes it holds, and synced, before any note is burned: a crash before this burns nothing and holds nothing. (2) The notes are burned one at a time; a crash in the middle leaves some burned, and the same request sent again finds them spent, skips them, and burns the rest (a note spent and not held by this request is refused before the pending entry is written, so a half-burned request can only be this one). (3) The burn is recorded under the request hash. (4) The change is signed; `issue_with_key` claims a blind nonce atomically with the issued total, so a crash after a claim and before the reply leaves the output counted once, and the retry signs it again (signing is deterministic) without counting it. (5) The answer is stored and `pay` is added to `paid` **in one write** (temp file, fsync, rename), and the pending entry is removed in the same write. So a crash between the burn and the stored answer leaves a pending request whose retry finishes it, and the payment is counted exactly when the answer is stored, never twice and never lost. If the input keyset is deleted at a rotation in between, the retry is finished only with proof of the burn (the `burned` mark, or the proof taken from the spent list when it was deleted), as for a rollover. A request pending forever (a payer that never retries) holds its notes; they are the payer's, who has the request.
+
+**The audit.** `/audit` has `paid`: the PSP units burned as payments by finished spends. It is a counter of its own, kept beside the answers because the answers of a deleted keyset are pruned and the revenue must not shrink with them. It is part of `redeemed` (the notes are redeemed whole and the change is issued, so `outstanding` falls by `pay`), and it is the only part of `redeemed` that is revenue: what the ESP mint burns through `/melt` for exchanges, and what a rollover burns and reissues, are in `redeemed` and not in `paid`. `pay` is never reissued and there is no reserve (decided 2026-10-21: the SPI's mints burn every PSP they are paid). A purchase (PSP issued for bitcoin) is never touched by any of this.
 
 ## Storage policy (setting only)
 
