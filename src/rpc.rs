@@ -82,11 +82,8 @@ impl Rpc {
         })
     }
 
-    pub fn from_cookie(url: &str, cookie_path: &Path) -> Result<Rpc, RpcError> {
-        Rpc::from_cookie_with_timeout(url, cookie_path, DEFAULT_TIMEOUT_SECS)
-    }
-
-    /// `from_cookie`, with each call allowed `timeout_secs`.
+    /// Read bitcoind's cookie file at `cookie_path` (`user:password`), with each
+    /// call allowed `timeout_secs`.
     pub fn from_cookie_with_timeout(
         url: &str,
         cookie_path: &Path,
@@ -130,17 +127,13 @@ impl Rpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn cookie_with_trailing_newline() {
+    fn the_cookie_file_is_parsed() {
         assert_eq!(
             parse_cookie("__cookie__:abc123\n"),
             Some(("__cookie__", "abc123"))
         );
-    }
-
-    #[test]
-    fn cookie_without_separator_is_rejected() {
+        // without the separator it is rejected
         assert_eq!(parse_cookie("abc123"), None);
     }
 }

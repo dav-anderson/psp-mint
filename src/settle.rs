@@ -276,6 +276,8 @@ pub struct Issue {
     /// can match a signature to the output it asked for even when some outputs
     /// were not signed.
     pub blind_nonces: Vec<BlindNonce>,
+    /// The PSP units of the outputs that were signed.
+    pub signed_units: u64,
     /// Requested units that were not signed because the payment was short. The
     /// mint keeps the value of the remainder.
     pub skipped_units: u64,
@@ -668,7 +670,8 @@ fn reject(
     Ok(Settlement::Rejected(why))
 }
 
-/// Advance one payment as far as it can go this run.
+/// Advance one payment as far as it can go this run, under the settlement
+/// `policy`: the [`Terms`] and the reconciliation fees.
 ///
 /// - At 1 confirmation the price is locked and stored. The first run that sees
 ///   the payment does this, even if it already has more confirmations (the
@@ -676,48 +679,14 @@ fn reject(
 /// - At 6 confirmations it is settled with the stored price, never a live one.
 /// - Every payment that gets a record is settled once, whether or not anything
 ///   is signed. A settled payment is not looked at again.
-pub fn settle(
-    logic: &MintLogic,
-    records: &mut Records,
-    received: &Received,
-    price: &mut dyn FnMut() -> Result<u64, String>,
-) -> Result<Settlement, SettleError> {
-    settle_with(logic, records, received, price, &Terms::default())
-}
-
-/// `settle` under the given settlement rules.
-pub fn settle_with(
-    logic: &MintLogic,
-    records: &mut Records,
-    received: &Received,
-    price: &mut dyn FnMut() -> Result<u64, String>,
-    terms: &Terms,
-) -> Result<Settlement, SettleError> {
-    settle_with_previous(logic, None, records, received, price, terms)
-}
-
-/// `settle_with`, for a mint that rotates. `previous` is the previous key set's
-/// ID and mint. A payload that names the previous set is signed by it, as every
-/// other request is; one that names the current set, no set, or a set that is
-/// no longer live (the BTC is already paid, and blinding does not depend on the
-/// key) is signed by `logic`, the current set. The settlement names the set that
-/// signed.
-pub fn settle_with_previous(
-    logic: &MintLogic,
-    previous: Option<(&str, &MintLogic)>,
-    records: &mut Records,
-    received: &Received,
-    price: &mut dyn FnMut() -> Result<u64, String>,
-    terms: &Terms,
-) -> Result<Settlement, SettleError> {
-    let policy = Policy {
-        terms: *terms,
-        fees: ReconcileTerms::default(),
-    };
-    settle_ruled(logic, previous, records, received, price, &policy)
-}
-
-/// `settle_with_previous` under the settlement terms and the reconciliation fees.
+///
+/// `logic` is the current key set's mint. `previous` is the previous key set's
+/// ID and mint, when the mint has one (a rotor that has not rotated yet has
+/// none). A payload that names the previous set is signed by it, as every other
+/// request is; one that names the current set, no set, or a set that is no
+/// longer live (the BTC is already paid, and blinding does not depend on the
+/// key) is signed by `logic`. The settlement names the set that signed.
+///
 /// A payment whose payload was already used by another is rejected as a duplicate
 /// (no delivery, no window). The first delivery's read cost comes off the paid
 /// value before it is assessed. The delivery of a purchase that opens a window
@@ -972,8 +941,7 @@ pub fn settle_ruled(
         .collect();
     // Keep what the payer is owed in the record, so that delivering it survives a
     // restart and an AIR server that is down. The purchase is issued by now, so a
-    // failure to write this is reported and does not undo it: the signatures are
-    // still in `describe`'s log.
+    // failure to write this is reported and does not undo it.
     let signatures: Vec<SignedOutput> = blind_nonces
         .iter()
         .zip(&results)
@@ -1002,13 +970,21 @@ pub fn settle_ruled(
     });
     if let Err(e) = records.put(txid, settled) {
         eprintln!(
-            "{txid}: issued, but what the payer is owed could not be stored ({e}); the signatures are in the log only"
+            "{txid}: issued, but what the payer is owed could not be stored ({e}); the signatures were not kept"
         );
     }
+    let signed_units: u64 = plan
+        .sign
+        .iter()
+        .zip(&results)
+        .filter(|(_, result)| result.is_ok())
+        .map(|(&i, _)| payload.outputs[i].amount.units)
+        .sum();
     Ok(Settlement::Issued(Issue {
         keyset: issuer_keyset,
         results,
         blind_nonces,
+        signed_units,
         skipped_units: plan.skipped_units,
         credit_cents: assessment.credit_cents,
         over_under_bps: assessment.over_under_bps,
@@ -1020,14 +996,16 @@ pub fn settle_ruled(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rotation::Rotor;
     use secp256k1::{PublicKey, SECP256K1, SecretKey};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
 
     // DID 0279be66..1798, then outputs 4 -> 3G and 1 -> 5G (5 units in all)
     const PAYLOAD_HEX: &str = "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179802000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
-    // The previous layout: a 10-byte reply ("reply-test") instead of a DID
-    const OLD_REPLY_PAYLOAD_HEX: &str = "0a7265706c792d7465737402000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
+    // A payload with a 10-byte reply ("reply-test") where a 33-byte DID belongs
+    const SHORT_REPLY_PAYLOAD_HEX: &str = "0a7265706c792d7465737402000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
 
     /// $10,000 per BTC, in cents. A unit is $0.10, so 1,000 sats is exactly 1
     /// unit: 100,000 sats is exactly 100 units and 5,000 sats is exactly 5 units
@@ -1050,17 +1028,13 @@ mod tests {
     fn any(_: Amount) -> bool {
         true
     }
-
     #[test]
     fn allowed_units_is_ten_cents_per_unit() {
         assert_eq!(allowed_units(100_000, BTC_10K), 100);
         assert_eq!(allowed_units(5_000, BTC_10K), 5);
         assert_eq!(allowed_units(100_000_000, BTC_10K), 100_000);
         assert_eq!(allowed_units(100_000_000, 8_167_355), 816_735);
-    }
-
-    #[test]
-    fn allowed_units_rounds_down_to_whole_units() {
+        // it rounds down to whole units
         assert_eq!(allowed_units(4_999, BTC_10K), 4);
         assert_eq!(allowed_units(999, BTC_10K), 0);
         assert_eq!(allowed_units(0, BTC_10K), 0);
@@ -1076,7 +1050,6 @@ mod tests {
             210_000_000_000_000_000
         );
     }
-
     #[test]
     fn over_under_is_reported_in_basis_points_of_the_request() {
         // 100 units requested, which is exactly 100,000 sats at $10,000
@@ -1084,10 +1057,7 @@ mod tests {
         assert_eq!(assess(112_500, BTC_10K, 100).over_under_bps, 1250);
         assert_eq!(assess(99_200, BTC_10K, 100).over_under_bps, -80);
         assert_eq!(assess(0, BTC_10K, 100).over_under_bps, -10_000);
-    }
-
-    #[test]
-    fn over_under_truncates_toward_zero() {
+        // it truncates toward zero:
         // 5 units requested, 5,499 sats is 9.98% over (998.0 bps, exact here)
         assert_eq!(assess(5_499, BTC_10K, 5).over_under_bps, 998);
         // 100 units, 100,001 sats is +0.001% = 0.1 bps, truncated to 0
@@ -1305,11 +1275,6 @@ mod tests {
     }
 
     #[test]
-    fn check_returns_the_total_requested() {
-        assert_eq!(check(any, &[out(4, 1), out(1, 2)]), Ok(5));
-    }
-
-    #[test]
     fn unknown_denomination_is_rejected() {
         assert_eq!(
             check(|a| a.units != 3, &[out(4, 1), out(3, 2)]),
@@ -1324,9 +1289,9 @@ mod tests {
             Err(Rejection::DuplicateBlindNonce)
         );
     }
-
     #[test]
     fn totals_are_exact_at_the_u64_limit() {
+        assert_eq!(check(any, &[out(4, 1), out(1, 2)]), Ok(5));
         let half = u64::MAX / 2;
         assert_eq!(check(any, &[out(half, 1), out(half, 2)]), Ok(u64::MAX - 1));
         assert_eq!(
@@ -1340,15 +1305,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn request_total_overflow_is_rejected() {
-        assert_eq!(
-            check(any, &[out(u64::MAX, 1), out(1, 2)]),
-            Err(Rejection::Overflow)
-        );
-    }
-
-    fn fixture(name: &str) -> (MintLogic, Records, PathBuf) {
+    fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("psp-mint-{}-{name}", {
             static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             format!(
@@ -1358,9 +1315,49 @@ mod tests {
             )
         }));
         let _ = fs::remove_dir_all(&dir);
-        let logic = crate::mint::open(&dir, Amount::from_units(1024)).unwrap();
+        dir
+    }
+
+    /// The mint the way `Settings::open_mint` opens it, with rotation off
+    /// (`rotation.activation_hours = 0`), and an empty record store.
+    fn fixture(name: &str) -> (MintLogic, Records, PathBuf) {
+        let dir = scratch(name);
+        let (_rotor, logic) = Rotor::open(&dir, Amount::from_units(1024), 0, 0).unwrap();
         let records = Records::open(&dir.join("settlements.json")).unwrap();
         (logic, records, dir)
+    }
+
+    /// A mint that has rotated once, as `serve` would find it an hour after the
+    /// first issuance: the current key set is generation 1, and generation 0 is
+    /// the previous one (in `rotor.previous`).
+    fn rotated(name: &str) -> (Rotor, MintLogic, Records, PathBuf) {
+        let dir = scratch(name);
+        let t = 10_000;
+        let (mut rotor, mut logic) =
+            Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, t).unwrap();
+        rotor.first_issue = Some(t);
+        rotor.clock.store(t + 3600, Ordering::SeqCst);
+        rotor.refresh(&mut logic).unwrap();
+        assert_eq!(rotor.current.epoch, 1);
+        assert_eq!(rotor.previous.as_ref().unwrap().0.epoch, 0);
+        let records = Records::open(&dir.join("settlements.json")).unwrap();
+        (rotor, logic, records, dir)
+    }
+
+    /// The previous key set as `service::settle_one` hands it to `settle_ruled`.
+    fn previous_of(rotor: &Rotor) -> Option<(&str, &MintLogic)> {
+        rotor
+            .previous
+            .as_ref()
+            .map(|(keys, logic)| (keys.id.as_str(), logic))
+    }
+
+    /// The default rules with these terms and no fees.
+    fn under(terms: Terms) -> Policy {
+        Policy {
+            terms,
+            ..Policy::default()
+        }
     }
 
     fn received(
@@ -1410,7 +1407,15 @@ mod tests {
         r: &Received,
         price: &mut Price,
     ) -> Settlement {
-        settle(logic, records, r, &mut || price.ask()).unwrap()
+        settle_ruled(
+            logic,
+            None,
+            records,
+            r,
+            &mut || price.ask(),
+            &Policy::default(),
+        )
+        .unwrap()
     }
 
     /// Settle the 4 + 1 payload naming `named` (`prev` is the previous set's
@@ -1419,11 +1424,10 @@ mod tests {
         case: &str,
         named: &dyn Fn(&str, &str) -> Option<String>,
     ) -> (String, String, String) {
-        let (current, mut records, _d1) = fixture(&format!("named-current-{case}"));
-        let (previous, _r2, _d2) = fixture(&format!("named-previous-{case}"));
+        let (rotor, current, mut records, dir) = rotated(&format!("named-{case}"));
         let (cur_id, prev_id) = (
             crate::rotation::keyset_id(current.public_keys()),
-            crate::rotation::keyset_id(previous.public_keys()),
+            rotor.previous.as_ref().unwrap().0.id.clone(),
         );
         assert_ne!(cur_id, prev_id);
         let mut p = payload::decode(&hex::decode(PAYLOAD_HEX).unwrap()).unwrap();
@@ -1436,16 +1440,17 @@ mod tests {
         );
         let mut price = Price::at(BTC_10K);
         let issue = issued(
-            settle_with_previous(
+            settle_ruled(
                 &current,
-                Some((&prev_id, &previous)),
+                previous_of(&rotor),
                 &mut records,
                 &r,
                 &mut || price.ask(),
-                &Terms::default(),
+                &Policy::default(),
             )
             .unwrap(),
         );
+        fs::remove_dir_all(&dir).unwrap();
         (issue.keyset, cur_id, prev_id)
     }
 
@@ -1632,7 +1637,7 @@ mod tests {
             run(&logic, &mut records, &garbage, &mut price),
             Settlement::Rejected(Rejection::BadPayload(_))
         ));
-        let old = received("cc", 6, 5_000, Some(OLD_REPLY_PAYLOAD_HEX));
+        let old = received("cc", 6, 5_000, Some(SHORT_REPLY_PAYLOAD_HEX));
         assert_eq!(
             run(&logic, &mut records, &old, &mut price),
             Settlement::Rejected(Rejection::BadPayload(DecodeError::WrongReplyLength))
@@ -1667,7 +1672,14 @@ mod tests {
         r: &Received,
         price: &mut Price,
     ) -> Result<Settlement, SettleError> {
-        settle(logic, records, r, &mut || price.ask())
+        settle_ruled(
+            logic,
+            None,
+            records,
+            r,
+            &mut || price.ask(),
+            &Policy::default(),
+        )
     }
 
     /// Make the next records write fail, the way a full disk or a crash during
@@ -1739,10 +1751,13 @@ mod tests {
         assert_eq!(rec.credit_cents, 0);
         assert!(rec.reason.is_some());
         assert_eq!(total(&logic), Amount::ZERO);
-        // it is on the payer's account, not looked at again, and not retried
-        let owed = records.owed_to(DID_HEX);
-        assert_eq!(owed.len(), 1);
-        assert_eq!(owed[0].0, "aa");
+        // it is open on the payer's account (inside its window, counted in
+        // /audit's open payments with the bitcoin held for it), not looked at
+        // again, and not retried
+        assert!(rec.is_open());
+        assert!(rec.open_until.is_some());
+        let open = records.reconciliation().open;
+        assert_eq!((open.payments, open.sats, open.credit_cents), (1, 3_500, 0));
         assert!(records.unsettled().is_empty());
         assert_eq!(
             run(&logic, &mut records, &r, &mut price),
@@ -1768,7 +1783,7 @@ mod tests {
         // with it on (the default) this payment is within 1% and settles in full.
         let r = received("aa", 6, 4_999, Some(PAYLOAD_HEX));
         assert!(matches!(
-            settle_with(&logic, &mut records, &r, &mut || price.ask(), &strict()).unwrap(),
+            ruled(&logic, &mut records, &r, &mut price, &under(strict())),
             Settlement::PaidUnsettled(_)
         ));
         assert_eq!(total(&logic), Amount::ZERO);
@@ -1786,8 +1801,11 @@ mod tests {
         assert_eq!(issue.results.len(), 2);
         assert_eq!(issue.credit_cents, 0);
         assert_eq!(issue.over_under_bps, 1000);
-        assert_eq!(records.get("aa").unwrap().credit_cents, 0);
-        assert!(records.owed_to(DID_HEX).is_empty());
+        let rec = records.get("aa").unwrap();
+        assert_eq!(rec.credit_cents, 0);
+        // nothing is owed: no window was opened
+        assert!(!rec.is_open());
+        assert_eq!(rec.open_until, None);
         assert_eq!(total(&logic), Amount::from_units(5));
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
@@ -1808,7 +1826,11 @@ mod tests {
         let rec = records.get("aa").unwrap();
         assert_eq!(rec.credit_cents, 10);
         assert_eq!(rec.payer_did.as_deref(), Some(DID_HEX));
-        assert_eq!(records.owed_to(DID_HEX).len(), 1);
+        // the credit is open for the payer to claim
+        assert!(rec.is_open());
+        assert!(rec.open_until.is_some());
+        let open = records.reconciliation().open;
+        assert_eq!((open.payments, open.credit_cents), (1, 10));
         assert_eq!(total(&logic), Amount::from_units(5));
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
@@ -1827,7 +1849,13 @@ mod tests {
         // the write that would record the settlement fails
         block_records_writes(&dir);
         let settled = received("aa", 6, 4_300, Some(PAYLOAD_HEX));
-        assert!(try_run(&logic, &mut records, &settled, &mut price).is_err());
+        assert!(
+            matches!(
+                try_run(&logic, &mut records, &settled, &mut price),
+                Err(SettleError::Records(RecordsError::Io(_)))
+            ),
+            "the failed write is a records I/O error"
+        );
         assert_eq!(total(&logic), Amount::ZERO);
         assert_eq!(records.get("aa").unwrap().status, Status::Locked);
         // the retry settles it, once
@@ -1852,7 +1880,13 @@ mod tests {
         run(&logic, &mut records, &seen, &mut price);
         block_records_writes(&dir);
         let settled = received("aa", 6, 3_500, Some(PAYLOAD_HEX));
-        assert!(try_run(&logic, &mut records, &settled, &mut price).is_err());
+        assert!(
+            matches!(
+                try_run(&logic, &mut records, &settled, &mut price),
+                Err(SettleError::Records(RecordsError::Io(_)))
+            ),
+            "the failed write is a records I/O error"
+        );
         assert_eq!(records.get("aa").unwrap().status, Status::Locked);
         assert_eq!(total(&logic), Amount::ZERO);
         // still waiting to settle, so the next scan picks it up again
@@ -1862,7 +1896,9 @@ mod tests {
             run(&logic, &mut records, &settled, &mut price),
             Settlement::PaidUnsettled(_)
         ));
-        assert_eq!(records.owed_to(DID_HEX).len(), 1);
+        let rec = records.get("aa").unwrap();
+        assert_eq!(rec.status, Status::PaidUnsettled);
+        assert!(rec.is_open());
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1876,11 +1912,15 @@ mod tests {
             run(&logic, &mut records, &r, &mut price),
             Settlement::PaidUnsettled(_)
         ));
+        let until = records.get("aa").unwrap().open_until;
+        assert!(until.is_some());
         // the process dies; a new one opens the same files
         drop(records);
         let mut records = Records::open(&dir.join("settlements.json")).unwrap();
-        assert_eq!(records.get("aa").unwrap().status, Status::PaidUnsettled);
-        assert_eq!(records.owed_to(DID_HEX).len(), 1);
+        let rec = records.get("aa").unwrap();
+        assert_eq!(rec.status, Status::PaidUnsettled);
+        assert!(rec.is_open());
+        assert_eq!(rec.open_until, until);
         assert_eq!(
             run(&logic, &mut records, &r, &mut price),
             Settlement::AlreadySettled(Status::PaidUnsettled)
@@ -1909,38 +1949,6 @@ mod tests {
             Settlement::AlreadySettled(Status::Issued)
         );
         assert_eq!(total(&logic), Amount::ZERO);
-        drop(logic);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_request_cannot_be_claimed_twice_by_a_duplicate_payment() {
-        let (logic, mut records, dir) = fixture("claim-twice");
-        let mut price = Price::at(BTC_10K);
-        // payment aa signs the 4 and drops the 1
-        let first = received("aa", 6, 4_300, Some(PAYLOAD_HEX));
-        issued(run(&logic, &mut records, &first, &mut price));
-        assert_eq!(total(&logic), Amount::from_units(4));
-        // the same payment again signs nothing more
-        assert_eq!(
-            run(&logic, &mut records, &first, &mut price),
-            Settlement::AlreadySettled(Status::Issued)
-        );
-        // a second payment carrying the same payload is a duplicate payment,
-        // whatever it pays: it signs nothing, has no delivery and no window. (A
-        // different payload that reuses a signed blind nonce is the case of
-        // `a_reused_blind_nonce_rejects_the_whole_payment_and_is_recorded`.)
-        let second = received("bb", 6, 9_000, Some(PAYLOAD_HEX));
-        assert_eq!(
-            run(&logic, &mut records, &second, &mut price),
-            Settlement::Rejected(Rejection::DuplicatePayment)
-        );
-        assert_eq!(total(&logic), Amount::from_units(4));
-        let dup = records.get("bb").unwrap();
-        assert_eq!(dup.status, Status::Rejected);
-        assert_eq!(dup.duplicate_of.as_deref(), Some("aa"));
-        assert!(dup.delivery.is_none());
-        assert_eq!(dup.open_until, None);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2025,21 +2033,20 @@ mod tests {
 
     #[test]
     fn the_delivery_names_both_live_keysets_when_the_mint_rotates() {
-        let (current, mut records, _d1) = fixture("delivery-cur");
-        let (previous, _r2, _d2) = fixture("delivery-prev");
+        let (rotor, current, mut records, dir) = rotated("delivery-rotated");
         let (cur_id, prev_id) = (
             crate::rotation::keyset_id(current.public_keys()),
-            crate::rotation::keyset_id(previous.public_keys()),
+            rotor.previous.as_ref().unwrap().0.id.clone(),
         );
         let r = received("aa", 6, 5_000, Some(PAYLOAD_HEX));
         let mut price = Price::at(BTC_10K);
-        settle_with_previous(
+        settle_ruled(
             &current,
-            Some((&prev_id, &previous)),
+            previous_of(&rotor),
             &mut records,
             &r,
             &mut || price.ask(),
-            &Terms::default(),
+            &Policy::default(),
         )
         .unwrap();
         let d = records.get("aa").unwrap().delivery.clone().unwrap();
@@ -2049,6 +2056,7 @@ mod tests {
         assert_eq!(signed.keysets.current, cur_id);
         assert_eq!(signed.keysets.previous.as_deref(), Some(prev_id.as_str()));
         assert_eq!(signed.keysets.keysets.len(), 2);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2202,7 +2210,7 @@ mod tests {
         let mut price = Price::at(BTC_10K);
         let mut go = |records: &mut Records, txid: &str, sats: u64, payload: &str| {
             let r = received(txid, 6, sats, Some(payload));
-            settle_with(&logic, records, &r, &mut || price.ask(), &terms).unwrap()
+            ruled(&logic, records, &r, &mut price, &under(terms))
         };
         // exact: closed, no window, and the signed record says nothing is owed
         go(&mut records, "aa", 5_000, PAYLOAD_HEX);
@@ -2243,7 +2251,7 @@ mod tests {
         let mut price = Price::at(BTC_10K);
         let mut go = |records: &mut Records, confirmations: u32| {
             let r = received("cc", confirmations, 5_000, Some(PAYLOAD_HEX));
-            settle_with(&logic, records, &r, &mut || price.ask(), &terms).unwrap()
+            ruled(&logic, records, &r, &mut price, &under(terms))
         };
         assert_eq!(
             go(&mut records, 1),
@@ -2318,9 +2326,9 @@ mod tests {
         // zero means only an exact payment is exact
         assert!(assess_with(65_000, BTC_10K, 65, &strict()).within_tolerance);
     }
-
     #[test]
-    fn nine_tenths_of_a_percent_under_settles_in_full() {
+    fn within_the_tolerance_either_way_settles_in_full_with_no_credit() {
+        // 0.9% under: the 65-unit request is settled in full as if exact
         let (logic, mut records, dir) = fixture("tol-under");
         let mut price = Price::at(BTC_10K);
         let r = received("aa", 6, 64_415, Some(&big_payload()));
@@ -2338,10 +2346,8 @@ mod tests {
         assert_eq!(total(&logic), Amount::from_units(65));
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
-    }
 
-    #[test]
-    fn nine_tenths_of_a_percent_over_settles_in_full_with_no_credit() {
+        // 0.9% over: also in full, and the excess is kept, not credited
         let (logic, mut records, dir) = fixture("tol-over");
         let mut price = Price::at(BTC_10K);
         let r = received("aa", 6, 65_585, Some(&big_payload()));
@@ -2351,7 +2357,10 @@ mod tests {
         assert_eq!(issue.credit_cents, 0);
         assert!(issue.within_tolerance);
         assert_eq!(issue.over_under_bps, 90);
-        assert!(records.owed_to(&hex::encode([7u8; 33])).is_empty());
+        // nothing is owed: no window was opened
+        let rec = records.get("aa").unwrap();
+        assert!(!rec.is_open());
+        assert_eq!(rec.open_until, None);
         assert_eq!(total(&logic), Amount::from_units(65));
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
@@ -2405,8 +2414,7 @@ mod tests {
             ..Terms::default()
         };
         let r = received("bb", 6, 65_715, Some(&big_payload()));
-        let issue =
-            issued(settle_with(&logic, &mut records, &r, &mut || price.ask(), &tight).unwrap());
+        let issue = issued(ruled(&logic, &mut records, &r, &mut price, &under(tight)));
         assert_eq!(issue.credit_cents, 7);
         assert!(!issue.within_tolerance);
         assert_eq!(records.get("bb").unwrap().credit_cents, 7);
@@ -2746,6 +2754,35 @@ mod tests {
             ),
             Settlement::AlreadySettled(Status::Rejected)
         );
+        drop(logic);
+        fs::remove_dir_all(&dir).unwrap();
+
+        // the first issued: payment aa signs the 4 and drops the 1
+        let (logic, mut records, dir) = fixture("claim-twice");
+        let mut price = Price::at(BTC_10K);
+        let first = received("aa", 6, 4_300, Some(PAYLOAD_HEX));
+        issued(run(&logic, &mut records, &first, &mut price));
+        assert_eq!(total(&logic), Amount::from_units(4));
+        // the same payment again signs nothing more
+        assert_eq!(
+            run(&logic, &mut records, &first, &mut price),
+            Settlement::AlreadySettled(Status::Issued)
+        );
+        // a second payment carrying the same payload is a duplicate payment,
+        // whatever it pays: it signs nothing, has no delivery and no window. (A
+        // different payload that reuses a signed blind nonce is the case of
+        // `a_reused_blind_nonce_rejects_the_whole_payment_and_is_recorded`.)
+        let second = received("bb", 6, 9_000, Some(PAYLOAD_HEX));
+        assert_eq!(
+            run(&logic, &mut records, &second, &mut price),
+            Settlement::Rejected(Rejection::DuplicatePayment)
+        );
+        assert_eq!(total(&logic), Amount::from_units(4));
+        let dup = records.get("bb").unwrap();
+        assert_eq!(dup.status, Status::Rejected);
+        assert_eq!(dup.duplicate_of.as_deref(), Some("aa"));
+        assert!(dup.delivery.is_none());
+        assert_eq!(dup.open_until, None);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }

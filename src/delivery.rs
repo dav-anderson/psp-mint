@@ -6,10 +6,10 @@
 //! **What is kept and when.** When a purchase is issued or rejected, `settle`
 //! stores what the payer is owed in the purchase's record (`records::Delivery`:
 //! the reply DID, the purchase id and the outcome, with `delivered` false). That
-//! is the only copy of the signatures; `describe` just logs them. This module
-//! writes it.
+//! is the only copy of the signatures: the scan log prints only counts and
+//! units. This module writes it.
 //!
-//! **Retry.** [`Deliverer::pass`] runs after every scan (and so also on every
+//! **Retry.** [`Deliverer::pass_shared`] runs after every scan (and so also on every
 //! pass of `serve`, whether or not the scan worked) and writes every record that
 //! is not stored yet. A write that fails is tried again after a wait that doubles
 //! from [`FIRST_RETRY_SECS`] to [`LONGEST_RETRY_SECS`]; the waits are kept in
@@ -59,7 +59,7 @@ struct Wait {
     next: Instant,
 }
 
-/// What one [`Deliverer::pass`] did.
+/// What one [`Deliverer::pass_shared`] did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Report {
     /// Records now stored (written, or found stored already).
@@ -94,21 +94,11 @@ impl Deliverer {
     }
 
     /// Write every record that is not stored yet and whose wait is over, at time
-    /// `now`. Never fails: what went wrong is printed and counted.
-    pub fn pass(&mut self, records: &mut Records, now: Instant) -> Report {
-        let (jobs, mut report) = self.plan(records, now);
-        if jobs.is_empty() {
-            return report;
-        }
-        let outcomes = self.write(&jobs);
-        self.apply(records, &jobs, outcomes, now, &mut report);
-        report
-    }
-
-    /// [`Deliverer::pass`] for the records the AIR listener shares. The records
-    /// lock is held to prepare the records (a local file) and again to mark them
-    /// stored, and **not while they are written to the AIR server**, so a
-    /// reconciliation request never waits for the network.
+    /// `now`, in the records the AIR listener shares. Never fails: what went wrong
+    /// is printed and counted. The records lock is held to prepare the records (a
+    /// local file) and again to mark them stored, and **not while they are written
+    /// to the AIR server**, so a reconciliation request never waits for the
+    /// network.
     pub fn pass_shared(&mut self, records: &Mutex<Records>, now: Instant) -> Report {
         let Some(mut guard) = lock(records) else {
             return Report::default();

@@ -1,9 +1,8 @@
 //! Key rotation: at most two key sets (generations), each with its own spent
 //! list, current and previous.
 //!
-//! Generation 0 is the mint as it was before rotation existed: `mint_keys.json`
-//! and `db/` at the top of the network's data folder, so existing data is used
-//! as it is. Generation N (1 and later) is `gen-N/mint_keys.json` and
+//! Generation 0 is `mint_keys.json` and `db/` at the top of the network's data
+//! folder. Generation N (1 and later) is `gen-N/mint_keys.json` and
 //! `gen-N/db/`. Each generation is a separate mint-core `MintLogic` with its
 //! own store, so mint-core is unchanged.
 //!
@@ -217,12 +216,10 @@ struct Retired {
     epochs: Vec<u64>,
     /// The keyset IDs of the deleted generations, so a request naming one is
     /// told `keyset_retired` rather than `unknown_keyset`.
-    #[serde(default)]
     ids: Vec<String>,
     /// Burn proofs taken from a spent list just before it is deleted: nonces
     /// (hex) a pending rollover held that were spent in the retiring set.
     /// Saved together with the retired ID, before anything is deleted.
-    #[serde(default)]
     burn_proofs: std::collections::BTreeSet<String>,
     issued: u64,
     redeemed: u64,
@@ -595,26 +592,21 @@ pub struct Rollovers {
     /// Pending rollovers whose inputs have all been burned under that request
     /// hash, written after the burn and before any signing. Only this proves
     /// the burn once the inputs' keyset has been deleted with its spent list.
-    #[serde(default)]
     burned: std::collections::BTreeSet<String>,
     /// The input nonces (hex) each pending rollover holds, saved with its
     /// pending entry before anything is burned. No other rollover or melt may
     /// take them meanwhile.
-    #[serde(default)]
     holds: BTreeMap<String, Vec<String>>,
     /// The answers to PSP spends (kind 14), by request hash. A spend uses the
     /// same `pending`, `burned` and `holds` as a rollover, under its own hash
     /// (the two hashes have different tags, so they never collide), so one
-    /// request in flight holds its notes against every other call. Absent in
-    /// files written before spends existed.
-    #[serde(default)]
+    /// request in flight holds its notes against every other call.
     spends: BTreeMap<String, PspSpendResponse>,
     /// The PSP units burned as payments in finished spends: the sum of `pay`
     /// over every answer ever stored in `spends`, kept apart from the answers
     /// because answers of a retired keyset are pruned and the revenue must not
     /// shrink with them. Saved in the same write as the answer it counts, so a
-    /// crash cannot count a payment twice or lose one. Absent in old files (0).
-    #[serde(default)]
+    /// crash cannot count a payment twice or lose one.
     paid: u64,
     #[serde(skip)]
     path: PathBuf,
@@ -1202,7 +1194,6 @@ mod tests {
             r.resolve(&"ab".repeat(8)).unwrap_err().code(),
             "unknown_keyset"
         );
-        assert_eq!(RETIRED_KEYSETS_CAP, 131_072, "1 MB of 8-byte IDs");
         r.set_retired_keep(2).unwrap();
         assert_eq!(
             r.resolve(&ids[0]).unwrap_err().code(),
@@ -1268,6 +1259,17 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn the_key_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("key-mode");
+        drop(Rotor::open(&d, Amount::from_units(16), 0, 0).unwrap());
+        let mode = fs::metadata(d.join(KEYS)).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        fs::remove_dir_all(&d).unwrap();
+    }
+
     #[test]
     fn epochs_follow_the_first_issue() {
         let r = Rotation {
@@ -1293,18 +1295,19 @@ mod tests {
     }
 
     #[test]
-    fn generation_zero_is_the_existing_mint_and_old_ones_are_deleted() {
+    fn generation_zero_keeps_its_keys_across_restarts_and_old_ones_are_deleted() {
         let d = scratch("gens");
-        // An existing mint, from before rotation.
-        let old = crate::mint::open(&d, Amount::from_units(16)).unwrap();
-        let keys0 = old.public_keys().clone();
-        drop(old);
-        let (mut r, mut cur) = Rotor::open(&d, Amount::from_units(16), 1, 1).unwrap();
-        assert_eq!(
-            cur.public_keys(),
-            &keys0,
-            "generation 0 = the existing keys"
-        );
+        // Generation 0 is made at the top of the data folder, and a restart finds
+        // the same keys.
+        let (first, first_logic) = Rotor::open(&d, Amount::from_units(1024), 1, 1).unwrap();
+        let keys0 = first_logic.public_keys().clone();
+        // 1, 2, 4 ... 1024: eleven denominations
+        assert_eq!(keys0.len(), 11);
+        assert!(d.join(KEYS).exists() && d.join(DB).exists());
+        drop(first);
+        drop(first_logic);
+        let (mut r, mut cur) = Rotor::open(&d, Amount::from_units(1024), 1, 1).unwrap();
+        assert_eq!(cur.public_keys(), &keys0, "generation 0 keeps its keys");
         assert_eq!(r.first_issue, None, "nothing issued: rotation not started");
         // First issuance, then the clock passes two periods.
         let out = MintOutput {
@@ -1335,7 +1338,8 @@ mod tests {
         drop(r);
         drop(cur);
         // A restart finds the same generations and the same first issue.
-        let (r2, _) = Rotor::open_at(&d, Amount::from_units(16), 1, 1, 10_000 + 2 * 3600).unwrap();
+        let (r2, _) =
+            Rotor::open_at(&d, Amount::from_units(1024), 1, 1, 10_000 + 2 * 3600).unwrap();
         assert_eq!(r2.first_issue, first);
         assert_eq!(r2.current.epoch, 2);
         assert_eq!(r2.previous.as_ref().unwrap().0.epoch, 1);

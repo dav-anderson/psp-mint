@@ -21,10 +21,11 @@
 //!   under. The ESP mint uses this to tell, on a retry, a note it burned itself
 //!   from a note that was burned by someone else.
 //! - `GET /audit`: issued, redeemed and outstanding totals, `paid` (the PSP units
-//!   burned as payments by PSP spends, kept apart from every other burn), and (when `serve`
-//!   gives the router the settlement records) `reconciliation`: the payments
+//!   burned as payments by PSP spends, kept apart from every other burn), `network`,
+//!   and `reconciliation`, read from the settlement records: the payments
 //!   held open and the payments forfeited, each with a count, the sats of the
-//!   ones that got no notes and the USD cents of credit on the ones that did.
+//!   ones that got no notes and the USD cents of credit on the ones that did, and
+//!   what reconciliation has settled, cost and kept (see `records::Reconciliation`).
 //! - `GET /health`: `200` while the scanner is keeping up and the mint lock is
 //!   sound, `503` otherwise, with the time of the last successful scan.
 //!
@@ -118,34 +119,24 @@ pub struct Health {
     started: u64,
     last_scan: AtomicU64,
     stale_after_secs: u64,
-    network: Option<String>,
+    network: String,
 }
 
 impl Health {
-    /// `stale_after_secs`: how long without a successful pass before `/health`
-    /// reports a failure.
-    pub fn new(stale_after_secs: u64) -> Arc<Self> {
-        Arc::new(Health {
-            started: now_secs(),
-            last_scan: AtomicU64::new(0),
-            stale_after_secs,
-            network: None,
-        })
-    }
-
-    /// As [`Health::new`], for a mint on `network`. `/health` and `/audit` then
-    /// report it as `"network"`.
+    /// The health of a mint on `network`; `/health` and `/audit` report it as
+    /// `"network"`. `stale_after_secs`: how long without a successful pass before
+    /// `/health` reports a failure.
     pub fn for_network(stale_after_secs: u64, network: &str) -> Arc<Self> {
         Arc::new(Health {
             started: now_secs(),
             last_scan: AtomicU64::new(0),
             stale_after_secs,
-            network: Some(network.to_string()),
+            network: network.to_string(),
         })
     }
 
-    pub fn network(&self) -> Option<&str> {
-        self.network.as_deref()
+    pub fn network(&self) -> &str {
+        &self.network
     }
 
     pub fn record_scan(&self) {
@@ -166,14 +157,13 @@ impl Health {
 
     /// What `/health` reports, as the body of a mint-info reply over AIR
     /// (`status`, `wire_version`, `network`): the same values as
-    /// [`Health::report`] at time `now`, and no status code. A mint with no
-    /// network (a test mint) reports an empty one.
+    /// [`Health::report`] at time `now`, and no status code.
     pub fn mint_info(&self, lock_poisoned: bool, now: u64) -> sp_wire::air_request::MintInfo {
         let (_, body) = self.report(lock_poisoned, now);
         sp_wire::air_request::MintInfo {
             status: body["status"].as_str().unwrap_or("unknown").to_string(),
             wire_version: sp_wire::WIRE_VERSION,
-            network: self.network.clone().unwrap_or_default(),
+            network: self.network.clone(),
         }
     }
 
@@ -197,16 +187,14 @@ impl Health {
             "ok" | "starting" => StatusCode::OK,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         };
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "status": status,
             "last_scan_unix": last,
             "seconds_since_last_scan": age,
             "stale_after_secs": self.stale_after_secs,
             "wire_version": sp_wire::WIRE_VERSION,
+            "network": self.network,
         });
-        if let Some(n) = &self.network {
-            body["network"] = serde_json::Value::String(n.clone());
-        }
         (code, body)
     }
 }
@@ -234,21 +222,18 @@ async fn health_handler(
     (code, Json(body))
 }
 
-/// Add `"reconciliation"` to a JSON object reply (`/audit`), when the router was
-/// given the settlement records: the payments held open (inside their window) and
-/// the payments forfeited (the window closed unsettled; the mint keeps the BTC),
-/// kept apart from the issued, redeemed and outstanding totals. The records are
-/// read when the report is asked for, so it is as current as the last write. A
+/// Add `"reconciliation"` to a JSON object reply (`/audit`): the payments held
+/// open (inside their window) and the payments forfeited (the window closed
+/// unsettled; the mint keeps the BTC), kept apart from the issued, redeemed and
+/// outstanding totals, with the fees and the rounding counted. The records file
+/// is read when the report is asked for, so it is as current as the last write. A
 /// file that cannot be read leaves the section out and says so on the log.
 async fn add_reconciliation(
-    State(records): State<Option<Arc<PathBuf>>>,
+    State(path): State<Arc<PathBuf>>,
     request: Request,
     next: Next,
 ) -> Response {
     let response = next.run(request).await;
-    let Some(path) = records else {
-        return response;
-    };
     if !response.status().is_success() {
         return response;
     }
@@ -274,16 +259,9 @@ async fn add_reconciliation(
     }
 }
 
-/// Add `"network"` to a JSON object reply (`/audit`), when the mint has one.
-async fn add_network(
-    State(network): State<Option<String>>,
-    request: Request,
-    next: Next,
-) -> Response {
+/// Add `"network"` to a JSON object reply (`/audit`).
+async fn add_network(State(network): State<String>, request: Request, next: Next) -> Response {
     let response = next.run(request).await;
-    let Some(network) = network else {
-        return response;
-    };
     let (mut parts, body) = response.into_parts();
     let Ok(bytes) = axum::body::to_bytes(body, 1 << 20).await else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -308,25 +286,17 @@ pub enum MeltFailure {
     Internal(String),
 }
 
-/// Burn `inputs` bound to `memo`, and keep the memo of the burn.
+/// Burn `inputs` bound to `memo`, and keep the memo of the burn, over the
+/// current generation and, when the mint rotates, the previous one.
 ///
 /// The memo is written, and synced, for every input that is not yet spent,
 /// before the mint burns anything. The caller holds the mint lock across the
 /// whole call, so no other burn can come between the record and the burn.
-pub fn melt_recording(
-    logic: &MintLogic,
-    log: &mut MeltLog,
-    inputs: &[MintInput],
-    memo: &str,
-) -> Result<Amount, MeltFailure> {
-    melt_recording_gens(logic, None, log, inputs, memo, &vec![false; inputs.len()])
-}
-
-/// [`melt_recording`] over the current generation and, when the mint rotates,
-/// the previous one. A melt whose notes are all current is mint-core's
-/// `melt`. One with notes of the previous set is checked whole first (each note
-/// against its own set and spent list, every spend signature over the one
-/// `melt_sighash`), then each note is burned in its own set.
+///
+/// A melt whose notes are all current is mint-core's `melt`. One with notes of
+/// the previous set is checked whole first (each note against its own set and
+/// spent list, every spend signature over the one `melt_sighash`), then each
+/// note is burned in its own set.
 pub fn melt_recording_gens(
     logic: &MintLogic,
     previous: Option<(
@@ -402,11 +372,6 @@ pub fn melt_recording_gens(
     Ok(total)
 }
 
-/// The state of each note, for `POST /burns`. The caller holds the mint lock.
-pub fn burns(logic: &MintLogic, log: &MeltLog, nonces: &[Nonce]) -> Result<Vec<Burn>, String> {
-    burns_gens(logic, None, log, nonces)
-}
-
 /// Spent in the current or the previous set.
 fn spent_in(logic: &MintLogic, prev: Option<&MintLogic>, nonce: Nonce) -> Result<bool, String> {
     Ok(logic.is_spent(nonce).map_err(|e| e.to_string())?
@@ -416,7 +381,9 @@ fn spent_in(logic: &MintLogic, prev: Option<&MintLogic>, nonce: Nonce) -> Result
         })
 }
 
-/// [`burns`] over both live generations.
+/// The state of each note, for `POST /burns`: spent in the current generation or,
+/// when the mint rotates, the previous one, and the memo it was burned under. The
+/// caller holds the mint lock.
 pub fn burns_gens(
     logic: &MintLogic,
     prev: Option<&MintLogic>,
@@ -453,7 +420,7 @@ fn coded(status: StatusCode, code: &str, message: impl ToString) -> ApiFailure {
     )
 }
 
-type MeltState = (Arc<AppState>, SharedMelts, Option<SharedRotating>);
+type MeltState = (Arc<AppState>, SharedMelts, SharedRotating);
 
 fn poisoned() -> ApiFailure {
     failure(
@@ -464,10 +431,9 @@ fn poisoned() -> ApiFailure {
 
 /// Lock the rotor (after the mint) and rotate as far as the clock says.
 fn rotor_of<'a>(
-    rot: &'a Option<SharedRotating>,
+    rot: &'a SharedRotating,
     logic: &mut MintLogic,
-) -> Result<Option<std::sync::MutexGuard<'a, Rotor>>, ApiFailure> {
-    let Some(rot) = rot else { return Ok(None) };
+) -> Result<std::sync::MutexGuard<'a, Rotor>, ApiFailure> {
     let mut g = rot.rotor.lock().map_err(|_| poisoned())?;
     g.refresh(logic).map_err(|e| {
         failure(
@@ -475,7 +441,7 @@ fn rotor_of<'a>(
             format!("key rotation failed: {e}"),
         )
     })?;
-    Ok(Some(g))
+    Ok(g)
 }
 
 async fn melt_handler(
@@ -509,46 +475,33 @@ async fn melt_handler(
     }
     let mut on_previous = Vec::with_capacity(keysets.len());
     for (i, k) in keysets.iter().enumerate() {
-        let side = match &rotor {
-            Some(r) => r.resolve(k).map_err(|e| {
-                coded(
-                    StatusCode::BAD_REQUEST,
-                    e.code(),
-                    e.why(&format!("input {i}")),
-                )
-            })?,
-            None if *k == crate::rotation::keyset_id(logic.public_keys()) => {
-                crate::rotation::Side::Current
-            }
-            None => {
-                let e = crate::rotation::KeysetError::Unknown(k.clone());
-                return Err(coded(
-                    StatusCode::BAD_REQUEST,
-                    e.code(),
-                    e.why(&format!("input {i}")),
-                ));
-            }
-        };
+        let side = rotor.resolve(k).map_err(|e| {
+            coded(
+                StatusCode::BAD_REQUEST,
+                e.code(),
+                e.why(&format!("input {i}")),
+            )
+        })?;
         on_previous.push(side == crate::rotation::Side::Previous);
     }
     // A note a pending rollover holds is that rollover's to burn.
-    if let Some(r) = &rot {
-        let held = r.rollovers.lock().map_err(|_| poisoned())?.held_nonces("");
-        if let Some(i) = req
-            .inputs
-            .iter()
-            .position(|n| held.contains(&hex::encode(n.note.nonce.0.serialize())))
-        {
-            return Err(coded(
-                StatusCode::BAD_REQUEST,
-                "note_held",
-                format!("input {i} is held by an unfinished rollover. Nothing was burned"),
-            ));
-        }
+    let held = rot
+        .rollovers
+        .lock()
+        .map_err(|_| poisoned())?
+        .held_nonces("");
+    if let Some(i) = req
+        .inputs
+        .iter()
+        .position(|n| held.contains(&hex::encode(n.note.nonce.0.serialize())))
+    {
+        return Err(coded(
+            StatusCode::BAD_REQUEST,
+            "note_held",
+            format!("input {i} is held by an unfinished rollover. Nothing was burned"),
+        ));
     }
-    let prev = rotor
-        .as_ref()
-        .and_then(|r| r.previous.as_ref().map(|(k, l)| (&r.current, k, l)));
+    let prev = rotor.previous.as_ref().map(|(k, l)| (&rotor.current, k, l));
     match melt_recording_gens(&logic, prev, &mut log, &req.inputs, &req.memo, &on_previous) {
         Ok(burned) => Ok(Json(MeltResponse { burned })),
         Err(MeltFailure::Rejected(e)) => Err(failure(StatusCode::BAD_REQUEST, e)),
@@ -573,9 +526,7 @@ async fn burns_handler(
         )
     })?;
     let rotor = rotor_of(&rot, &mut logic)?;
-    let prev = rotor
-        .as_ref()
-        .and_then(|r| r.previous.as_ref().map(|(_, l)| l));
+    let prev = rotor.previous.as_ref().map(|(_, l)| l);
     burns_gens(&logic, prev, &log, &req.nonces)
         .map(|burns| Json(BurnsResponse { burns }))
         .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))
@@ -677,8 +628,7 @@ type RotState = (Arc<AppState>, SharedRotating);
 /// The keys call: the public key for each denomination now in force.
 fn keys_response(state: &AppState, rot: &SharedRotating) -> Result<api::KeysResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(Arc::clone(rot));
-    let _r = rotor_of(&rot, &mut logic)?;
+    let _r = rotor_of(rot, &mut logic)?;
     Ok(api::KeysResponse {
         keys: logic.public_keys().clone(),
     })
@@ -692,11 +642,8 @@ fn check_state_response(
     req: api::CheckStateRequest,
 ) -> Result<api::CheckStateResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(Arc::clone(rot));
-    let rotor = rotor_of(&rot, &mut logic)?;
-    let prev = rotor
-        .as_ref()
-        .and_then(|r| r.previous.as_ref().map(|(_, l)| l));
+    let rotor = rotor_of(rot, &mut logic)?;
+    let prev = rotor.previous.as_ref().map(|(_, l)| l);
     let mut spent = Vec::with_capacity(req.nonces.len());
     for n in req.nonces {
         spent.push(
@@ -715,9 +662,7 @@ async fn audit_handler(
     State((state, rot)): State<RotState>,
 ) -> Result<Json<serde_json::Value>, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let shared = Arc::clone(&rot);
-    let rot = Some(rot);
-    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
+    let rotor = rotor_of(&rot, &mut logic)?;
     let int = |e| failure(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"));
     let (mut i, mut d) = logic.audit_totals().map_err(int)?;
     if let Some((_, p)) = &rotor.previous {
@@ -729,7 +674,7 @@ async fn audit_handler(
     i += Amount::from_units(ri);
     d += Amount::from_units(rd);
     // Lock order: the mint, the rotor, then the rollovers (as a rollover does).
-    let paid = shared.rollovers.lock().map_err(|_| poisoned())?.paid();
+    let paid = rot.rollovers.lock().map_err(|_| poisoned())?.paid();
     let mut body = serde_json::to_value(api::AuditResponse {
         issued: i,
         redeemed: d,
@@ -743,8 +688,7 @@ async fn audit_handler(
 /// The keysets call.
 fn keysets_response(state: &AppState, rot: &SharedRotating) -> Result<KeysetsResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(Arc::clone(rot));
-    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
+    let rotor = rotor_of(rot, &mut logic)?;
     let units = |pk: &std::collections::BTreeMap<Amount, secp256k1::PublicKey>| {
         pk.iter().map(|(a, k)| (a.units, *k)).collect()
     };
@@ -766,8 +710,7 @@ fn rotation_response(
     rot: &SharedRotating,
 ) -> Result<crate::rotation::RotationResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let rot = Some(Arc::clone(rot));
-    let rotor = rotor_of(&rot, &mut logic)?.expect("rotating");
+    let rotor = rotor_of(rot, &mut logic)?;
     Ok(rotor.window())
 }
 
@@ -831,24 +774,13 @@ where
 ///
 /// `body` is the request body (empty for the reads); `limits` are the ceilings
 /// (`server.*_max_request_bytes`, the same ones `/melt` and `/burns` have).
-pub fn air_served(
-    state: &AppState,
-    rot: &SharedRotating,
-    health: &Health,
-    limits: &Limits,
-    kind: u8,
-    body: &[u8],
-) -> Option<sp_wire::air_request::Served> {
-    air_served_with(state, rot, None, health, limits, kind, body)
-}
-
-/// [`air_served`] for a mint that also reconciles payments (kind 15): `records`
-/// is the settlement records, shared with the scan thread. Without them kind 15 is
-/// not answered. Lock order: the records, then the mint, then the rotor.
+/// `records` is the settlement records, shared with the scan thread: kind 15
+/// reconciles payments in them. Lock order: the records, then the mint, then the
+/// rotor.
 pub fn air_served_with(
     state: &AppState,
     rot: &SharedRotating,
-    records: Option<&SharedRecords>,
+    records: &SharedRecords,
     health: &Health,
     limits: &Limits,
     kind: u8,
@@ -922,7 +854,7 @@ pub fn air_served_with(
 fn reconcile_served(
     state: &AppState,
     rot: &SharedRotating,
-    records: Option<&SharedRecords>,
+    records: &SharedRecords,
     limits: &Limits,
     body: &[u8],
 ) -> sp_wire::air_request::Served {
@@ -933,13 +865,6 @@ fn reconcile_served(
             if counted { ", counted" } else { "" }
         );
         Served::Ignored(format!("{code}: {why}"))
-    };
-    let Some(records) = records else {
-        return ignored(
-            sp_wire::codes::UNAVAILABLE,
-            "this mint was started without its settlement records",
-            false,
-        );
     };
     let early = |e: crate::reconcile::Ignore| ignored(&e.code, &e.why, e.counted);
     if body.len() > limits.rollover_bytes {
@@ -979,9 +904,8 @@ fn reconcile_served(
             false,
         );
     };
-    let r2 = Some(Arc::clone(rot));
-    let rotor = match rotor_of(&r2, &mut logic) {
-        Ok(rotor) => rotor.expect("rotating"),
+    let rotor = match rotor_of(rot, &mut logic) {
+        Ok(rotor) => rotor,
         Err((_, Json(why))) => {
             return ignored(sp_wire::codes::UNAVAILABLE, &why.to_string(), false);
         }
@@ -1010,8 +934,7 @@ fn rollover_response(
     max_notes: usize,
 ) -> Result<crate::rotation::RolloverResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let r2 = Some(Arc::clone(rot));
-    let rotor = rotor_of(&r2, &mut logic)?.expect("rotating");
+    let rotor = rotor_of(rot, &mut logic)?;
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
     match crate::rotation::rollover(&logic, &rotor, &mut store, req, max_notes) {
         Ok(a) => Ok(a),
@@ -1044,8 +967,7 @@ fn spend_response(
         return Err(spend_failure(e));
     }
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
-    let r2 = Some(Arc::clone(rot));
-    let rotor = rotor_of(&r2, &mut logic)?.expect("rotating");
+    let rotor = rotor_of(rot, &mut logic)?;
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
     crate::rotation::spend(&logic, &rotor, &mut store, req, max_items).map_err(spend_failure)
 }
@@ -1065,79 +987,40 @@ fn spend_failure(e: SpendError) -> ApiFailure {
     }
 }
 
-/// The API with the default ceilings.
-pub fn router(state: Arc<AppState>, health: Arc<Health>, melts: SharedMelts) -> Router {
-    router_with(state, health, melts, Limits::default())
-}
-
-pub fn router_with(
-    state: Arc<AppState>,
-    health: Arc<Health>,
-    melts: SharedMelts,
-    limits: Limits,
-) -> Router {
-    router_full(state, health, melts, limits, None)
-}
-
-/// The API, with key rotation when `rot` is given: then `/audit` spans both
-/// live key sets. The wallet-facing calls (keys, keysets, rotation, rollover,
-/// check-state) are not routes: they are answered over AIR (`air_served`).
-pub fn router_full(
-    state: Arc<AppState>,
-    health: Arc<Health>,
-    melts: SharedMelts,
-    limits: Limits,
-    rot: Option<SharedRotating>,
-) -> Router {
-    router_audited(state, health, melts, limits, rot, None)
-}
-
-/// [`router_full`] with the path of `settlements.json`: `/audit` then also
-/// reports the payments held open and the payments forfeited (see
-/// `add_reconciliation`).
+/// The API: `/melt`, `/burns`, `/audit` and `/health`. `/audit` spans both live
+/// key sets and the deleted ones, and carries `reconciliation` (the payments held
+/// open and forfeited, the fees and the rounding), read from the settlement
+/// records file at `records` when it is asked for. The wallet-facing calls (keys,
+/// keysets, rotation, rollover, check-state, spend, reconcile) are not routes:
+/// they are answered over AIR (`air_served_with`).
 pub fn router_audited(
     state: Arc<AppState>,
     health: Arc<Health>,
     melts: SharedMelts,
     limits: Limits,
-    rot: Option<SharedRotating>,
-    records: Option<PathBuf>,
+    rot: SharedRotating,
+    records: PathBuf,
 ) -> Router {
-    let audit_network = health.network().map(str::to_string);
-    let audit_records = records.map(Arc::new);
+    let audit_network = health.network().to_string();
+    let audit_records = Arc::new(records);
     let health_routes = Router::new()
         .route("/health", get(health_handler))
         .with_state((Arc::clone(&state), health));
     let melt_routes = Router::new()
         .route("/melt", limited(post(melt_handler), limits.melt_bytes))
         .route("/burns", limited(post(burns_handler), limits.burns_bytes))
-        .with_state((Arc::clone(&state), melts, rot.clone()));
-    if let Some(rot) = rot {
-        return Router::new()
-            .route(
-                "/audit",
-                get(audit_handler)
-                    .layer(middleware::from_fn_with_state(
-                        audit_records.clone(),
-                        add_reconciliation,
-                    ))
-                    .layer(middleware::from_fn_with_state(audit_network, add_network)),
-            )
-            .with_state((Arc::clone(&state), rot))
-            .merge(melt_routes)
-            .merge(health_routes);
-    }
+        .with_state((Arc::clone(&state), melts, Arc::clone(&rot)));
     Router::new()
         .route(
             "/audit",
-            get(api::audit)
+            get(audit_handler)
                 .layer(middleware::from_fn_with_state(
                     audit_records,
                     add_reconciliation,
                 ))
                 .layer(middleware::from_fn_with_state(audit_network, add_network)),
         )
-        .with_state(state)
+        .with_state((state, rot))
         .merge(melt_routes)
         .merge(health_routes)
 }
@@ -1153,44 +1036,40 @@ mod tests {
 
     #[test]
     fn starting_until_the_first_scan_then_ok() {
-        let h = Health::new(100);
+        let h = Health::for_network(100, "regtest");
         let t = h.started;
         assert_eq!(status(&h, false, t + 5), (200, "starting".into()));
         h.record_scan_at(t + 10);
         assert_eq!(status(&h, false, t + 20), (200, "ok".into()));
         assert_eq!(h.last_scan(), Some(t + 10));
     }
-
     #[test]
-    fn no_scan_for_too_long_is_a_failure() {
-        let h = Health::new(100);
+    fn an_old_scan_is_a_failure_and_the_boundary_is_ok() {
+        let h = Health::for_network(100, "regtest");
+        h.record_scan_at(1_000);
+        assert_eq!(status(&h, false, 1_100), (200, "ok".into()));
+        assert_eq!(status(&h, false, 1_101), (503, "scan_stale".into()));
+        // a mint that has never scanned is stale too once the limit has passed
+        let h = Health::for_network(100, "regtest");
         let t = h.started;
         assert_eq!(status(&h, false, t + 101), (503, "scan_stale".into()));
     }
 
     #[test]
-    fn an_old_scan_is_a_failure_and_the_boundary_is_ok() {
-        let h = Health::new(100);
-        h.record_scan_at(1_000);
-        assert_eq!(status(&h, false, 1_100), (200, "ok".into()));
-        assert_eq!(status(&h, false, 1_101), (503, "scan_stale".into()));
-    }
-
-    #[test]
     fn a_poisoned_lock_is_a_failure_even_after_a_fresh_scan() {
-        let h = Health::new(100);
+        let h = Health::for_network(100, "regtest");
         h.record_scan_at(1_000);
         assert_eq!(status(&h, true, 1_001), (503, "mint_lock_poisoned".into()));
     }
 
     #[test]
     fn the_body_reports_the_last_scan_time() {
-        let h = Health::new(100);
+        let h = Health::for_network(100, "regtest");
         h.record_scan_at(1_000);
         let (_, body) = h.report(false, 1_030);
         assert_eq!(body["last_scan_unix"], 1_000);
         assert_eq!(body["seconds_since_last_scan"], 30);
-        let (_, none) = Health::new(100).report(false, now_secs());
+        let (_, none) = Health::for_network(100, "regtest").report(false, now_secs());
         assert!(none["last_scan_unix"].is_null());
         assert!(none["seconds_since_last_scan"].is_null());
     }
@@ -1207,12 +1086,11 @@ mod tests {
         assert_eq!(h.mint_info(false, t + 20).status, "ok");
         assert_eq!(h.mint_info(false, t + 111).status, "scan_stale");
         assert_eq!(h.mint_info(true, t + 20).status, "mint_lock_poisoned");
-        assert_eq!(Health::new(100).mint_info(false, now_secs()).network, "");
     }
 
     #[test]
     fn a_clock_that_went_backwards_does_not_underflow() {
-        let h = Health::new(100);
+        let h = Health::for_network(100, "regtest");
         h.record_scan_at(2_000);
         assert_eq!(status(&h, false, 1_000), (200, "ok".into()));
     }

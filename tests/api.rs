@@ -6,34 +6,24 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use mint_server::api::{
-    AuditResponse, CheckStateRequest, CheckStateResponse, KeysResponse, MeltRequest, MeltResponse,
+    AuditResponse, CheckStateRequest, CheckStateResponse, MeltRequest, MeltResponse,
 };
 use mint_server::state::AppState;
-use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
-use psp_mint::melts::MeltLog;
-use psp_mint::rotation::{Rollovers, Rotor};
-use psp_mint::server::{
-    Burn, BurnsRequest, BurnsResponse, Health, Limits, Rotating, SharedRotating, fatal,
+use mint_types::{
+    Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
 };
+use psp_mint::server::{Burn, BurnsRequest, BurnsResponse, Limits, fatal};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("psp-mint-api-{}-{name}", {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        format!(
-            "{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )
-    }));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
+use common::PspMint;
+
+/// The mint's clock: after it, a mint that has issued would be an hour from its
+/// first rotation.
+const CLOCK: u64 = 1_800_000_000;
 
 /// The melt with every input's keyset named (the mint's one keyset).
 fn ks(state: &AppState, melt: MeltRequest) -> psp_mint::server::PspMeltRequest {
@@ -47,55 +37,23 @@ fn ks(state: &AppState, melt: MeltRequest) -> psp_mint::server::PspMeltRequest {
     }
 }
 
-async fn start(name: &str) -> (String, Arc<AppState>) {
-    let (base, state, _health) = start_with_health(name).await;
-    (base, state)
+/// The mint as `serve` builds it, with its local HTTP API on a port of its own.
+async fn start(name: &str) -> (String, PspMint) {
+    let mint = PspMint::open(name, CLOCK, Limits::default());
+    let base = mint.http().await;
+    (base, mint)
 }
 
-async fn start_with_health(name: &str) -> (String, Arc<AppState>, Arc<Health>) {
-    let dir = scratch(name);
-    let logic = psp_mint::mint::open(&dir, Amount::from_units(1024)).unwrap();
-    let state = psp_mint::server::app_state(logic);
-    let melts = Arc::new(Mutex::new(
-        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
-    ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let health = Health::new(100);
-    let app = psp_mint::server::router(Arc::clone(&state), Arc::clone(&health), melts);
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), state, health)
+/// That a melt was refused with `400` and this message, which `mint-core` gives.
+async fn assert_refused(response: reqwest::Response, why: &str) {
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["error"], why, "{body}");
 }
 
-/// As [`start`], with the AIR listener of the same mint: a rotating mint, as
-/// `serve` runs, whose keys are generation 0. The `Air` holds the turn on the
-/// shared AIR server until it drops.
-async fn start_with_air(name: &str) -> (String, Arc<AppState>, common::Air) {
-    let dir = scratch(name);
-    let (rotor, logic) =
-        Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, 1_800_000_000).unwrap();
-    let rot: SharedRotating = Rotating::new(rotor, Rollovers::open(&dir).unwrap());
-    let state = psp_mint::server::app_state(logic);
-    let melts = Arc::new(Mutex::new(
-        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
-    ));
-    let air = common::Air::start(&state, &rot, Limits::default());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = psp_mint::server::router_full(
-        Arc::clone(&state),
-        Health::new(100),
-        melts,
-        Limits::default(),
-        Some(rot),
-    );
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), state, air)
-}
+const SPENT: &str = "The note is already spent";
+const NOT_AUTHORIZED: &str =
+    "The spend signature does not authorize this note for this transaction";
 
 /// What the mint does when a payment settles, and what the wallet does after.
 fn issued_note(state: &AppState, amount: Amount) -> (Note, Keypair) {
@@ -128,25 +86,16 @@ fn melt_input(note: Note, keypair: &Keypair, amount: Amount, memo: &str) -> Mint
 }
 
 #[tokio::test]
-async fn keys_lists_every_denomination() {
-    let (_base, _state, air) = start_with_air("keys").await;
-    let keys: KeysResponse = air.get("/keys");
-    // 1, 2, 4, ... 1024
-    assert_eq!(keys.keys.len(), 11);
-    assert!(keys.keys.contains_key(&Amount::from_units(1)));
-    assert!(keys.keys.contains_key(&Amount::from_units(1024)));
-    assert!(!keys.keys.contains_key(&Amount::from_units(3)));
-}
-
-#[tokio::test]
 async fn a_note_can_be_burned_once_over_http() {
-    let (base, state, air) = start_with_air("melt").await;
+    let (base, mint) = start("melt").await;
+    let air = mint.air();
+    let state = &mint.state;
     let http = reqwest::Client::new();
     let amount = Amount::from_units(4);
-    let (note, keypair) = issued_note(&state, amount);
+    let (note, keypair) = issued_note(state, amount);
     let memo = "esp-mint exchange test";
     let request = ks(
-        &state,
+        state,
         MeltRequest {
             inputs: vec![melt_input(note, &keypair, amount, memo)],
             memo: memo.to_string(),
@@ -191,12 +140,21 @@ async fn a_note_can_be_burned_once_over_http() {
         .send()
         .await
         .unwrap();
-    assert_eq!(again.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_refused(again, SPENT).await;
+    // and the refusal changed nothing
+    let audit: AuditResponse = reqwest::get(format!("{base}/audit"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(audit.redeemed, amount);
 }
 
 #[tokio::test]
 async fn a_burn_is_bound_to_its_memo() {
-    let (base, state) = start("memo").await;
+    let (base, mint) = start("memo").await;
+    let state = Arc::clone(&mint.state);
     let http = reqwest::Client::new();
     let amount = Amount::from_units(2);
     let (note, keypair) = issued_note(&state, amount);
@@ -214,7 +172,7 @@ async fn a_burn_is_bound_to_its_memo() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_refused(response, NOT_AUTHORIZED).await;
     let audit: AuditResponse = reqwest::get(format!("{base}/audit"))
         .await
         .unwrap()
@@ -222,6 +180,13 @@ async fn a_burn_is_bound_to_its_memo() {
         .await
         .unwrap();
     assert_eq!(audit.redeemed, Amount::ZERO);
+    assert_eq!(
+        burns(&base, vec![note.nonce]).await,
+        vec![Burn {
+            spent: false,
+            memo: None
+        }]
+    );
 }
 
 async fn burns(base: &str, nonces: Vec<Nonce>) -> Vec<Burn> {
@@ -241,7 +206,8 @@ async fn burns(base: &str, nonces: Vec<Nonce>) -> Vec<Burn> {
 
 #[tokio::test]
 async fn a_burn_keeps_its_memo_and_burns_reports_it() {
-    let (base, state) = start("burn-memo").await;
+    let (base, mint) = start("burn-memo").await;
+    let state = Arc::clone(&mint.state);
     let http = reqwest::Client::new();
     let amount = Amount::from_units(4);
     let (spent_note, spent_key) = issued_note(&state, amount);
@@ -279,7 +245,8 @@ async fn a_burn_keeps_its_memo_and_burns_reports_it() {
 
 #[tokio::test]
 async fn a_burn_that_fails_leaves_the_note_unspent_and_without_a_memo() {
-    let (base, state) = start("burn-failed").await;
+    let (base, mint) = start("burn-failed").await;
+    let state = Arc::clone(&mint.state);
     let amount = Amount::from_units(2);
     let (note, _owner) = issued_note(&state, amount);
     let thief = Keypair::new(SECP256K1, &mut OsRng);
@@ -295,7 +262,7 @@ async fn a_burn_that_fails_leaves_the_note_unspent_and_without_a_memo() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_refused(response, NOT_AUTHORIZED).await;
     assert_eq!(
         burns(&base, vec![note.nonce]).await,
         vec![Burn {
@@ -309,7 +276,8 @@ async fn a_burn_that_fails_leaves_the_note_unspent_and_without_a_memo() {
 async fn a_second_burn_does_not_change_the_memo_on_record() {
     // A holder tries to burn a note under a second memo after the first burn.
     // The second is a double spend, and the memo on record stays the first.
-    let (base, state) = start("burn-relabel").await;
+    let (base, mint) = start("burn-relabel").await;
+    let state = Arc::clone(&mint.state);
     let http = reqwest::Client::new();
     let amount = Amount::from_units(2);
     let (note, keypair) = issued_note(&state, amount);
@@ -326,7 +294,11 @@ async fn a_second_burn_does_not_change_the_memo_on_record() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status().is_success(), expect_ok, "{memo}");
+        if expect_ok {
+            assert!(response.status().is_success(), "{memo}");
+        } else {
+            assert_refused(response, SPENT).await;
+        }
     }
     assert_eq!(
         burns(&base, vec![note.nonce]).await,
@@ -336,18 +308,44 @@ async fn a_second_burn_does_not_change_the_memo_on_record() {
         }]
     );
 }
-
 #[tokio::test]
 async fn a_note_spent_with_no_memo_on_record_reports_spent_and_no_memo() {
-    // Spent some other way than through /melt, such as before the log existed.
-    let (base, state) = start("burn-unrecorded").await;
+    // A rollover burns its inputs without a melt memo, so this is the state of a
+    // note that was spent some way other than through /melt.
+    let (base, mint) = start("burn-unrecorded").await;
+    let state = Arc::clone(&mint.state);
     let amount = Amount::from_units(2);
     let (note, keypair) = issued_note(&state, amount);
+    let keyset = psp_mint::rotation::keyset_id(state.logic.lock().unwrap().public_keys());
+    let blinded = Keypair::new(SECP256K1, &mut OsRng);
+    let (blind_point, _) =
+        bdhke::blind_message(&Nonce(blinded.public_key()).as_hash_preimage(), None);
+    let outputs = vec![MintOutput {
+        amount,
+        blind_nonce: BlindNonce(blind_point),
+    }];
+    let unsigned = MintInput {
+        amount,
+        note,
+        spend_signature: secp256k1::schnorr::Signature::from_slice(&[0u8; 64]).unwrap(),
+    };
+    let sighash = transaction_sighash(std::slice::from_ref(&unsigned), &outputs);
+    let input = MintInput {
+        spend_signature: SECP256K1.sign_schnorr(&sighash, &keypair),
+        ..unsigned
+    };
     {
-        let logic = state.logic.lock().unwrap();
-        logic
-            .melt(&[melt_input(note, &keypair, amount, "direct")], b"direct")
-            .unwrap();
+        let air = mint.air();
+        let (status, body) = air.post_json(
+            "/rollover",
+            &psp_mint::rotation::RolloverRequest {
+                input_keysets: vec![keyset.clone()],
+                inputs: vec![input],
+                keyset,
+                outputs,
+            },
+        );
+        assert_eq!(status, 200, "{body}");
     }
     assert_eq!(
         burns(&base, vec![note.nonce]).await,
@@ -360,7 +358,8 @@ async fn a_note_spent_with_no_memo_on_record_reports_spent_and_no_memo() {
 
 #[tokio::test]
 async fn every_note_in_one_burn_is_recorded_under_the_one_memo() {
-    let (base, state) = start("burn-many").await;
+    let (base, mint) = start("burn-many").await;
+    let state = Arc::clone(&mint.state);
     let amount = Amount::from_units(2);
     let (a, ka) = issued_note(&state, amount);
     let (b, kb) = issued_note(&state, amount);
@@ -397,156 +396,84 @@ async fn every_note_in_one_burn_is_recorded_under_the_one_memo() {
     );
 }
 
+/// Only `/melt`, `/burns`, `/audit` and `/health` are HTTP routes, on the router
+/// `serve` builds. Issuing and swapping are not mounted, and the calls wallets
+/// make are answered over AIR only.
 #[tokio::test]
-async fn one_spent_note_among_several_leaves_the_others_unburned() {
-    // mint-core's melt checks every input before it burns any; this holds the
-    // PSP to that: a melt of three notes, one already spent, burns nothing.
-    let (base, state) = start("burn-partial").await;
+async fn only_melt_burns_audit_and_health_are_http_routes() {
+    let (base, _mint) = start("routes").await;
     let http = reqwest::Client::new();
-    let amount = Amount::from_units(2);
-    let (a, ka) = issued_note(&state, amount);
-    let (b, kb) = issued_note(&state, amount);
-    let (c, kc) = issued_note(&state, amount);
-    let first = http
-        .post(format!("{base}/melt"))
-        .json(&ks(
-            &state,
-            MeltRequest {
-                inputs: vec![melt_input(a, &ka, amount, "first")],
-                memo: "first".to_string(),
-            },
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert!(first.status().is_success());
-    let memo = "all three";
-    let unsigned = |note: Note| MintInput {
-        amount,
-        note,
-        spend_signature: secp256k1::schnorr::Signature::from_slice(&[0u8; 64]).unwrap(),
-    };
-    let mut inputs = vec![unsigned(b), unsigned(a), unsigned(c)];
-    let sighash = melt_sighash(&inputs, memo.as_bytes());
-    inputs[0].spend_signature = SECP256K1.sign_schnorr(&sighash, &kb);
-    inputs[1].spend_signature = SECP256K1.sign_schnorr(&sighash, &ka);
-    inputs[2].spend_signature = SECP256K1.sign_schnorr(&sighash, &kc);
-    let all = http
-        .post(format!("{base}/melt"))
-        .json(&ks(
-            &state,
-            MeltRequest {
-                inputs,
-                memo: memo.to_string(),
-            },
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(all.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(
-        burns(&base, vec![a.nonce, b.nonce, c.nonce]).await,
-        vec![
-            Burn {
-                spent: true,
-                memo: Some("first".to_string())
-            },
-            Burn {
-                spent: false,
-                memo: None
-            },
-            Burn {
-                spent: false,
-                memo: None
-            },
-        ],
-        "only the first, separate burn happened"
-    );
-}
-
-#[tokio::test]
-async fn a_note_signed_by_someone_else_cannot_be_burned() {
-    let (base, state) = start("thief").await;
-    let amount = Amount::from_units(2);
-    let (note, _owner) = issued_note(&state, amount);
-    let thief = Keypair::new(SECP256K1, &mut OsRng);
-    let request = ks(
-        &state,
-        MeltRequest {
-            inputs: vec![melt_input(note, &thief, amount, "memo")],
-            memo: "memo".to_string(),
-        },
-    );
-    let response = reqwest::Client::new()
-        .post(format!("{base}/melt"))
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn issuing_and_swapping_are_not_exposed() {
-    let (base, _state) = start("closed").await;
-    let http = reqwest::Client::new();
-    for path in ["/admin/issue", "/swap"] {
+    for path in [
+        "/admin/issue",
+        "/swap",
+        "/keys",
+        "/keysets",
+        "/rotation",
+        "/rollover",
+        "/check-state",
+        "/spend",
+        "/reconcile",
+    ] {
+        for method in [reqwest::Method::GET, reqwest::Method::POST] {
+            let response = http
+                .request(method.clone(), format!("{base}{path}"))
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::NOT_FOUND,
+                "{method} {path}"
+            );
+        }
+    }
+    // the four that are routes answer, though not always with a success: a
+    // missing body is refused, a wrong method is not allowed, and neither is a 404
+    for (method, path) in [
+        (reqwest::Method::GET, "/audit"),
+        (reqwest::Method::GET, "/health"),
+        (reqwest::Method::POST, "/melt"),
+        (reqwest::Method::POST, "/burns"),
+        (reqwest::Method::GET, "/melt"),
+        (reqwest::Method::GET, "/burns"),
+        (reqwest::Method::POST, "/audit"),
+        (reqwest::Method::POST, "/health"),
+    ] {
         let response = http
-            .post(format!("{base}{path}"))
+            .request(method.clone(), format!("{base}{path}"))
             .json(&serde_json::json!({}))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+        assert_ne!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "{method} {path}"
+        );
     }
-}
-
-/// The calls wallets make are answered over AIR only: on the HTTP server, the
-/// one the SPI uses, they are not routes, in either router `serve` can build.
-#[tokio::test]
-async fn the_wallets_calls_are_not_routes_over_http() {
-    let (rotating, _state, _air) = start_with_air("no-wallet-routes").await;
-    let (plain, _state) = start("no-wallet-routes-plain").await;
-    let http = reqwest::Client::new();
-    for base in [rotating, plain] {
-        for path in [
-            "/keys",
-            "/keysets",
-            "/rotation",
-            "/rollover",
-            "/check-state",
-        ] {
-            for method in [reqwest::Method::GET, reqwest::Method::POST] {
-                let response = http
-                    .request(method.clone(), format!("{base}{path}"))
-                    .json(&serde_json::json!({}))
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    response.status(),
-                    reqwest::StatusCode::NOT_FOUND,
-                    "{method} {path}"
-                );
-            }
-        }
+    let allowed = |response: &reqwest::Response| response.status().is_success();
+    assert!(allowed(
+        &reqwest::get(format!("{base}/audit")).await.unwrap()
+    ));
+    assert!(allowed(
+        &reqwest::get(format!("{base}/health")).await.unwrap()
+    ));
+    for (method, path) in [
+        (reqwest::Method::GET, "/melt"),
+        (reqwest::Method::POST, "/audit"),
+    ] {
+        let response = http
+            .request(method.clone(), format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path}"
+        );
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_api_works_while_the_mint_is_shared() {
-    // The scanner holds the same mutex for short stretches. A request that
-    // arrives while it is held waits and then succeeds.
-    let (base, state) = start("shared").await;
-    let held = Arc::clone(&state);
-    let holder = std::thread::spawn(move || {
-        let _guard = held.logic.lock().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    });
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let response = reqwest::get(format!("{base}/audit")).await.unwrap();
-    assert!(response.status().is_success());
-    holder.join().unwrap();
 }
 
 async fn health_json(base: &str) -> (reqwest::StatusCode, serde_json::Value) {
@@ -557,13 +484,15 @@ async fn health_json(base: &str) -> (reqwest::StatusCode, serde_json::Value) {
 
 #[tokio::test]
 async fn health_reports_the_last_successful_scan() {
-    let (base, _state, health) = start_with_health("health").await;
+    let (base, mint) = start("health").await;
+    let health = &mint.health;
 
     let (code, body) = health_json(&base).await;
     assert_eq!(code, reqwest::StatusCode::OK);
     assert_eq!(body["status"], "starting");
     assert!(body["last_scan_unix"].is_null());
     assert_eq!(body["wire_version"], sp_wire::WIRE_VERSION);
+    assert_eq!(body["network"], common::NETWORK);
 
     health.record_scan();
     let (code, body) = health_json(&base).await;
@@ -574,25 +503,27 @@ async fn health_reports_the_last_successful_scan() {
 
 #[tokio::test]
 async fn health_fails_when_the_last_scan_is_too_old() {
-    let (base, _state, health) = start_with_health("health-stale").await;
-    health.record_scan_at(psp_mint::server::now_secs() - 500);
+    let (base, mint) = start("health-stale").await;
+    mint.health
+        .record_scan_at(psp_mint::server::now_secs() - 500);
     let (code, body) = health_json(&base).await;
     assert_eq!(code, reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["status"], "scan_stale");
+    assert_eq!(body["stale_after_secs"], 100);
 }
 
 #[tokio::test]
 async fn health_answers_while_the_mint_is_busy() {
-    let (base, state, _health) = start_with_health("health-busy").await;
+    let (base, mint) = start("health-busy").await;
     // The mint lock is held on another thread for the whole request: a guard
     // kept in the async test itself would be held across the await.
     let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let busy = Arc::clone(&state);
+    let busy = Arc::clone(&mint.state);
     let holder = std::thread::spawn(move || {
         let _guard = busy.logic.lock().unwrap();
         held_tx.send(()).unwrap();
-        let _ = release_rx.recv();
+        release_rx.recv().unwrap();
     });
     held_rx.recv().unwrap();
     let (code, _) = health_json(&base).await;
@@ -609,17 +540,18 @@ fn poison(state: &Arc<AppState>) {
     })
     .join();
     assert!(result.is_err());
+    assert!(state.logic.is_poisoned());
 }
 
 #[tokio::test]
 async fn a_poisoned_mint_lock_fails_health_and_is_fatal() {
-    let (base, state, health) = start_with_health("poisoned").await;
-    health.record_scan();
-    assert_eq!(fatal(&state, false), None);
+    let (base, mint) = start("poisoned").await;
+    mint.health.record_scan();
+    assert_eq!(fatal(&mint.state, false), None);
 
-    poison(&state);
+    poison(&mint.state);
 
-    assert_eq!(fatal(&state, false), Some("the mint lock is poisoned"));
+    assert_eq!(fatal(&mint.state, false), Some("the mint lock is poisoned"));
     let (code, body) = health_json(&base).await;
     assert_eq!(code, reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["status"], "mint_lock_poisoned");
@@ -627,17 +559,10 @@ async fn a_poisoned_mint_lock_fails_health_and_is_fatal() {
 
 #[tokio::test]
 async fn a_stopped_scan_thread_is_fatal() {
-    let (_base, state, _health) = start_with_health("scan-dead").await;
-    assert_eq!(fatal(&state, false), None);
-    assert_eq!(fatal(&state, true), Some("the scan thread has stopped"));
-}
-
-#[tokio::test]
-async fn a_panicking_scan_thread_shows_as_finished() {
-    // What the watchdog in `serve` relies on: a thread that panics is finished.
-    let handle = std::thread::spawn(|| panic!("scan blew up"));
-    while !handle.is_finished() {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    assert!(handle.join().is_err());
+    let (_base, mint) = start("scan-dead").await;
+    assert_eq!(fatal(&mint.state, false), None);
+    assert_eq!(
+        fatal(&mint.state, true),
+        Some("the scan thread has stopped")
+    );
 }

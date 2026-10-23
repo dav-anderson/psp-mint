@@ -310,13 +310,8 @@ const SOURCES: [(&str, &str, Parser); 3] = [
     ),
 ];
 
-/// Fetch all three tickers. A failure of one source is reported for that source
-/// and does not stop the others.
-pub fn fetch_all() -> Vec<(&'static str, Result<Quote, String>)> {
-    fetch_all_with(DEFAULT_TIMEOUT_SECS)
-}
-
-/// `fetch_all` with each request allowed `timeout_secs`.
+/// Fetch all three tickers, each request allowed `timeout_secs`. A failure of one
+/// source is reported for that source and does not stop the others.
 pub fn fetch_all_with(timeout_secs: u64) -> Vec<(&'static str, Result<Quote, String>)> {
     let client = match Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
@@ -375,7 +370,6 @@ mod tests {
     fn p(cents: &[u64]) -> Aggregate {
         aggregate(cents, DEFAULT_MAX_SPREAD_BPS)
     }
-
     #[test]
     fn three_prices_take_the_median() {
         for order in [[1, 2, 3], [3, 1, 2], [2, 3, 1]] {
@@ -388,10 +382,7 @@ mod tests {
                 }
             );
         }
-    }
-
-    #[test]
-    fn three_prices_ignore_an_outlier_even_a_wild_one() {
+        // an outlier, even a wild one, is ignored
         assert_eq!(
             p(&[8_000_000, 8_010_000, 1]),
             Aggregate::Price {
@@ -418,10 +409,9 @@ mod tests {
             }
         );
     }
-
     #[test]
-    fn two_prices_exactly_two_percent_apart_are_averaged() {
-        // 2% of 10_000_000 is 200_000
+    fn two_prices_over_two_percent_apart_wait() {
+        // 2% of 10_000_000 is 200_000: exactly that far apart is averaged
         assert_eq!(
             p(&[10_000_000, 10_200_000]),
             Aggregate::Price {
@@ -429,10 +419,7 @@ mod tests {
                 sources: 2
             }
         );
-    }
-
-    #[test]
-    fn two_prices_over_two_percent_apart_wait() {
+        // and one cent further waits
         assert_eq!(
             p(&[10_000_000, 10_200_001]),
             Aggregate::Disagree {
@@ -480,7 +467,6 @@ mod tests {
     fn q(cents: u64, observed_at: u64) -> Result<Quote, String> {
         Ok(Quote { cents, observed_at })
     }
-
     #[test]
     fn errored_and_stale_sources_are_excluded() {
         let now = 1_000_000;
@@ -494,23 +480,17 @@ mod tests {
         assert_eq!(excluded.len(), 2);
         assert_eq!(excluded[0].0, "bitstamp");
         assert_eq!(excluded[1].0, "gemini");
-    }
 
-    #[test]
-    fn a_quote_exactly_at_the_age_limit_is_kept() {
+        // a quote exactly at the age limit is kept
         let (prices, _) = usable(&[("a", q(5, 1000 - 120))], 1000, 120);
         assert_eq!(prices, vec![5]);
-    }
 
-    #[test]
-    fn a_quote_dated_far_in_the_future_is_excluded() {
+        // a quote dated far in the future is excluded
         let (prices, excluded) = usable(&[("a", q(5, 1000 + 121))], 1000, 120);
         assert!(prices.is_empty());
         assert_eq!(excluded.len(), 1);
-    }
 
-    #[test]
-    fn the_age_limit_is_configurable() {
+        // the age limit is a parameter
         let reports = vec![("a", q(5, 900)), ("b", q(5, 990))];
         assert_eq!(usable(&reports, 1000, 120).0.len(), 2);
         assert_eq!(usable(&reports, 1000, 30).0.len(), 1);
@@ -631,7 +611,6 @@ mod tests {
         assert!(parse_gemini("not json").is_err());
         assert!(parse_gemini(r#"{"message":"rate limited"}"#).is_err());
     }
-
     #[test]
     fn lazy_fetches_once_and_only_when_asked() {
         let mut calls = 0;
@@ -653,19 +632,17 @@ mod tests {
             });
         }
         assert_eq!(never, 0);
-    }
 
-    #[test]
-    fn lazy_remembers_a_failure_too() {
-        let mut calls = 0;
+        // a failure is remembered too: it is not fetched again
+        let mut failing = 0;
         {
             let mut lazy = Lazy::new(|| {
-                calls += 1;
+                failing += 1;
                 Err("down".to_string())
             });
             assert!(lazy.get().is_err());
             assert!(lazy.get().is_err());
         }
-        assert_eq!(calls, 1);
+        assert_eq!(failing, 1);
     }
 }

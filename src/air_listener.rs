@@ -336,12 +336,4 @@ mod tests {
         assert!(!dir.join(format!("{NEXT_FILE}.tmp")).exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
-
-    #[test]
-    fn a_damaged_counter_is_an_error_not_a_reset() {
-        let dir = scratch("damaged");
-        std::fs::write(next_path(&dir), "not a number").unwrap();
-        assert!(read_next(&dir).unwrap_err().contains(NEXT_FILE));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
 }

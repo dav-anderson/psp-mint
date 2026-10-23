@@ -1,14 +1,21 @@
 //! One scan cycle, shared by the one-shot run and `serve`.
 
+use std::error::Error;
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use mint_core::MintLogic;
+use mint_server::state::AppState;
+use sp_wire::seal::SecretKey;
 
+use crate::delivery::Deliverer;
 use crate::price::{self, Aggregate, Config};
 use crate::records::Records;
-use crate::scan::Received;
-use crate::settle::{self, Policy, ReconcileTerms, Rejection, SettleError, Settlement, Terms};
+use crate::scan::{self, Node, Received};
+use crate::seal;
+use crate::server::Rotating;
+use crate::settle::{self, Policy, Rejection, SettleError, Settlement, Terms};
 
 pub fn cents_text(cents: u64) -> String {
     format!("{}.{:02}", cents / 100, cents % 100)
@@ -44,63 +51,16 @@ pub fn btc_usd_cents(config: Config) -> Result<u64, String> {
     }
 }
 
-/// Move every payment as far as it can go.
+/// Move every payment as far as it can go, under the settlement `policy` (the
+/// terms and the reconciliation fees), in the records the AIR listener shares (it
+/// reconciles payments in them).
 ///
-/// The mint is shared with the HTTP API behind `logic`, so it is locked once
-/// per payment and never while waiting on the network. The price is fetched
-/// before the lock is taken, and only for a payment that has no record yet,
-/// which is the one case where `settle` asks for it. `price` is called at most
-/// once per payment, and the caller makes it fetch at most once per cycle.
-pub fn run_once(
-    logic: &Mutex<MintLogic>,
-    records: &mut Records,
-    found: &[Received],
-    price: &mut dyn FnMut() -> Result<u64, String>,
-    report: &mut dyn FnMut(&Received, &Settlement),
-) -> Result<(), SettleError> {
-    run_once_with(logic, records, found, price, report, &Terms::default())
-}
-
-/// `run_once` under the given settlement rules.
-pub fn run_once_with(
-    logic: &Mutex<MintLogic>,
-    records: &mut Records,
-    found: &[Received],
-    price: &mut dyn FnMut() -> Result<u64, String>,
-    report: &mut dyn FnMut(&Received, &Settlement),
-    terms: &Terms,
-) -> Result<(), SettleError> {
-    run_once_rotating(logic, None, records, found, price, report, terms)
-}
-
-/// `run_once_with` for a mint that rotates. A payment whose payload names the
-/// previous key set is signed by it (see `settle::settle_with_previous`). The
-/// mint is locked first and the rotor second, as everywhere else.
-pub fn run_once_rotating(
-    logic: &Mutex<MintLogic>,
-    rotating: Option<&crate::server::Rotating>,
-    records: &mut Records,
-    found: &[Received],
-    price: &mut dyn FnMut() -> Result<u64, String>,
-    report: &mut dyn FnMut(&Received, &Settlement),
-    terms: &Terms,
-) -> Result<(), SettleError> {
-    let policy = Policy {
-        terms: *terms,
-        fees: ReconcileTerms::default(),
-    };
-    for received in found {
-        let needs_price = received.confirmations >= terms.lock_confirmations
-            && records.get(&received.txid).is_none();
-        let fetched = if needs_price { Some(price()) } else { None };
-        let settlement = settle_one(logic, rotating, records, received, fetched, &policy)?;
-        report(received, &settlement);
-    }
-    Ok(())
-}
-
-/// `run_once_rotating` for the records the AIR listener shares (it reconciles
-/// payments in them), under the settlement terms and the reconciliation fees.
+/// The mint is shared with the HTTP API behind `logic`, so it is locked once per
+/// payment and never while waiting on the network. The price is fetched before
+/// any lock is taken, and only for a payment that has no record yet, which is the
+/// one case where `settle_ruled` asks for it. `price` is called at most once per
+/// payment, and the caller makes it fetch at most once per cycle. A payment whose
+/// payload names the previous key set is signed by it (see `settle::settle_ruled`).
 ///
 /// **Locks.** The records lock is taken for one payment at a time and never while
 /// the price is fetched, so a reconciliation request waits for at most one
@@ -111,7 +71,7 @@ pub fn run_once_rotating(
 /// middle of a settlement or a reconciliation, and `serve` is about to exit.
 pub fn run_once_shared(
     logic: &Mutex<MintLogic>,
-    rotating: Option<&crate::server::Rotating>,
+    rotating: &Rotating,
     records: &Mutex<Records>,
     found: &[Received],
     price: &mut dyn FnMut() -> Result<u64, String>,
@@ -152,7 +112,7 @@ pub fn lock_records(
 /// and the rotor second, as everywhere else.
 fn settle_one(
     logic: &Mutex<MintLogic>,
-    rotating: Option<&crate::server::Rotating>,
+    rotating: &Rotating,
     records: &mut Records,
     received: &Received,
     fetched: Option<Result<u64, String>>,
@@ -161,17 +121,13 @@ fn settle_one(
     let guard = logic
         .lock()
         .map_err(|_| SettleError::Mint("mint lock is poisoned".to_string()))?;
-    let rotor = match rotating {
-        Some(r) => Some(
-            r.rotor
-                .lock()
-                .map_err(|_| SettleError::Mint("rotor lock is poisoned".to_string()))?,
-        ),
-        None => None,
-    };
+    let rotor = rotating
+        .rotor
+        .lock()
+        .map_err(|_| SettleError::Mint("rotor lock is poisoned".to_string()))?;
     let previous = rotor
+        .previous
         .as_ref()
-        .and_then(|r| r.previous.as_ref())
         .map(|(keys, prev)| (keys.id.as_str(), prev));
     settle::settle_ruled(
         &guard,
@@ -187,9 +143,143 @@ fn settle_one(
     )
 }
 
-/// The lines printed for a payment.
-pub fn describe(received: &Received, settlement: &Settlement) -> Vec<String> {
-    describe_with(received, settlement, &Terms::default())
+/// What one scan pass takes from the settings.
+pub struct Pass<'a> {
+    /// The network's folder: the scan checkpoint is kept here.
+    pub data_dir: &'a Path,
+    /// The wallet's name, for the log.
+    pub wallet: &'a str,
+    /// `settle.min_confirmations`: how deep the checkpoint trails the tip.
+    pub min_confirmations: u32,
+    /// The terms and fees every payment is settled under.
+    pub policy: &'a Policy,
+    /// The mint's DID key: payloads are sealed to its public half.
+    pub did: &'a SecretKey,
+    /// Leave out payments that are already settled.
+    pub quiet: bool,
+}
+
+/// Scan the wallet once and move every payment as far as it can go: read what is
+/// new since the checkpoint (and what is still unsettled), open the payloads with
+/// the mint's DID key, rotate to the current key set, settle each payment
+/// (`run_once_shared`), print what happened, and only then save the checkpoint.
+///
+/// A payment whose data does not open with the DID key is not for this mint and
+/// is ignored, not rejected. A failed pass leaves the checkpoint where it was, so
+/// the same blocks are read again next time. The records are locked only to read
+/// what is unsettled and, one payment at a time, to settle it; never while the
+/// wallet is scanned or a price is fetched.
+///
+/// The callers follow it with [`deliver`] and [`forfeit`], whether or not it
+/// worked: what was issued before is owed its record, and a window that closed
+/// stays closed.
+pub fn cycle(
+    pass: &Pass,
+    node: &dyn Node,
+    state: &AppState,
+    rot: &Rotating,
+    records: &Mutex<Records>,
+    price: &mut dyn FnMut() -> Result<u64, String>,
+) -> Result<(), Box<dyn Error>> {
+    let checkpoint = scan::Checkpoint::load(pass.data_dir)?;
+    let unsettled = lock_records(records)?.unsettled();
+    let since = scan::since(
+        node,
+        checkpoint.as_ref(),
+        pass.min_confirmations,
+        &unsettled,
+    )?;
+    let (found, ignored) = seal::open_payloads(pass.did, since.received);
+    if !pass.quiet {
+        if found.is_empty() && ignored == 0 {
+            println!("no payments received by wallet {}", pass.wallet);
+        }
+        if ignored > 0 {
+            println!("ignored {ignored} payment(s) whose data is not encrypted to this mint");
+        }
+    }
+    // Rotate first, so a settlement signs with the current key set.
+    {
+        let mut logic = state
+            .logic
+            .lock()
+            .map_err(|_| "the mint lock is poisoned")?;
+        rot.rotor
+            .lock()
+            .map_err(|_| "the rotor lock is poisoned")?
+            .refresh(&mut logic)?;
+    }
+    let terms = pass.policy.terms;
+    run_once_shared(
+        &state.logic,
+        rot,
+        records,
+        &found,
+        price,
+        &mut |received, settlement| {
+            if pass.quiet && matches!(settlement, Settlement::AlreadySettled(_)) {
+                return;
+            }
+            for line in describe_with(received, settlement, &terms) {
+                println!("{line}");
+            }
+        },
+        pass.policy,
+    )?;
+    // Only after every payment was processed: a failed pass reads the same
+    // blocks again next time.
+    since.next.save(pass.data_dir)?;
+    Ok(())
+}
+
+/// Write the records of every purchase that is owed one and has none stored.
+/// Never fails a scan: what could not be written is printed and tried again on the
+/// next pass. Without a deliverer (`air.server` and `air.host` not set) the
+/// purchases stay in the records, and `quiet` leaves out saying so.
+pub fn deliver(deliverer: &mut Option<Deliverer>, records: &Mutex<Records>, quiet: bool) {
+    match deliverer {
+        Some(deliverer) => {
+            // The records are locked to plan and to apply, not while the
+            // records are written to the AIR server.
+            deliverer.pass_shared(records, Instant::now());
+        }
+        None => {
+            let Ok(guard) = lock_records(records) else {
+                eprintln!("delivery: the settlement records lock is poisoned; skipped");
+                return;
+            };
+            let waiting = guard.undelivered().len();
+            drop(guard);
+            if waiting > 0 && !quiet {
+                println!(
+                    "{waiting} purchase(s) are waiting for their signatures to be delivered over \
+                     AIR; air.server and air.host are not set, so they stay in the records"
+                );
+            }
+        }
+    }
+}
+
+/// Forfeit every payment whose reconciliation window closed at or before `now`
+/// with the payment still open: the mint keeps the BTC and owes nothing, and
+/// `/audit` shows it apart. Never fails a scan. A poisoned records lock is logged
+/// and skipped (the watcher in `serve` exits the process).
+pub fn forfeit(records: &Mutex<Records>, now: u64) {
+    let Ok(mut guard) = lock_records(records) else {
+        eprintln!("forfeit check skipped: the settlement records lock is poisoned");
+        return;
+    };
+    match guard.forfeit_expired(now) {
+        Ok(gone) => {
+            for txid in gone {
+                println!(
+                    "forfeited {txid}: its reconciliation window closed with the payment \
+                     unsettled; the mint keeps the BTC"
+                );
+            }
+        }
+        Err(e) => eprintln!("forfeit check failed, will retry: {e}"),
+    }
 }
 
 /// Basis points as a percentage: 100 is "1%", 150 is "1.5%".
@@ -204,7 +294,8 @@ pub fn percent_text(bps: u128) -> String {
     }
 }
 
-/// `describe` with the numbers of the given settlement rules.
+/// The lines printed for a payment, with the numbers of the given settlement
+/// rules.
 pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms) -> Vec<String> {
     let (lock, min) = (terms.lock_confirmations, terms.min_confirmations);
     let mut lines = vec![format!(
@@ -232,11 +323,10 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
         Settlement::Rejected(why) => lines.push(format!("  rejected: {why:?}")),
         Settlement::PaidUnsettled(held) => {
             lines.push(format!("  over/under: {} bps", held.over_under_bps));
-            // The AIR exchange that settles this (asking the payer's DID for a
-            // new request that matches what was paid) is not built yet. Only the
-            // record is made, and the BTC is held.
+            // The record is made, the BTC is held, and the payer's delivery
+            // record (over AIR) carries the rules for a corrected request.
             lines.push(format!(
-                "  paid but unsettled: {} units requested, {} paid; no smaller request gets within {} of the amount paid, so nothing was signed and the BTC is held for payer DID {} (AIR request for a new matching request not built)",
+                "  paid but unsettled: {} units requested, {} paid; no smaller request gets within {} of the amount paid, so nothing was signed and the BTC is held for reply key {}",
                 held.requested_units,
                 held.paid_units,
                 percent_text(terms.reconciliation_target_bps),
@@ -244,7 +334,7 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
             ));
             let days = terms.reconciliation_window_secs.div_ceil(86_400);
             lines.push(format!(
-                "  the payer is told over AIR; if it is not settled within {days} day(s) the payment is forfeited and the mint keeps the BTC"
+                "  the payer is told over AIR and can send a corrected request (kind 15); if it is not settled within {days} day(s) the payment is forfeited and the mint keeps the BTC"
             ));
         }
         Settlement::Issued(issue) => {
@@ -263,30 +353,33 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
                 ));
             }
             if issue.credit_cents > 0 {
-                // The AIR message asking the payer's DID for a new request
-                // is not built yet. The credit is only recorded.
+                // The credit is recorded; the payer claims it over AIR (kind 15)
+                // with a credit claim signed by the reply key.
                 lines.push(format!(
-                    "  overpaid by more than {}: credit {} USD recorded for payer DID {} (AIR message to the payer not built)",
+                    "  overpaid by more than {}: credit {} USD recorded for reply key {}; the payer can claim it over AIR (kind 15)",
                     percent_text(terms.reconciliation_target_bps),
                     cents_text(issue.credit_cents),
                     hex::encode(issue.payer_did)
                 ));
             }
-            // The lines below are a log. The payer does not claim from them: the
-            // same pairs, the keyset and its keys are written to the AIR server
-            // as the purchase's delivery record (see `delivery`).
-            //
-            // "keyset <id>": the keyset that signed.
-            lines.push(format!("  keyset {}", issue.keyset));
-            // "signature <blind nonce> <signature>": each signature with the
-            // blind nonce of the output it signs.
-            for (blind_nonce, result) in issue.blind_nonces.iter().zip(&issue.results) {
-                match result {
-                    Ok(signature) => {
-                        lines.push(format!("  signature {} {}", blind_nonce.0, signature.0))
-                    }
-                    Err(e) => lines.push(format!("  not issued: {blind_nonce:?}: {e}")),
-                }
+            // Counts and amounts only. The signatures are not logged: they are
+            // stored in the purchase's record and written to the AIR server as
+            // its delivery record (see `delivery`).
+            let signed = issue.results.iter().filter(|r| r.is_ok()).count();
+            lines.push(format!(
+                "  signed {signed} output(s), {} unit(s)",
+                issue.signed_units
+            ));
+            let failed: Vec<String> = issue
+                .results
+                .iter()
+                .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
+                .collect();
+            if let Some(first) = failed.first() {
+                lines.push(format!(
+                    "  not issued: {} output(s), the first because: {first}",
+                    failed.len()
+                ));
             }
         }
     }
@@ -297,9 +390,13 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
 mod tests {
     use super::*;
     use crate::records::Status;
+    use crate::rotation::{Rollovers, Rotor};
+    use crate::server::SharedRotating;
     use mint_types::Amount;
+    use sp_wire::air_request::delivery::Outcome;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     // DID 0279be66..1798, then outputs 4 -> 3G and 1 -> 5G (5 units in all)
     const PAYLOAD_HEX: &str = "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179802000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
@@ -307,19 +404,80 @@ mod tests {
     /// requested.
     const BTC_10K: u64 = 1_000_000;
 
-    fn fixture(name: &str) -> (Mutex<MintLogic>, Records, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("psp-mint-svc-{}-{name}", {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            format!(
-                "{}-{}",
-                std::process::id(),
-                N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    /// The mint wired the way `Settings::open_mint` wires it: the rotor and its
+    /// rollovers behind a `Rotating`, the mint behind its mutex, and the
+    /// settlement records behind a mutex.
+    struct Mint {
+        logic: Mutex<MintLogic>,
+        rot: SharedRotating,
+        records: Mutex<Records>,
+        dir: PathBuf,
+    }
+
+    impl Mint {
+        fn open(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("psp-mint-svc-{}-{name}", {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                format!(
+                    "{}-{}",
+                    std::process::id(),
+                    N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
+            }));
+            let _ = fs::remove_dir_all(&dir);
+            let (rotor, logic) = Rotor::open(&dir, Amount::from_units(1024), 0, 0).unwrap();
+            let rollovers = Rollovers::open(&dir).unwrap();
+            Mint {
+                logic: Mutex::new(logic),
+                rot: Rotating::new(rotor, rollovers),
+                records: Mutex::new(Records::open(&dir.join("settlements.json")).unwrap()),
+                dir,
+            }
+        }
+
+        /// One cycle under `policy`.
+        fn run_under(
+            &self,
+            found: &[Received],
+            price: &mut dyn FnMut() -> Result<u64, String>,
+            report: &mut dyn FnMut(&Received, &Settlement),
+            policy: &Policy,
+        ) -> Result<(), SettleError> {
+            run_once_shared(
+                &self.logic,
+                &self.rot,
+                &self.records,
+                found,
+                price,
+                report,
+                policy,
             )
-        }));
-        let _ = fs::remove_dir_all(&dir);
-        let logic = crate::mint::open(&dir, Amount::from_units(1024)).unwrap();
-        let records = Records::open(&dir.join("settlements.json")).unwrap();
-        (Mutex::new(logic), records, dir)
+        }
+
+        /// One cycle under the default policy.
+        fn run(
+            &self,
+            found: &[Received],
+            price: &mut dyn FnMut() -> Result<u64, String>,
+            report: &mut dyn FnMut(&Received, &Settlement),
+        ) {
+            self.run_under(found, price, report, &Policy::default())
+                .unwrap();
+        }
+
+        fn record(&self, txid: &str) -> Option<crate::records::Record> {
+            self.records.lock().unwrap().get(txid).cloned()
+        }
+
+        fn issued_units(&self) -> Amount {
+            self.logic.lock().unwrap().audit_totals().unwrap().0
+        }
+    }
+
+    impl Drop for Mint {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 
     fn received(txid: &str, confirmations: u32) -> Received {
@@ -333,91 +491,66 @@ mod tests {
 
     #[test]
     fn the_mint_is_not_locked_while_the_price_is_fetched() {
-        let (logic, mut records, dir) = fixture("lock");
+        let m = Mint::open("lock");
         let found = [received("aa", 1)];
         let mut asked = 0;
         let mut seen_free = Vec::new();
-        run_once(
-            &logic,
-            &mut records,
+        m.run(
             &found,
             &mut || {
                 asked += 1;
                 // another thread (the HTTP API) could take the lock right now
-                seen_free.push(logic.try_lock().is_ok());
+                seen_free.push(m.logic.try_lock().is_ok());
                 Ok(BTC_10K)
             },
             &mut |_, _| {},
-        )
-        .unwrap();
+        );
         assert_eq!(asked, 1);
         assert_eq!(seen_free, vec![true]);
-        assert_eq!(records.get("aa").unwrap().locked_price_cents, Some(BTC_10K));
-        drop(logic);
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(m.record("aa").unwrap().locked_price_cents, Some(BTC_10K));
+    }
+
+    #[test]
+    fn the_records_are_not_locked_while_the_price_is_fetched() {
+        // A reconciliation request (kind 15) takes the records lock: it must not
+        // wait for a price source.
+        let m = Mint::open("records-free");
+        let mut seen_free = Vec::new();
+        m.run(
+            &[received("aa", 1)],
+            &mut || {
+                seen_free.push(m.records.try_lock().is_ok());
+                Ok(BTC_10K)
+            },
+            &mut |_, _| {},
+        );
+        assert_eq!(seen_free, vec![true]);
     }
 
     #[test]
     fn the_price_is_only_asked_for_payments_with_no_record_and_a_confirmation() {
-        let (logic, mut records, dir) = fixture("need");
+        let m = Mint::open("need");
         let mut asked = 0;
         let mut price = || {
             asked += 1;
             Ok(BTC_10K)
         };
         // not in a block yet: no price
-        run_once(
-            &logic,
-            &mut records,
-            &[received("zero", 0)],
-            &mut price,
-            &mut |_, _| {},
-        )
-        .unwrap();
+        m.run(&[received("zero", 0)], &mut price, &mut |_, _| {});
         // first sight at 1 confirmation: price
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 1)],
-            &mut price,
-            &mut |_, _| {},
-        )
-        .unwrap();
+        m.run(&[received("aa", 1)], &mut price, &mut |_, _| {});
         // already locked: no price, then settled: no price
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 3)],
-            &mut price,
-            &mut |_, _| {},
-        )
-        .unwrap();
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 6)],
-            &mut price,
-            &mut |_, _| {},
-        )
-        .unwrap();
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 7)],
-            &mut price,
-            &mut |_, _| {},
-        )
-        .unwrap();
+        m.run(&[received("aa", 3)], &mut price, &mut |_, _| {});
+        m.run(&[received("aa", 6)], &mut price, &mut |_, _| {});
+        m.run(&[received("aa", 7)], &mut price, &mut |_, _| {});
         assert_eq!(asked, 1);
-        assert_eq!(records.get("aa").unwrap().status, Status::Issued);
-        assert!(records.get("zero").is_none());
-        drop(logic);
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(m.record("aa").unwrap().status, Status::Issued);
+        assert!(m.record("zero").is_none());
     }
 
     #[test]
     fn a_reorg_after_settlement_never_settles_twice_and_one_before_waits() {
-        let (logic, mut records, dir) = fixture("reorg");
+        let m = Mint::open("reorg");
         let mut price = || Ok(BTC_10K);
         let mut issued = 0;
         let mut count = |_: &Received, s: &Settlement| {
@@ -426,88 +559,50 @@ mod tests {
             }
         };
         // locked at 1, then a reorg takes it back to 0 before it settles: it waits
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 1)],
-            &mut price,
-            &mut count,
-        )
-        .unwrap();
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 0)],
-            &mut price,
-            &mut count,
-        )
-        .unwrap();
-        assert_eq!(records.get("aa").unwrap().status, Status::Locked);
-        assert_eq!(records.unsettled(), vec!["aa".to_string()]);
+        m.run(&[received("aa", 1)], &mut price, &mut count);
+        m.run(&[received("aa", 0)], &mut price, &mut count);
+        assert_eq!(m.record("aa").unwrap().status, Status::Locked);
+        assert_eq!(
+            m.records.lock().unwrap().unsettled(),
+            vec!["aa".to_string()]
+        );
         // mined again and settled at 6
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 6)],
-            &mut price,
-            &mut count,
-        )
-        .unwrap();
-        assert_eq!(records.get("aa").unwrap().status, Status::Issued);
-        assert!(records.unsettled().is_empty());
+        m.run(&[received("aa", 6)], &mut price, &mut count);
+        assert_eq!(m.record("aa").unwrap().status, Status::Issued);
+        assert!(m.records.lock().unwrap().unsettled().is_empty());
         // a later reorg and re-mining is seen again but never issues again
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 0)],
-            &mut price,
-            &mut count,
-        )
-        .unwrap();
-        run_once(
-            &logic,
-            &mut records,
-            &[received("aa", 6)],
-            &mut price,
-            &mut count,
-        )
-        .unwrap();
+        m.run(&[received("aa", 0)], &mut price, &mut count);
+        m.run(&[received("aa", 6)], &mut price, &mut count);
         assert_eq!(issued, 1);
-        assert_eq!(records.get("aa").unwrap().status, Status::Issued);
-        drop(logic);
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(m.record("aa").unwrap().status, Status::Issued);
+        assert_eq!(m.issued_units(), Amount::from_units(5));
     }
 
     #[test]
     fn every_payment_is_reported_and_a_failed_price_is_retried_next_cycle() {
-        let (logic, mut records, dir) = fixture("report");
+        let m = Mint::open("report");
+        let terms = Policy::default().terms;
         let found = [received("aa", 1), received("bb", 1)];
         let mut reports = Vec::new();
-        run_once(
-            &logic,
-            &mut records,
-            &found,
-            &mut || Err("down".to_string()),
-            &mut |r, s| reports.push((r.txid.clone(), describe(r, s))),
-        )
-        .unwrap();
+        m.run(&found, &mut || Err("down".to_string()), &mut |r, s| {
+            reports.push((r.txid.clone(), describe_with(r, s, &terms)))
+        });
         assert_eq!(reports.len(), 2);
-        assert!(reports[0].1[1].contains("no price this run (down)"));
-        assert!(records.get("aa").is_none());
+        assert_eq!(
+            reports[0].1[1],
+            "  waiting: no price this run (down); will retry next run"
+        );
+        assert!(m.record("aa").is_none());
 
         let mut reports = Vec::new();
-        run_once(
-            &logic,
-            &mut records,
-            &found,
-            &mut || Ok(BTC_10K),
-            &mut |r, s| reports.push((r.txid.clone(), describe(r, s))),
-        )
-        .unwrap();
-        assert!(reports[0].1[1].contains("price locked at 10000.00 USD/BTC"));
-        assert!(records.get("aa").is_some() && records.get("bb").is_some());
-        drop(logic);
-        fs::remove_dir_all(&dir).unwrap();
+        m.run(&found, &mut || Ok(BTC_10K), &mut |r, s| {
+            reports.push((r.txid.clone(), describe_with(r, s, &terms)))
+        });
+        assert_eq!(
+            reports[0].1[1],
+            "  price locked at 10000.00 USD/BTC, waiting: 1 of 6 confirmations"
+        );
+        assert!(m.record("aa").is_some() && m.record("bb").is_some());
     }
 
     #[test]
@@ -515,7 +610,7 @@ mod tests {
         use crate::seal;
         use sp_wire::seal::SecretKey;
 
-        let (logic, mut records, dir) = fixture("sealed");
+        let m = Mint::open("sealed");
         let mint = SecretKey::new();
         let other = SecretKey::new();
         let plain = hex::decode(PAYLOAD_HEX).unwrap();
@@ -527,75 +622,63 @@ mod tests {
         let mut cleartext = received("cleartext", 6);
         cleartext.payload = Some(plain.clone());
 
-        let (found, dropped) = seal::open_payloads(&mint, vec![ours, theirs, cleartext]);
-        assert_eq!(dropped, 2);
+        let (found, _) = seal::open_payloads(&mint, vec![ours, theirs, cleartext]);
 
         let mut asked = 0;
-        run_once(
-            &logic,
-            &mut records,
+        m.run(
             &found,
             &mut || {
                 asked += 1;
                 Ok(BTC_10K)
             },
             &mut |_, _| {},
-        )
-        .unwrap();
+        );
 
         // only the payment sealed to this mint was priced, recorded and issued
         assert_eq!(asked, 1);
-        assert_eq!(records.get("ours").unwrap().status, Status::Issued);
-        assert!(records.get("theirs").is_none());
-        assert!(records.get("cleartext").is_none());
-        assert_eq!(
-            logic.lock().unwrap().audit_totals().unwrap().0,
-            Amount::from_units(5)
-        );
-        drop(logic);
-        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(m.record("ours").unwrap().status, Status::Issued);
+        assert!(m.record("theirs").is_none());
+        assert!(m.record("cleartext").is_none());
+        assert_eq!(m.issued_units(), Amount::from_units(5));
     }
 
     #[test]
-    fn describe_lists_signatures_and_the_over_under() {
-        let (logic, mut records, dir) = fixture("describe");
+    fn the_scan_log_has_counts_and_amounts_and_no_signature() {
+        let m = Mint::open("describe");
+        let terms = Policy::default().terms;
         let r = received("aa", 6);
         let mut lines = Vec::new();
-        run_once(
-            &logic,
-            &mut records,
+        m.run(
             std::slice::from_ref(&r),
             &mut || Ok(BTC_10K),
-            &mut |r, s| lines = describe(r, s),
-        )
-        .unwrap();
-        assert_eq!(lines[0], "aa confirmations=6 value_sats=5000");
-        assert_eq!(lines[1], "  over/under: 0 bps");
-        let signature_lines: Vec<&String> = lines
-            .iter()
-            .filter(|l| l.starts_with("  signature "))
-            .collect();
-        assert_eq!(signature_lines.len(), 2);
-        // each line is the blind nonce then the signature, both 33-byte points
-        for line in signature_lines {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            assert_eq!(parts.len(), 3);
-            assert_eq!(parts[1].len(), 66);
-            assert_eq!(parts[2].len(), 66);
+            &mut |r, s| lines = describe_with(r, s, &terms),
+        );
+        assert_eq!(
+            lines,
+            [
+                "aa confirmations=6 value_sats=5000",
+                "  over/under: 0 bps",
+                "  signed 2 output(s), 5 unit(s)",
+            ]
+        );
+        // what the payer is owed is in the record, and none of it is in the log
+        let record = m.record("aa").unwrap();
+        let Outcome::Signed(signed) = record.delivery.unwrap().outcome else {
+            panic!("an exact purchase is issued");
+        };
+        assert_eq!(signed.signatures.len(), 2);
+        for owed in &signed.signatures {
+            for line in &lines {
+                assert!(!line.contains(&owed.blind_nonce), "{line}");
+                assert!(!line.contains(&owed.signature), "{line}");
+            }
         }
-        drop(logic);
-        fs::remove_dir_all(&dir).unwrap();
     }
-
     #[test]
-    fn cents_are_printed_as_dollars() {
+    fn log_amounts_are_printed_as_dollars_and_percent() {
         assert_eq!(cents_text(8_167_355), "81673.55");
         assert_eq!(cents_text(5), "0.05");
         assert_eq!(cents_text(10_000_000), "100000.00");
-    }
-
-    #[test]
-    fn percentages_are_printed_from_basis_points() {
         assert_eq!(percent_text(100), "1%");
         assert_eq!(percent_text(1000), "10%");
         assert_eq!(percent_text(150), "1.5%");
@@ -628,6 +711,7 @@ mod tests {
             keyset: "00".repeat(8),
             results: vec![],
             blind_nonces: vec![],
+            signed_units: 0,
             skipped_units: 2,
             credit_cents: 100,
             over_under_bps: 0,
@@ -647,10 +731,12 @@ mod tests {
                 .any(|l| l.contains("overpaid by more than 1.5%")),
             "{lines:?}"
         );
-        assert!(
-            lines.iter().any(|l| l.contains(&"07".repeat(33))),
-            "{lines:?}"
+        // a credit names the reply key and says how it is claimed (kind 15)
+        let credit = format!(
+            "  overpaid by more than 1.5%: credit 1.00 USD recorded for reply key {}; the payer can claim it over AIR (kind 15)",
+            "07".repeat(33)
         );
+        assert!(lines.contains(&credit), "{lines:?}");
         let held = settle::Unsettled {
             payer_did: [7; crate::payload::DID_LEN],
             requested_units: 100,
@@ -659,25 +745,33 @@ mod tests {
             over_under_bps: -4000,
         };
         let lines = describe_with(&r, &Settlement::PaidUnsettled(held), &terms);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("paid but unsettled: 100 units requested, 60 paid")),
-            "{lines:?}"
+        assert_eq!(lines[1], "  over/under: -4000 bps");
+        assert_eq!(
+            lines[2],
+            format!(
+                "  paid but unsettled: 100 units requested, 60 paid; no smaller request gets within 1.5% of the amount paid, so nothing was signed and the BTC is held for reply key {}",
+                "07".repeat(33)
+            )
         );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("AIR request for a new matching request not built")),
-            "{lines:?}"
+        // kind 15 is built: the payer can answer, and the window is the terms'
+        assert_eq!(
+            lines[3],
+            "  the payer is told over AIR and can send a corrected request (kind 15); if it is not settled within 1 day(s) the payment is forfeited and the mint keeps the BTC"
         );
+        // and nothing says the exchange is not built
+        for line in &lines {
+            assert!(!line.contains("not built"), "{line}");
+            assert!(!line.contains("payer DID"), "{line}");
+        }
     }
 
     #[test]
     fn a_poisoned_records_lock_fails_the_pass_and_settles_nothing() {
-        let (logic, records, dir) = fixture("poison");
-        let records = std::sync::Arc::new(Mutex::new(records));
-        let held = std::sync::Arc::clone(&records);
+        let m = Mint::open("poison");
+        let records = Arc::new(Mutex::new(
+            Records::open(&m.dir.join("poisoned.json")).unwrap(),
+        ));
+        let held = Arc::clone(&records);
         let died = std::thread::spawn(move || {
             let _guard = held.lock().unwrap();
             panic!("a thread dies holding the records");
@@ -692,8 +786,8 @@ mod tests {
         let found = [received("aa", 6)];
         let mut reported = 0;
         let err = run_once_shared(
-            &logic,
-            None,
+            &m.logic,
+            &m.rot,
             &records,
             &found,
             &mut || Ok(BTC_10K),
@@ -703,11 +797,192 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SettleError::RecordsPoisoned), "{err}");
         assert_eq!(reported, 0, "nothing was settled or reported");
-        assert_eq!(
-            logic.lock().unwrap().audit_totals().unwrap().0,
-            Amount::ZERO
-        );
+        assert_eq!(m.issued_units(), Amount::ZERO);
         assert!(records.is_poisoned(), "the lock was not recovered");
+    }
+
+    #[test]
+    fn a_poisoned_mint_or_rotor_lock_fails_the_pass_and_settles_nothing() {
+        let m = Mint::open("poison-mint");
+        let logic = Arc::new(Mutex::new(
+            Rotor::open(&m.dir.join("other"), Amount::from_units(16), 0, 0)
+                .unwrap()
+                .1,
+        ));
+        let held = Arc::clone(&logic);
+        let died = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("a thread dies holding the mint");
+        })
+        .join();
+        assert!(died.is_err());
+        let mut reported = 0;
+        let err = run_once_shared(
+            &logic,
+            &m.rot,
+            &m.records,
+            &[received("aa", 6)],
+            &mut || Ok(BTC_10K),
+            &mut |_, _| reported += 1,
+            &Policy::default(),
+        )
+        .unwrap_err();
+        match err {
+            SettleError::Mint(why) => assert_eq!(why, "mint lock is poisoned"),
+            other => panic!("{other}"),
+        }
+        assert_eq!(reported, 0);
+        // the mint is needed before the payment is looked at: no record, and
+        // nothing was signed
+        assert!(m.record("aa").is_none());
+        assert_eq!(m.issued_units(), Amount::ZERO);
+
+        // a poisoned rotor lock fails the pass the same way
+        let m = Mint::open("poison-rotor");
+        let rot = Arc::clone(&m.rot);
+        let died = std::thread::spawn(move || {
+            let _guard = rot.rotor.lock().unwrap();
+            panic!("a thread dies holding the rotor");
+        })
+        .join();
+        assert!(died.is_err());
+        let err = m
+            .run_under(
+                &[received("aa", 6)],
+                &mut || Ok(BTC_10K),
+                &mut |_, _| {},
+                &Policy::default(),
+            )
+            .unwrap_err();
+        match err {
+            SettleError::Mint(why) => assert_eq!(why, "rotor lock is poisoned"),
+            other => panic!("{other}"),
+        }
+        assert!(m.record("aa").is_none());
+        assert_eq!(m.issued_units(), Amount::ZERO);
+    }
+
+    #[test]
+    fn a_payment_the_previous_keyset_names_is_signed_by_it_through_the_cycle() {
+        // The rotor's previous key set reaches settlement: the cycle hands it to
+        // `settle_ruled` as `previous`.
+        let dir = std::env::temp_dir().join(format!("psp-mint-svc-{}-rotated", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let t = 10_000;
+        let (mut rotor, mut logic) =
+            Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, t).unwrap();
+        rotor.first_issue = Some(t);
+        rotor
+            .clock
+            .store(t + 3600, std::sync::atomic::Ordering::SeqCst);
+        rotor.refresh(&mut logic).unwrap();
+        let previous_id = rotor.previous.as_ref().unwrap().0.id.clone();
+        let current_id = crate::rotation::keyset_id(logic.public_keys());
+        assert_ne!(previous_id, current_id);
+        let rot = Rotating::new(rotor, Rollovers::open(&dir).unwrap());
+        let logic = Mutex::new(logic);
+        let records = Mutex::new(Records::open(&dir.join("settlements.json")).unwrap());
+
+        let mut payload = crate::payload::decode(&hex::decode(PAYLOAD_HEX).unwrap()).unwrap();
+        payload.keyset = Some(previous_id.clone());
+        let mut r = received("aa", 6);
+        r.payload = Some(crate::payload::encode(&payload).unwrap());
+        let mut signed_by = None;
+        run_once_shared(
+            &logic,
+            &rot,
+            &records,
+            &[r],
+            &mut || Ok(BTC_10K),
+            &mut |_, s| {
+                if let Settlement::Issued(issue) = s {
+                    signed_by = Some(issue.keyset.clone());
+                }
+            },
+            &Policy::default(),
+        )
+        .unwrap();
+        assert_eq!(signed_by, Some(previous_id));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A payload for the reply key `07..07` asking for these `(units, seed)`
+    /// outputs, in the wire form `payload::decode` reads.
+    fn payload_bytes(outputs: &[(u64, u8)]) -> Vec<u8> {
+        use secp256k1::{PublicKey, SECP256K1, SecretKey};
+        let mut bytes = vec![33u8];
+        bytes.extend_from_slice(&[7u8; 33]);
+        bytes.push(outputs.len() as u8);
+        for &(units, seed) in outputs {
+            bytes.extend_from_slice(&units.to_be_bytes());
+            let key = SecretKey::from_slice(&[seed; 32]).unwrap();
+            bytes.extend_from_slice(&PublicKey::from_secret_key(SECP256K1, &key).serialize());
+        }
+        bytes
+    }
+
+    #[test]
+    fn fees_come_off_what_the_payment_buys_and_are_kept_in_the_records() {
+        // delivery.read_fee 1, reconciliation.fee 2, reconciliation.write_fee 3
+        // (PSP units, $0.10 each at this price)
+        let m = Mint::open("fees");
+        let policy = Policy {
+            fees: crate::settle::ReconcileTerms {
+                fee_units: 2,
+                write_fee_units: 3,
+                read_fee_units: 1,
+                ..Default::default()
+            },
+            ..Policy::default()
+        };
+        // 6,000 sats are 6 units; the first read costs 1, which leaves exactly
+        // the 5 units asked: issued in full, no credit
+        let mut exact = received("exact", 6);
+        exact.value_sats = 6_000;
+        // 12,000 sats are 12 units, less the read 11 against the one note of 16
+        // asked: held, with the rules for the corrected request
+        let mut held = received("held", 6);
+        held.value_sats = 12_000;
+        held.payload = Some(payload_bytes(&[(16, 3)]));
+        let mut kinds = Vec::new();
+        m.run_under(
+            &[exact, held],
+            &mut || Ok(BTC_10K),
+            &mut |r, s| {
+                let kind = match s {
+                    Settlement::Issued(_) => "issued",
+                    Settlement::PaidUnsettled(_) => "held",
+                    _ => "other",
+                };
+                kinds.push((r.txid.clone(), kind));
+            },
+            &policy,
+        )
+        .unwrap();
+        assert_eq!(
+            kinds,
+            vec![
+                ("exact".to_string(), "issued"),
+                ("held".to_string(), "held")
+            ]
+        );
+        let exact = m.record("exact").unwrap();
+        assert_eq!(exact.read_prepaid_units, 1);
+        assert_eq!(exact.credit_cents, 0);
+        assert_eq!(m.issued_units(), Amount::from_units(5));
+        let held = m.record("held").unwrap();
+        assert_eq!(held.read_prepaid_units, 1);
+        let rules = held.rules.as_ref().unwrap();
+        // 12 units paid, less the first read (1), the fee (2), the write (3) and
+        // the follow-up's read (1)
+        assert_eq!(rules.due_units, 5);
+        assert_eq!(rules.reconciliation_fee_units, 2);
+        assert_eq!(rules.write_prepaid_units, 3);
+        assert_eq!(rules.read_prepaid_units, 2);
+        // the first reads are revenue, counted in /audit's reconciliation
+        // section; the fee and the write are counted when a reconciliation settles
+        let report = m.records.lock().unwrap().reconciliation();
+        assert_eq!(report.read_prepaid_units, 2);
+        assert_eq!((report.fees_units, report.write_prepaid_units), (0, 0));
     }
 }

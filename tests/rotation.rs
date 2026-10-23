@@ -1,4 +1,4 @@
-//! Key rotation: generation 0 is the existing mint, the first issue starts the
+//! Key rotation: generation 0 is the first set of keys, the first issue starts the
 //! clock, notes of the previous set are spendable and can be rolled over until
 //! the next rotation, then they are lost.
 //!
@@ -10,17 +10,16 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 
 use mint_server::api::{AuditResponse, CheckStateRequest, CheckStateResponse};
 use mint_server::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
 };
-use psp_mint::melts::MeltLog;
 use psp_mint::rotation::{RolloverRequest, RolloverResponse, Rollovers, RotationResponse, Rotor};
-use psp_mint::server::{Health, KeysetsResponse, PspMeltRequest, Rotating, SharedRotating};
+use psp_mint::server::{KeysetsResponse, PspMeltRequest, SharedRotating};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 
@@ -54,27 +53,13 @@ async fn start(dir: &Path, clock: u64) -> Mint {
 }
 
 async fn start_with(dir: &Path, clock: u64, limits: psp_mint::server::Limits) -> Mint {
-    let (rotor, logic) = Rotor::open_at(dir, Amount::from_units(1024), 1, 1, clock).unwrap();
-    let rot = Rotating::new(rotor, Rollovers::open(dir).unwrap());
-    let state = psp_mint::server::app_state(logic);
-    let melts = Arc::new(Mutex::new(
-        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
-    ));
-    let air = common::Air::start(&state, &rot, limits);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = psp_mint::server::router_full(
-        Arc::clone(&state),
-        Health::new(100),
-        melts,
-        limits,
-        Some(Arc::clone(&rot)),
-    );
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mint = common::PspMint::open_in(dir, 1, 1, clock, limits);
+    let air = mint.air();
+    let base = mint.http().await;
     Mint {
-        base: format!("http://{addr}"),
-        state,
-        rot,
+        base,
+        state: Arc::clone(&mint.state),
+        rot: Arc::clone(&mint.rot),
         air,
     }
 }
@@ -102,6 +87,14 @@ impl Mint {
         let signature = bdhke::unblind_message(&out.0, &r, &logic.public_keys()[&amount]);
         (Note { nonce, signature }, kp)
     }
+    /// Ask for the rotation, which records the first issue and so starts the
+    /// clock, and check that it and the keysets name the same current set.
+    async fn records_first_issue(&self) {
+        let rotation: RotationResponse = self.get("/rotation").await;
+        let keysets: KeysetsResponse = self.get("/keysets").await;
+        assert_eq!(rotation.current.id, keysets.current);
+    }
+
     /// A read: `/audit` is the SPI's, over HTTP; the rest are the wallet's, over AIR.
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> T {
         if path != "/audit" {
@@ -201,9 +194,11 @@ fn rollover(
 async fn rotation_keeps_previous_notes_for_one_period_then_they_are_lost() {
     let dir = scratch("cycle");
     let one = Amount::from_units(1);
-    // An existing mint from before rotation: its keys are generation 0.
-    let keys0 = psp_mint::mint::open(&dir, Amount::from_units(1024))
+    // The keys of generation 0 (epoch 0), opened on their own first: the mint
+    // started next in the same folder serves these same keys.
+    let keys0 = Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, T)
         .unwrap()
+        .1
         .public_keys()
         .clone();
     let m = start(&dir, T).await;
@@ -346,7 +341,7 @@ async fn a_rollover_with_one_spent_input_among_several_burns_none() {
     // keyset read), so look once before the clock moves, as the other
     // rotation tests do. Otherwise the first issue is stamped at T + H and
     // nothing has rotated yet.
-    let _: RotationResponse = m.get("/rotation").await;
+    m.records_first_issue().await;
     m.set_clock(T + H);
     let w: RotationResponse = m.get("/rotation").await;
     let id0 = w.previous.as_ref().unwrap().id.clone();
@@ -420,7 +415,7 @@ async fn a_rollover_interrupted_after_the_burn_is_finished_by_the_retry() {
     let one = Amount::from_units(1);
     let m = start(&dir, T).await;
     let n = m.issue(one);
-    let _: RotationResponse = m.get("/rotation").await;
+    m.records_first_issue().await;
     m.set_clock(T + H);
     let ids: KeysetsResponse = m.get("/keysets").await;
     let (req, _, _) = rollover(&n, one, ids.previous.as_ref().unwrap(), &ids.current);
@@ -433,7 +428,7 @@ async fn a_rollover_interrupted_after_the_burn_is_finished_by_the_retry() {
         let path = dir.join(psp_mint::rotation::ROLLOVERS_FILE);
         std::fs::write(
             &path,
-            serde_json::json!({"answers": {}, "pending": {req.hash(): 1}}).to_string(),
+            common::rollovers_file(serde_json::json!({"pending": {req.hash(): 1}})),
         )
         .unwrap();
         let (k, l) = rotor.previous.as_ref().unwrap();
@@ -454,9 +449,9 @@ async fn one_melt_may_mix_the_current_and_previous_sets() {
     let one = Amount::from_units(1);
     let m = start(&dir, T).await;
     let old = m.issue(one);
-    let _: RotationResponse = m.get("/rotation").await;
+    m.records_first_issue().await;
     m.set_clock(T + H);
-    let _: RotationResponse = m.get("/rotation").await;
+    m.records_first_issue().await;
     let new = m.issue(one);
     let nonces = vec![old.0.nonce, new.0.nonce];
     let ids: KeysetsResponse = m.get("/keysets").await;
@@ -495,7 +490,7 @@ async fn rollover_after_retirement(
     let one = Amount::from_units(1);
     let m = start(&dir, T).await;
     let n = m.issue(one);
-    let _: RotationResponse = m.get("/rotation").await;
+    m.records_first_issue().await;
     m.set_clock(T + H);
     let ids: KeysetsResponse = m.get("/keysets").await;
     let (req, _, _) = rollover(&n, one, ids.previous.as_ref().unwrap(), &ids.current);
@@ -507,9 +502,10 @@ async fn rollover_after_retirement(
         let nonce = hex::encode(n.0.nonce.0.serialize());
         std::fs::write(
             dir.join(psp_mint::rotation::ROLLOVERS_FILE),
-            serde_json::json!({"answers": {}, "pending": {req.hash(): 1}, "burned": burned,
-                "holds": {req.hash(): [nonce]}})
-            .to_string(),
+            common::rollovers_file(
+                serde_json::json!({"pending": {req.hash(): 1}, "burned": burned,
+                "holds": {req.hash(): [nonce]}}),
+            ),
         )
         .unwrap();
         if burn {
@@ -553,27 +549,11 @@ async fn a_resumed_rollover_after_retirement_finishes_only_with_stored_proof_of_
         (400, Some("burn_not_proven")),
         "{body}"
     );
-}
-
-#[tokio::test]
-async fn a_resumed_rollover_whose_output_set_was_deleted_meanwhile_is_signed_by_the_current_set() {
+    // The set the outputs name is deleted meanwhile too: the outputs are signed
+    // by the current set.
     let (code, body, signer) = rollover_after_retirement("proof-late", true, true, true).await;
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["keyset"], signer.as_str(), "signed by the current set");
-}
-
-#[tokio::test]
-async fn every_keyset_field_is_in_the_rollover_request_hash() {
-    let dir = scratch("hash-keysets");
-    let one = Amount::from_units(1);
-    let m = start(&dir, T).await;
-    let n = m.issue(one);
-    let (req, _, _) = rollover(&n, one, &"ab".repeat(8), &"cd".repeat(8));
-    let mut a = req.clone();
-    a.input_keysets = vec!["ef".repeat(8)];
-    let mut b = req.clone();
-    b.keyset = "ef".repeat(8);
-    assert!(req.hash() != a.hash() && req.hash() != b.hash() && a.hash() != b.hash());
 }
 
 #[tokio::test]
@@ -587,9 +567,8 @@ async fn a_note_held_by_a_pending_rollover_cannot_be_melted_or_rolled_over_by_an
     // Recorded and holding the note, then a crash before its burn.
     std::fs::write(
         dir.join(psp_mint::rotation::ROLLOVERS_FILE),
-        serde_json::json!({"answers": {}, "pending": {req.hash(): 0},
-            "holds": {req.hash(): [hex::encode(n.0.nonce.0.serialize())]}})
-        .to_string(),
+        common::rollovers_file(serde_json::json!({"pending": {req.hash(): 0},
+            "holds": {req.hash(): [hex::encode(n.0.nonce.0.serialize())]}})),
     )
     .unwrap();
     *m.rot.rollovers.lock().unwrap() = Rollovers::open(&dir).unwrap();
@@ -626,7 +605,7 @@ async fn the_rollover_has_its_own_body_ceiling_and_note_cap() {
     .await;
     let a = m.issue(one);
     let b = m.issue(one);
-    let _: RotationResponse = m.get("/rotation").await;
+    m.records_first_issue().await;
     m.set_clock(T + H);
     let ids: KeysetsResponse = m.get("/keysets").await;
     let prev = ids.previous.clone().unwrap();

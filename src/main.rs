@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use mint_server::state::AppState;
 use mint_types::Amount;
@@ -15,8 +15,7 @@ use psp_mint::network::{self, Network};
 use psp_mint::price::Lazy;
 use psp_mint::records::{Records, SharedRecords};
 use psp_mint::rpc::Rpc;
-use psp_mint::settle::Settlement;
-use psp_mint::{rotation, scan, seal, server, service};
+use psp_mint::{rotation, seal, server, service};
 use sp_wire::seal::SecretKey;
 
 /// Load the settings, or say everything that is wrong with them.
@@ -132,67 +131,13 @@ impl Settings {
         Some(Deliverer::new(air.server, air.timeout_secs, key.clone()))
     }
 
-    /// Write the records of every purchase that is owed one and has none stored.
-    /// Never fails a scan: what could not be written is printed and tried again
-    /// on the next pass.
-    fn deliver(&self, deliverer: &mut Option<Deliverer>, records: &Mutex<Records>, quiet: bool) {
-        match deliverer {
-            Some(deliverer) => {
-                // The records are locked to plan and to apply, not while the
-                // records are written to the AIR server.
-                deliverer.pass_shared(records, Instant::now());
-            }
-            None => {
-                let Ok(guard) = service::lock_records(records) else {
-                    eprintln!("delivery: the settlement records lock is poisoned; skipped");
-                    return;
-                };
-                let waiting = guard.undelivered().len();
-                drop(guard);
-                if waiting > 0 && !quiet {
-                    println!(
-                        "{waiting} purchase(s) are waiting for their signatures to be delivered over \
-                         AIR; air.server and air.host are not set, so they stay in the records"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Forfeit every payment whose reconciliation window has closed with the
-    /// payment still open: the mint keeps the BTC and owes nothing, and `/audit`
-    /// shows it apart. Never fails a scan. A poisoned records lock is logged and
-    /// skipped (the watcher exits the process).
-    fn forfeit(&self, records: &Mutex<Records>) {
-        let Ok(mut guard) = service::lock_records(records) else {
-            eprintln!("forfeit check skipped: the settlement records lock is poisoned");
-            return;
-        };
-        match guard.forfeit_expired(server::now_secs()) {
-            Ok(gone) => {
-                for txid in gone {
-                    println!(
-                        "forfeited {txid}: its reconciliation window closed with the payment \
-                         unsettled; the mint keeps the BTC"
-                    );
-                }
-            }
-            Err(e) => eprintln!("forfeit check failed, will retry: {e}"),
-        }
-    }
-
     fn records(&self) -> Result<Records, Box<dyn Error>> {
-        Ok(Records::open_with_legacy(
-            &self.data_dir.join("settlements.json"),
-            &self.data_dir.join("processed_txids.json"),
-        )?)
+        Ok(Records::open(&self.data_dir.join("settlements.json"))?)
     }
 
-    /// Scan the wallet once and move every payment as far as it can go.
-    /// `quiet` leaves out payments that are already settled.
-    ///
-    /// Payloads are opened with the mint's DID key first. A payment whose data
-    /// does not open is not for this mint and is ignored, not rejected.
+    /// Scan the wallet once and move every payment as far as it can go
+    /// (`service::cycle`), after checking that bitcoind is on the selected
+    /// network. `quiet` leaves out payments that are already settled.
     fn cycle(
         &self,
         state: &AppState,
@@ -208,55 +153,18 @@ impl Settings {
             cfg.rpc_timeout_secs,
         )?;
         network::verify(&self.node()?, cfg.network)?;
-        let checkpoint = scan::Checkpoint::load(&self.data_dir)?;
-        // The records are locked only to read what is unsettled, not while the
-        // wallet is scanned.
-        let unsettled = service::lock_records(records)?.unsettled();
-        let since = scan::since(&rpc, checkpoint.as_ref(), cfg.min_confirmations, &unsettled)?;
-        let (found, ignored) = seal::open_payloads(did, since.received);
-        if !quiet {
-            if found.is_empty() && ignored == 0 {
-                println!("no payments received by wallet {}", cfg.wallet);
-            }
-            if ignored > 0 {
-                println!("ignored {ignored} payment(s) whose data is not encrypted to this mint");
-            }
-        }
-        // Rotate first, so a settlement signs with the current key set.
-        {
-            let mut logic = state
-                .logic
-                .lock()
-                .map_err(|_| "the mint lock is poisoned")?;
-            rot.rotor
-                .lock()
-                .map_err(|_| "the rotor lock is poisoned")?
-                .refresh(&mut logic)?;
-        }
         let price_config = cfg.price();
         let policy = cfg.policy();
-        let terms = policy.terms;
         let mut price = Lazy::new(|| service::btc_usd_cents(price_config));
-        service::run_once_shared(
-            &state.logic,
-            Some(&**rot),
-            records,
-            &found,
-            &mut || price.get(),
-            &mut |received, settlement| {
-                if quiet && matches!(settlement, Settlement::AlreadySettled(_)) {
-                    return;
-                }
-                for line in service::describe_with(received, settlement, &terms) {
-                    println!("{line}");
-                }
-            },
-            &policy,
-        )?;
-        // Only after every payment was processed: a failed pass reads the same
-        // blocks again next time.
-        since.next.save(&self.data_dir)?;
-        Ok(())
+        let pass = service::Pass {
+            data_dir: &self.data_dir,
+            wallet: &cfg.wallet,
+            min_confirmations: cfg.min_confirmations,
+            policy: &policy,
+            did,
+            quiet,
+        };
+        service::cycle(&pass, &rpc, state, rot, records, &mut || price.get())
     }
 }
 
@@ -270,8 +178,8 @@ fn run_once(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let mut deliverer = settings.deliverer(&did);
     let cycle = settings.cycle(&state, &rot, &records, &did, false);
     // Delivery is tried even when the scan failed: what was issued before is owed.
-    settings.deliver(&mut deliverer, &records, false);
-    settings.forfeit(&records);
+    service::deliver(&mut deliverer, &records, false);
+    service::forfeit(&records, server::now_secs());
     cycle
 }
 
@@ -341,8 +249,8 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
             }
             // After every scan, whether or not it worked: records that could not
             // be written earlier are tried again here, with a backoff of their own.
-            settings.deliver(&mut deliverer, &scan_records, true);
-            settings.forfeit(&scan_records);
+            service::deliver(&mut deliverer, &scan_records, true);
+            service::forfeit(&scan_records, server::now_secs());
             thread::sleep(interval);
         }
     });
@@ -375,7 +283,7 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
         println!("psp-mint local api (melt, burns, audit, health) listening on http://{bind}");
         axum::serve(
             listener,
-            server::router_audited(state, health, melts, limits, Some(rot), Some(records_path)),
+            server::router_audited(state, health, melts, limits, rot, records_path),
         )
         .with_graceful_shutdown(async {
             shutdown_signal().await;
@@ -405,7 +313,7 @@ fn start_air_listener(
         .name("air-listener".into())
         .spawn(move || {
             let serve = move |kind, body: &[u8]| {
-                server::air_served_with(&state, &rot, Some(&records), &health, &limits, kind, body)
+                server::air_served_with(&state, &rot, &records, &health, &limits, kind, body)
             };
             match psp_mint::air_listener::run_blocking(&air, &did, &serve) {
                 Ok(()) => eprintln!("AIR listener: stopped"),
@@ -457,20 +365,6 @@ fn encrypt(mint_key: &str, payload_hex: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Move the state of a data directory from before networks had their own
-/// folders into `regtest/`. Moves, never deletes.
-fn migrate() -> Result<(), Box<dyn Error>> {
-    let base = data_dir()?;
-    let moved = network::migrate_to_regtest(&base)?;
-    println!(
-        "moved {} into {}",
-        moved.join(", "),
-        Network::Regtest.data_dir(&base).display()
-    );
-    println!("nothing was deleted. Start the mint with --regtest to use them");
-    Ok(())
-}
-
 const USAGE: &str = "\
 psp-mint [--mainnet | --regtest | --signet | --testnet] [command]
 
@@ -490,10 +384,6 @@ psp-mint [--mainnet | --regtest | --signet | --testnet] [command]
                                            on first use.
   encrypt <mint pubkey hex> <payload hex>  Seal a payload to a public key and
                                            print it as hex, for testing.
-  migrate                                  Move data that sits directly in
-                                           ~/.psp-mint (from before the
-                                           per-network folders) into
-                                           ~/.psp-mint/regtest.
   --help                                   Print this text.
 
 The network is --mainnet unless another is given. Settings: psp-mint.toml in
@@ -516,17 +406,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     let flag = network::take_flag(&mut args)?;
-    if let [cmd, key, payload] = args.as_slice() {
-        if cmd == "encrypt" {
-            return encrypt(key, payload);
-        }
-    }
-    if args.first().map(String::as_str) == Some("migrate") {
-        return migrate();
+    // `encrypt` needs no settings, so it is answered before they are read.
+    if args.first().map(String::as_str) == Some("encrypt") {
+        return match args.as_slice() {
+            [_, key, payload] => encrypt(key, payload),
+            _ => Err("encrypt takes a mint public key and a payload, both hex: \
+                 psp-mint encrypt <mint pubkey hex> <payload hex>"
+                .into()),
+        };
     }
     let (settings, loaded) = Settings::load(flag)?;
     if args.first().map(String::as_str) != Some("config") {
-        network::refuse_legacy(&data_dir()?)?;
         // On stderr, so that `psp-mint pubkey` (and `encrypt`) print only their
         // answer on stdout and `MINT_KEY=$(psp-mint pubkey)` captures just the key.
         eprintln!(
@@ -557,7 +447,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             Ok(())
         }
         Some(other) => Err(format!(
-            "unknown command {other:?}. Use `serve`, `config`, `pubkey`, `migrate`, `encrypt <mint pubkey hex> <payload hex>`, or no command to run once. Add --regtest, --signet or --testnet for a network other than mainnet"
+            "unknown command {other:?}. Use `serve`, `config`, `pubkey`, `encrypt <mint pubkey hex> <payload hex>`, or no command to run once. Add --regtest, --signet or --testnet for a network other than mainnet"
         )
         .into()),
     }

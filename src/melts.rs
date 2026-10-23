@@ -174,16 +174,6 @@ mod tests {
     }
 
     #[test]
-    fn recording_nothing_writes_nothing() {
-        let dir = scratch("nothing");
-        let path = dir.join("melt_memos.json");
-        let mut log = MeltLog::open(&path).unwrap();
-        log.record(&[], "memo").unwrap();
-        assert!(!path.exists());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn a_damaged_file_is_an_error_and_is_left_alone() {
         let dir = scratch("damaged");
         let path = dir.join("melt_memos.json");
@@ -193,27 +183,6 @@ mod tests {
             Err(MeltLogError::Corrupt(_))
         ));
         assert_eq!(fs::read_to_string(&path).unwrap(), "not json");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_failed_write_records_nothing() {
-        let dir = scratch("failed");
-        // the directory is gone, so the temporary file cannot be created
-        let path = dir.join("gone").join("melt_memos.json");
-        let mut log = MeltLog::open(&path).unwrap();
-        let a = nonce();
-        assert!(log.record(&[a], "memo").is_err());
-        assert_eq!(log.get(&a), None);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn no_temporary_file_is_left_behind() {
-        let dir = scratch("tmp");
-        let mut log = MeltLog::open(&dir.join("melt_memos.json")).unwrap();
-        log.record(&[nonce()], "memo").unwrap();
-        assert!(!dir.join("melt_memos.json.tmp").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

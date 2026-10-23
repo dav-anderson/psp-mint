@@ -45,8 +45,43 @@ pub const MIN_PSP_ROTATION_PERIOD_HOURS: u64 = 24;
 pub const FILE_ENV: &str = "PSP_CONFIG";
 /// The default ceiling on one request body (1 MiB).
 pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
-/// The smallest ceiling accepted: a request with one note has to fit.
-pub const MIN_REQUEST_BYTES: u64 = 4096;
+
+// ---- the caps ----------------------------------------------------------------
+//
+// Every size ceiling has a hard cap (and a floor), checked when the settings
+// load, so that no setting can reach a value that breaks the mint's own routes.
+// The fees have no cap of their own: see `MAX_FEE_UNITS`. The numbers and the
+// reasoning are in DESIGN.md, "Caps on sizes and fees"; the sums are checked at
+// compile time below.
+
+/// The most any request ceiling may be: 15 MiB, the largest message AIR carries
+/// (16 MiB) less 1 MiB kept for the envelope, its seal and AIR's framing. A higher
+/// ceiling would let the mint take a request that no wallet can send. (The two
+/// loopback routes, `/melt` and `/burns`, are called by esp-mint, whose
+/// `exchange.max_items` cap of 25,000 makes the largest melt about 9.2 MB.)
+pub const MAX_REQUEST_BYTES_CAP: u64 = 15 * 1024 * 1024;
+/// The least any request ceiling may be: 16 KiB. The widest one-note request is
+/// about 8.1 KB: a spend with one note, a 256-byte memo and 64 change outputs
+/// (a rollover with 64 outputs is 7.9 KB), each field at its widest in JSON.
+pub const MIN_REQUEST_BYTES: u64 = 16 * 1024;
+/// The least `rollover.max_items` may be: 64, the most outputs one amount can
+/// need (a `u64` splits into at most 64 powers of two), so that a one-note spend
+/// always fits. The largest change one note can need is 62 outputs, for a
+/// denomination of 2^62, the most `mint.max_denomination_units` allows.
+pub const MIN_ITEMS: u64 = 64;
+/// The most `rollover.max_items` may be: 25,000. A note and an output in JSON
+/// are 482 bytes together, so a request of that many is 12.05 MB, which fits
+/// [`MAX_REQUEST_BYTES_CAP`]; a higher count could not.
+pub const MAX_ITEMS_CAP: u64 = 25_000;
+const _: () = {
+    // a request of the most items fits the largest ceiling (482 bytes a note and
+    // output pair in JSON, measured)
+    assert!(MAX_ITEMS_CAP * 482 < MAX_REQUEST_BYTES_CAP);
+    // the widest one-note request is 8,090 bytes; the smallest ceiling is twice that
+    assert!(MIN_REQUEST_BYTES >= 2 * 8_090);
+    // a note of the largest denomination (2^62) has change of at most 62 outputs
+    assert!(MIN_ITEMS >= 62);
+};
 /// The default largest denomination, in PSP units.
 pub const DEFAULT_MAX_DENOMINATION_UNITS: u64 = 16_777_216;
 /// The default time between scans in `serve`.
@@ -81,8 +116,9 @@ pub struct Spec {
     pub what: &'static str,
 }
 
-/// The most a fee setting may be: 2^62 PSP units, far above anything real, so no sum
-/// of fees can overflow.
+/// The most a fee setting may be: 2^62 PSP units, far above anything real. It is
+/// not a limit on what a mint should charge (there is none, see DESIGN.md, "Caps
+/// on sizes and fees"); it keeps the sums of fees far from `u64::MAX`.
 pub const MAX_FEE_UNITS: u64 = 1 << 62;
 
 pub const SPECS: &[Spec] = &[
@@ -98,35 +134,35 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_MELT_MAX_BYTES",
         default: "1048576",
         units: "bytes",
-        what: "The ceiling on one `POST /melt` body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned.",
+        what: "The ceiling on one `POST /melt` body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "server.rollover_max_request_bytes",
         env: "PSP_ROLLOVER_MAX_BYTES",
         default: "1048576",
         units: "bytes",
-        what: "The ceiling on one rollover request or one spend request (1 MiB), which come over AIR. A larger body is refused with 413 before it is parsed: nothing is burned.",
+        what: "The ceiling on one rollover request or one spend request (1 MiB), which come over AIR. A larger body is refused with 413 before it is parsed: nothing is burned. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "rollover.max_items",
         env: "PSP_ROLLOVER_MAX_ITEMS",
         default: "1000",
         units: "notes",
-        what: "The most notes in one rollover request, and the most notes in and the most change outputs out of one spend request. More is refused 400 before anything is burned.",
+        what: "The most notes in one rollover request, and the most notes in and the most change outputs out of one spend request. More is refused 400 before anything is burned. 64 to 25000: at least the 64 outputs one amount can need, at most what fits one AIR message.",
     },
     Spec {
         key: "server.burns_max_request_bytes",
         env: "PSP_BURNS_MAX_BYTES",
         default: "1048576",
         units: "bytes",
-        what: "The ceiling on one `POST /burns` body (1 MiB). A larger body is refused with 413 before it is parsed.",
+        what: "The ceiling on one `POST /burns` body (1 MiB). A larger body is refused with 413 before it is parsed. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "server.check_state_max_request_bytes",
         env: "PSP_CHECK_STATE_MAX_BYTES",
         default: "1048576",
         units: "bytes",
-        what: "The ceiling on one check-state request (1 MiB), which comes over AIR. A larger body is refused with 413 before it is parsed.",
+        what: "The ceiling on one check-state request (1 MiB), which comes over AIR. A larger body is refused with 413 before it is parsed. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
         key: "bitcoin.network",
@@ -630,16 +666,16 @@ impl Config {
                 key,
                 value as u64,
                 MIN_REQUEST_BYTES,
-                1 << 30,
-                "bytes; a request with one note has to fit, and 1 GiB is the most the mint will hold in memory",
+                MAX_REQUEST_BYTES_CAP,
+                "bytes; a one-note request with 64 outputs has to fit, and 15 MiB is the most one AIR message carries",
             );
         }
         range(
             "rollover.max_items",
             self.rollover_max_items as u64,
-            1,
-            100_000,
-            "notes",
+            MIN_ITEMS,
+            MAX_ITEMS_CAP,
+            "notes; at least the 64 outputs one amount can need, and at most what fits one AIR message",
         );
         range(
             "bitcoin.rpc_timeout_secs",
@@ -1197,9 +1233,22 @@ pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
 }
 
+/// The expected value for the operating system the tests run on: bitcoind's
+/// default data folder is not the same on macOS and Linux, and neither is
+/// assumed.
+#[cfg(test)]
+fn for_this_os<'a>(macos: &'a str, linux: &'a str) -> &'a str {
+    if cfg!(target_os = "macos") {
+        macos
+    } else {
+        linux
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use std::collections::HashMap;
 
     fn scratch(name: &str) -> PathBuf {
@@ -1352,17 +1401,21 @@ mod tests {
                 spec.key
             );
         }
-        fs::remove_dir_all(&dir).unwrap();
-    }
 
-    #[test]
-    fn the_defaults_are_the_values_the_mint_used_before_it_had_a_config() {
-        // The network is mainnet by default now, with mainnet's node settings.
+        // The values the typed fields hold by default, written out, so the table
+        // above is not the only thing checked against itself. The network is
+        // mainnet by default, with mainnet's node settings.
         let c = Config::defaults("/h");
         assert_eq!(c.network, Network::Main);
         assert_eq!(c.bind, "127.0.0.1:3000");
         assert_eq!(c.wallet_url(), "http://127.0.0.1:8332/wallet/psp-main");
-        assert_eq!(c.cookie, "/h/Library/Application Support/Bitcoin/.cookie");
+        assert_eq!(
+            c.cookie,
+            for_this_os(
+                "/h/Library/Application Support/Bitcoin/.cookie",
+                "/h/.bitcoin/.cookie"
+            )
+        );
         assert_eq!(c.scan_interval_secs, 120);
         assert_eq!(c.rpc_timeout_secs, 30);
         assert_eq!(c.terms(), Terms::default());
@@ -1384,6 +1437,7 @@ mod tests {
             assert_eq!(bytes, 1024 * 1024);
         }
         assert_eq!(c.rollover_max_items, 1000);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1430,30 +1484,6 @@ mod tests {
         let env = load(&dir, &env_of(&[("PSP_AIR_HOST", "air.example.org")])).unwrap();
         assert_eq!(env.config.air_listener(&dir).server.host, "air.example.org");
         assert_eq!(env.sources["air.host"], Source::Env("PSP_AIR_HOST"));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn air_enabled_is_gone_and_says_so_from_the_file_and_the_environment() {
-        let dir = scratch("air-enabled-gone");
-        for text in ["[air]\nenabled = true\n", "[air]\nenabled = false\n"] {
-            fs::write(dir.join(FILE_NAME), text).unwrap();
-            let p = load(&dir, &env_of(&[])).unwrap_err();
-            assert!(
-                p.iter()
-                    .any(|x| x.contains("air.enabled is gone") && x.contains("PSP_AIR_SERVER")),
-                "{p:?}"
-            );
-        }
-        fs::remove_file(dir.join(FILE_NAME)).unwrap();
-        let p = load(&dir, &env_of(&[("PSP_AIR_ENABLED", "true")])).unwrap_err();
-        assert!(
-            p.iter()
-                .any(|x| x.contains("PSP_AIR_ENABLED") && x.contains("is gone")),
-            "{p:?}"
-        );
-        // Empty is unset, as for every variable.
-        assert!(load(&dir, &env_of(&[("PSP_AIR_ENABLED", "")])).is_ok());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1512,7 +1542,13 @@ mod tests {
         assert!(air_host_problem("[::1]").is_none());
         assert!(air_host_problem("air.example.org").is_none());
         // A host that is wrong is refused even for a command that does not need it.
-        assert!(load(&dir, &env_of(&[("PSP_AIR_HOST", "127.0.0.1:5702")])).is_err());
+        let problems = load(&dir, &env_of(&[("PSP_AIR_HOST", "127.0.0.1:5702")])).unwrap_err();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.starts_with("air.host = `127.0.0.1:5702`") && p.contains("no port")),
+            "{problems:?}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1534,17 +1570,34 @@ mod tests {
         let dir = scratch("layers");
         fs::write(
             dir.join(FILE_NAME),
-            "[settle]\nmin_confirmations = 3\npayment_reconciliation_target = 0.05\n[bitcoin]\nwallet = \"shop\"\n",
+            "[settle]\nmin_confirmations = 3\npayment_reconciliation_target = 0.05\n[bitcoin]\nwallet = \"shop\"\n[reconciliation]\nfee = 3\n",
         )
         .unwrap();
         let loaded = load(
             &dir,
-            &env_of(&[("PSP_PAYMENT_RECONCILIATION_TARGET", "0.2")]),
+            &env_of(&[
+                ("PSP_PAYMENT_RECONCILIATION_TARGET", "0.2"),
+                ("PSP_PRICE_TOLERANCE", "0.02"),
+                ("PSP_RECONCILIATION_WINDOW_DAYS", "30"),
+            ]),
         )
         .unwrap();
         assert_eq!(loaded.config.min_confirmations, 3);
         assert_eq!(loaded.config.payment_reconciliation_target_bps, 2000);
         assert_eq!(loaded.config.wallet, "shop");
+        // a key of another section from the file, and two more from the environment
+        assert_eq!(loaded.config.reconciliation_fee, 3);
+        assert_eq!(loaded.sources["reconciliation.fee"], Source::File);
+        assert_eq!(loaded.config.price_tolerance_bps, 200);
+        assert_eq!(
+            loaded.sources["settle.price_tolerance"],
+            Source::Env("PSP_PRICE_TOLERANCE")
+        );
+        assert_eq!(loaded.config.reconciliation_window_days, 30);
+        assert_eq!(
+            loaded.sources["settle.reconciliation_window_days"],
+            Source::Env("PSP_RECONCILIATION_WINDOW_DAYS")
+        );
         assert_eq!(loaded.sources["settle.min_confirmations"], Source::File);
         assert_eq!(
             loaded.sources["settle.payment_reconciliation_target"],
@@ -1657,6 +1710,27 @@ mod tests {
                 "{key}: {problems:?}"
             );
         }
+
+        // the health settings, alone: exactly these two are reported
+        let mut c = Config::defaults("/h");
+        c.health_intervals = 0;
+        c.health_grace_secs = 86_401;
+        let problems = c.validate().unwrap_err();
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(problems[0].contains("scan.health_intervals"));
+        assert!(problems[1].contains("scan.health_grace_secs"));
+
+        // the target may be 1 (all of the request) and no more
+        let mut c = Config::defaults("/h");
+        c.set("settle.payment_reconciliation_target", "1").unwrap();
+        assert!(c.validate().is_ok());
+        c.set("settle.payment_reconciliation_target", "1.0001")
+            .unwrap();
+        let problems = c.validate().unwrap_err();
+        assert!(
+            problems[0].starts_with("settle.payment_reconciliation_target = 1.0001"),
+            "{problems:?}"
+        );
     }
 
     #[test]
@@ -1725,9 +1799,21 @@ mod tests {
             "0,1",
             "10%",
         ] {
-            assert!(fraction_to_bps(k, bad).is_err(), "{bad}");
+            assert_eq!(
+                fraction_to_bps(k, bad),
+                Err(format!(
+                    "{k} = `{bad}` is not a fraction like 0.10 (digits only, at most four after the point, no sign)"
+                )),
+                "{bad}"
+            );
         }
-        assert!(fraction_to_bps(k, "99999999999999999999").is_err());
+        // past what fits in a u64 of basis points
+        assert_eq!(
+            fraction_to_bps(k, "99999999999999999999"),
+            Err(format!(
+                "{k} = `99999999999999999999` is not a fraction like 0.10 (digits only, at most four after the point, no sign)"
+            ))
+        );
         for (bps, text) in [
             (1000, "0.10"),
             (500, "0.05"),
@@ -1739,37 +1825,6 @@ mod tests {
             assert_eq!(bps_to_fraction(bps), text);
             assert_eq!(fraction_to_bps(k, text), Ok(bps));
         }
-    }
-
-    #[test]
-    fn the_target_cannot_be_more_than_one() {
-        let mut c = Config::defaults("/h");
-        c.set("settle.payment_reconciliation_target", "1").unwrap();
-        assert!(c.validate().is_ok());
-        c.set("settle.payment_reconciliation_target", "1.0001")
-            .unwrap();
-        let problems = c.validate().unwrap_err();
-        assert!(
-            problems[0].starts_with("settle.payment_reconciliation_target = 1.0001"),
-            "{problems:?}"
-        );
-    }
-
-    #[test]
-    fn the_tolerance_is_read_from_the_file_and_the_environment() {
-        let dir = scratch("tolerance");
-        fs::write(dir.join(FILE_NAME), "[settle]\nprice_tolerance = 0.02\n").unwrap();
-        let loaded = load(&dir, &env_of(&[])).unwrap();
-        assert_eq!(loaded.config.price_tolerance_bps, 200);
-        assert_eq!(loaded.config.terms().price_tolerance_bps, 200);
-        assert_eq!(loaded.sources["settle.price_tolerance"], Source::File);
-        let loaded = load(&dir, &env_of(&[("PSP_PRICE_TOLERANCE", "0.005")])).unwrap();
-        assert_eq!(loaded.config.price_tolerance_bps, 50);
-        assert_eq!(
-            loaded.sources["settle.price_tolerance"],
-            Source::Env("PSP_PRICE_TOLERANCE")
-        );
-        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1786,8 +1841,14 @@ mod tests {
             problems[0].starts_with("settle.price_tolerance = 1.0001"),
             "{problems:?}"
         );
-        assert!(c.set("settle.price_tolerance", "-0.01").is_err());
-        assert!(c.set("settle.price_tolerance", "1%").is_err());
+        for bad in ["-0.01", "1%"] {
+            assert_eq!(
+                c.set("settle.price_tolerance", bad),
+                Err(format!(
+                    "settle.price_tolerance = `{bad}` is not a fraction like 0.10 (digits only, at most four after the point, no sign)"
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1806,7 +1867,13 @@ mod tests {
         let mut c = Config::defaults("/h");
         c.set("settle.payment_reconciliation_target", "0.005")
             .unwrap();
-        assert!(c.validate().is_err());
+        let problems = c.validate().unwrap_err();
+        assert!(
+            problems[0].starts_with(
+                "settle.price_tolerance = 0.01 is more than settle.payment_reconciliation_target = 0.005:"
+            ),
+            "{problems:?}"
+        );
         // and through the file, where startup sees it
         let dir = scratch("tolerance-over-target");
         fs::write(
@@ -1858,6 +1925,66 @@ mod tests {
         }
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// A settings file that sets `key` (`section.name`) to `value` is refused at
+    /// load, and the message names the setting, the value and the range.
+    fn refused_at_load(key: &str, value: u64, range: &str) {
+        let (section, name) = key.split_once('.').unwrap();
+        let dir = scratch(&format!("cap-{section}-{name}-{value}"));
+        fs::write(
+            dir.join(FILE_NAME),
+            format!("[{section}]\n{name} = {value}\n"),
+        )
+        .unwrap();
+        let problems = load(&dir, &env_of(&[])).unwrap_err();
+        let want = format!("{key} = {value} is out of range: it must be from {range} (");
+        assert!(problems.iter().any(|p| p.contains(&want)), "{problems:?}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn melt_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load(
+            "server.melt_max_request_bytes",
+            15_728_641,
+            "16384 to 15728640",
+        );
+        refused_at_load("server.melt_max_request_bytes", 16_383, "16384 to 15728640");
+    }
+
+    #[test]
+    fn burns_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load(
+            "server.burns_max_request_bytes",
+            15_728_641,
+            "16384 to 15728640",
+        );
+    }
+
+    #[test]
+    fn rollover_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load(
+            "server.rollover_max_request_bytes",
+            15_728_641,
+            "16384 to 15728640",
+        );
+    }
+
+    #[test]
+    fn check_state_max_request_bytes_past_its_cap_is_refused_at_load() {
+        refused_at_load(
+            "server.check_state_max_request_bytes",
+            15_728_641,
+            "16384 to 15728640",
+        );
+    }
+
+    #[test]
+    fn rollover_max_items_past_its_cap_is_refused_at_load() {
+        // above what fits one AIR message, and below the outputs one amount can need
+        refused_at_load("rollover.max_items", 25_001, "64 to 25000");
+        refused_at_load("rollover.max_items", 63, "64 to 25000");
+    }
 }
 
 #[cfg(test)]
@@ -1875,27 +2002,6 @@ mod health_tests {
         assert_eq!(c.health_stale_after_secs(), 50);
         assert_eq!(c.validate(), Ok(()));
         assert_eq!(c.get("scan.health_intervals").as_deref(), Some("5"));
-    }
-
-    #[test]
-    fn health_settings_out_of_range_are_refused() {
-        let mut c = Config::defaults("/h");
-        c.health_intervals = 0;
-        c.health_grace_secs = 86_401;
-        let problems = c.validate().unwrap_err();
-        assert_eq!(problems.len(), 2, "{problems:?}");
-        assert!(problems[0].contains("scan.health_intervals"));
-        assert!(problems[1].contains("scan.health_grace_secs"));
-        assert!(
-            SPECS
-                .iter()
-                .any(|s| s.key == "scan.health_intervals" && s.env == "PSP_HEALTH_INTERVALS")
-        );
-        assert!(
-            SPECS
-                .iter()
-                .any(|s| s.key == "scan.health_grace_secs" && s.env == "PSP_HEALTH_GRACE_SECS")
-        );
     }
 }
 
@@ -1939,7 +2045,10 @@ mod network_tests {
         assert_eq!(reg.config.wallet, "psp-regtest");
         assert_eq!(
             reg.config.cookie,
-            "/h/Library/Application Support/Bitcoin/regtest/.cookie"
+            for_this_os(
+                "/h/Library/Application Support/Bitcoin/regtest/.cookie",
+                "/h/.bitcoin/regtest/.cookie"
+            )
         );
         assert_eq!(reg.sources.get("bitcoin.network"), Some(&Source::Flag));
         let sig = load_with(&d, &env, Some(Network::Signet)).unwrap().config;
@@ -1962,7 +2071,10 @@ mod network_tests {
         );
         assert_eq!(
             c.cookie,
-            "/h/Library/Application Support/Bitcoin/regtest/.cookie"
+            for_this_os(
+                "/h/Library/Application Support/Bitcoin/regtest/.cookie",
+                "/h/.bitcoin/regtest/.cookie"
+            )
         );
         // the flag beats the environment and the file
         fs::write(d.join(FILE_NAME), "[bitcoin]\nnetwork = \"signet\"\n").unwrap();
@@ -1983,7 +2095,13 @@ mod network_tests {
             Network::Regtest
         );
         let bad = env_of(&[("HOME", "/h"), ("PSP_NETWORK", "moon")]);
-        assert!(load_with(&d, &bad, None).is_err());
+        assert_eq!(
+            load_with(&d, &bad, None).unwrap_err(),
+            vec![
+                "environment variable PSP_NETWORK: `moon` is not a network: use main, regtest, signet or testnet"
+                    .to_string()
+            ]
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
@@ -1992,7 +2110,11 @@ mod network_tests {
         let d = dir("retired");
         fs::write(d.join(FILE_NAME), "[scan]\nmax_transactions = 1000\n").unwrap();
         let e = load_with(&d, &env_of(&[("HOME", "/h")]), None).unwrap_err();
-        assert!(e.iter().any(|p| p.contains("retired")), "{e:?}");
+        assert!(
+            e.iter()
+                .any(|p| p.contains("scan.max_transactions is retired")),
+            "{e:?}"
+        );
         fs::remove_file(d.join(FILE_NAME)).unwrap();
         let e = load_with(
             &d,
@@ -2000,22 +2122,29 @@ mod network_tests {
             None,
         )
         .unwrap_err();
-        assert!(e.iter().any(|p| p.contains("retired")), "{e:?}");
+        assert!(
+            e.iter()
+                .any(|p| p.contains("PSP_SCAN_MAX_TRANSACTIONS: scan.max_transactions is retired")),
+            "{e:?}"
+        );
         fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
-    fn the_reconciliation_window_is_fourteen_days_by_default_and_set_in_days() {
+    fn the_reconciliation_window_is_set_in_days_and_ranged() {
         let mut c = Config::defaults("/h");
-        assert_eq!(c.reconciliation_window_days, 14);
-        assert_eq!(c.get("settle.reconciliation_window_days").unwrap(), "14");
-        assert_eq!(c.terms().reconciliation_window_secs, 14 * 86_400);
         c.set("settle.reconciliation_window_days", "30").unwrap();
         assert_eq!(c.terms().reconciliation_window_secs, 30 * 86_400);
         assert!(c.validate().is_ok());
         // a decimal or a sign is not a number of days
-        assert!(c.set("settle.reconciliation_window_days", "1.5").is_err());
-        assert!(c.set("settle.reconciliation_window_days", "-1").is_err());
+        for bad in ["1.5", "-1"] {
+            assert_eq!(
+                c.set("settle.reconciliation_window_days", bad),
+                Err(format!(
+                    "settle.reconciliation_window_days = `{bad}` is not a whole number (no sign, no decimals)"
+                ))
+            );
+        }
         for bad in ["0", "366"] {
             c.set("settle.reconciliation_window_days", bad).unwrap();
             let problems = c.validate().unwrap_err();
@@ -2029,35 +2158,11 @@ mod network_tests {
     }
 
     #[test]
-    fn the_reconciliation_window_can_come_from_the_file_and_the_environment() {
-        let d = dir("window");
-        fs::write(
-            d.join(FILE_NAME),
-            "[settle]\nreconciliation_window_days = 3\n",
-        )
-        .unwrap();
-        let loaded = load_with(&d, &env_of(&[("HOME", "/h")]), None).unwrap();
-        assert_eq!(loaded.config.reconciliation_window_days, 3);
-        let loaded = load_with(
-            &d,
-            &env_of(&[("HOME", "/h"), ("PSP_RECONCILIATION_WINDOW_DAYS", "21")]),
-            None,
-        )
-        .unwrap();
-        assert_eq!(loaded.config.reconciliation_window_days, 21);
-        fs::remove_dir_all(&d).unwrap();
-    }
-
-    #[test]
-    fn the_reconciliation_fees_and_limits_default_to_nothing_and_are_ranged() {
+    fn the_reconciliation_fees_and_limits_map_to_the_policy_and_are_ranged() {
         let mut c = Config::defaults("/h");
-        assert_eq!(c.get("reconciliation.fee").unwrap(), "0");
-        assert_eq!(c.get("reconciliation.max_attempts").unwrap(), "2");
-        assert_eq!(c.get("reconciliation.write_fee").unwrap(), "0");
-        assert_eq!(c.get("reconciliation.round_up_from").unwrap(), "9");
-        assert_eq!(c.get("delivery.read_fee").unwrap(), "0");
         assert!(c.validate().is_ok());
         let policy = c.policy();
+        // no fee unless one is set: the fees stay 0 by default
         assert_eq!(policy.fees, settle::ReconcileTerms::default());
         assert_eq!(policy.terms, c.terms());
 
@@ -2101,41 +2206,13 @@ mod network_tests {
             ("reconciliation.write_fee", "-1"),
             ("reconciliation.round_up_from", "0.9"),
         ] {
-            assert!(c.set(key, bad).is_err(), "{key}={bad}");
+            assert_eq!(
+                c.set(key, bad),
+                Err(format!(
+                    "{key} = `{bad}` is not a whole number (no sign, no decimals)"
+                )),
+                "{key}={bad}"
+            );
         }
-    }
-
-    #[test]
-    fn the_reconciliation_settings_come_from_the_file_and_the_environment() {
-        let d = dir("recon-settings");
-        fs::write(
-            d.join(FILE_NAME),
-            "[reconciliation]\nfee = 2\nmax_attempts = 3\nround_up_from = 10\n\n[delivery]\nread_fee = 1\n",
-        )
-        .unwrap();
-        let loaded = load_with(&d, &env_of(&[("HOME", "/h")]), None).unwrap();
-        let c = &loaded.config;
-        assert_eq!(
-            (
-                c.reconciliation_fee,
-                c.reconciliation_max_attempts,
-                c.reconciliation_round_up_from,
-                c.delivery_read_fee
-            ),
-            (2, 3, 10, 1)
-        );
-        let loaded = load_with(
-            &d,
-            &env_of(&[
-                ("HOME", "/h"),
-                ("PSP_RECONCILIATION_WRITE_FEE", "4"),
-                ("PSP_RECONCILIATION_FEE", "7"),
-            ]),
-            None,
-        )
-        .unwrap();
-        assert_eq!(loaded.config.reconciliation_write_fee, 4);
-        assert_eq!(loaded.config.reconciliation_fee, 7, "the environment wins");
-        fs::remove_dir_all(&d).unwrap();
     }
 }

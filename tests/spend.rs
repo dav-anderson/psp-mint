@@ -8,17 +8,16 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
 
 use mint_server::api::{CheckStateRequest, CheckStateResponse};
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
-use psp_mint::melts::MeltLog;
 use psp_mint::rotation::{
-    PspSpendRequest, PspSpendResponse, ROLLOVERS_FILE, Rollovers, RotationResponse, Rotor,
+    PspSpendRequest, PspSpendResponse, ROLLOVERS_FILE, Rollovers, RotationResponse,
 };
-use psp_mint::server::{Health, KeysetsResponse, Limits, PspMeltRequest, Rotating, SharedRotating};
+use psp_mint::server::{KeysetsResponse, Limits, PspMeltRequest, SharedRotating};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 use serde_json::Value;
@@ -56,27 +55,13 @@ async fn start(dir: &Path, clock: u64) -> Mint {
 }
 
 async fn start_with(dir: &Path, clock: u64, limits: Limits) -> Mint {
-    let (rotor, logic) = Rotor::open_at(dir, Amount::from_units(1024), 1, 1, clock).unwrap();
-    let rot = Rotating::new(rotor, Rollovers::open(dir).unwrap());
-    let state = psp_mint::server::app_state(logic);
-    let melts = Arc::new(Mutex::new(
-        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
-    ));
-    let air = common::Air::start(&state, &rot, limits);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let app = psp_mint::server::router_full(
-        Arc::clone(&state),
-        Health::new(100),
-        melts,
-        limits,
-        Some(Arc::clone(&rot)),
-    );
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mint = common::PspMint::open_in(dir, 1, 1, clock, limits);
+    let air = mint.air();
+    let base = mint.http().await;
     Mint {
-        base: format!("http://{addr}"),
-        state,
-        rot,
+        base,
+        state: Arc::clone(&mint.state),
+        rot: Arc::clone(&mint.rot),
         air,
     }
 }
@@ -114,6 +99,13 @@ impl Mint {
 
     async fn rotation(&self) -> RotationResponse {
         self.air.get("/rotation")
+    }
+
+    /// Ask for the rotation, which records the first issue and so starts the
+    /// clock, and check that it and the keysets name the same current set.
+    async fn records_first_issue(&self) {
+        let rotation = self.rotation().await;
+        assert_eq!(rotation.current.id, self.keysets().await.current);
     }
 
     /// The current keyset's ID.
@@ -407,7 +399,7 @@ async fn keysets_are_live_the_way_a_rollover_needs_them() {
     let dir = scratch("keysets");
     let m = start(&dir, T).await;
     let (a, b, c) = (m.issue(4), m.issue(4), m.issue(4));
-    let _ = m.rotation().await; // records the first issue
+    m.records_first_issue().await;
     m.set_clock(T + H);
     let ks = m.keysets().await;
     let (id0, id1) = (ks.previous.clone().unwrap(), ks.current.clone());
@@ -495,9 +487,8 @@ async fn a_spend_cut_short_after_the_burn_is_finished_by_the_retry() {
         // burned, no answer stored.
         std::fs::write(
             dir.join(ROLLOVERS_FILE),
-            serde_json::json!({"answers": {}, "pending": {hash.clone(): 0},
-                "holds": {hash.clone(): [hex::encode(a.0.nonce.0.serialize())]}})
-            .to_string(),
+            common::rollovers_file(serde_json::json!({"pending": {hash.clone(): 0},
+                "holds": {hash.clone(): [hex::encode(a.0.nonce.0.serialize())]}})),
         )
         .unwrap();
         {
@@ -662,27 +653,4 @@ async fn the_shape_of_a_spend_is_checked_before_anything_is_burned() {
         "nothing was burned"
     );
     assert_eq!(m.totals().await, [6, 0, 6, 0]);
-}
-
-#[tokio::test]
-async fn a_rollovers_file_from_before_spends_still_reads() {
-    let dir = scratch("old-file");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join(ROLLOVERS_FILE),
-        serde_json::json!({"answers": {}, "pending": {}}).to_string(),
-    )
-    .unwrap();
-    let m = start(&dir, T).await;
-    let a = m.issue(4);
-    let cur = m.current().await;
-    assert_eq!(
-        m.totals().await,
-        [4, 0, 4, 0],
-        "no paid yet, and the audit has the field"
-    );
-    let built = build(&[(&a, 4, &cur)], "", &[], 4, "");
-    assert_eq!(m.spend(&built.req).await.0, 200);
-    assert_eq!(m.totals().await, [4, 4, 0, 4]);
-    assert_eq!(Rollovers::open(&dir).unwrap().paid(), 4);
 }

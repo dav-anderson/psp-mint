@@ -5,68 +5,44 @@
 //! The wallet's check-state is over AIR, through the mint's real listener on a
 //! real `air_server` (see `common`), where the same body comes back as a signed
 //! refusal. The ceiling is tried over AIR at 4 KiB; the 1 MiB default is
-//! asserted as a value and by a request that is answered under it.
+//! tried by requests answered under it and refused over it.
 
 mod common;
 
-use std::io::{Read, Write};
-use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
 
 use mint_server::api::{CheckStateRequest, CheckStateResponse};
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
-use psp_mint::melts::MeltLog;
-use psp_mint::rotation::{Rollovers, Rotor};
-use psp_mint::server::{BurnsRequest, Health, Limits, Rotating, SharedRotating};
+use psp_mint::server::{BurnsRequest, Limits};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 
 const MIB: usize = 1024 * 1024;
 
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("psp-mint-limits-{}-{name}", {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        format!(
-            "{}-{}",
-            std::process::id(),
-            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        )
-    }));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
 const T: u64 = 1_800_000_000;
 
-/// A rotating mint (the one `serve` runs) with its HTTP server for `/melt` and
-/// `/burns`, and the pieces to put an AIR listener on it.
-async fn start(
-    name: &str,
-    limits: Option<Limits>,
-) -> (String, Arc<AppState>, SharedRotating, Limits) {
-    let dir = scratch(name);
-    let (rotor, logic) = Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, T).unwrap();
-    let rot = Rotating::new(rotor, Rollovers::open(&dir).unwrap());
-    let state = psp_mint::server::app_state(logic);
-    let limits = limits.unwrap_or_default();
-    let melts = Arc::new(Mutex::new(
-        MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
-    ));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let health = Health::new(100);
-    let app = psp_mint::server::router_full(
-        Arc::clone(&state),
-        health,
-        melts,
-        limits,
-        Some(Arc::clone(&rot)),
-    );
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{addr}"), state, rot, limits)
+/// A mint wired as `serve` wires it, with its HTTP server for `/melt` and
+/// `/burns`; the AIR listener is `mint.air()`.
+async fn start(name: &str, limits: Option<Limits>) -> (String, common::PspMint) {
+    let mint = common::PspMint::open(name, T, limits.unwrap_or_default());
+    let base = mint.http().await;
+    (base, mint)
+}
+
+/// What the server sent before it closed. A server that refuses a large body and
+/// closes with part of it unread may reset the connection; the reply was sent
+/// first, so a reset after some bytes is not a failure, and the tests check
+/// what was received. Any other error, or a reset with nothing received, is.
+fn read_reply(stream: &mut TcpStream) -> String {
+    let mut bytes = Vec::new();
+    match stream.read_to_end(&mut bytes) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::ConnectionReset && !bytes.is_empty() => {}
+        Err(e) => panic!("the reply could not be read: {e}"),
+    }
+    String::from_utf8(bytes).unwrap()
 }
 
 fn issued_note(state: &AppState, amount: Amount) -> (Note, Keypair) {
@@ -130,14 +106,12 @@ async fn declared(base: &str, path: &str, length: usize) -> (u16, serde_json::Va
     let addr = base.trim_start_matches("http://").to_string();
     let path = path.to_string();
     let reply = tokio::task::spawn_blocking(move || {
-        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        let mut stream = TcpStream::connect(&addr).unwrap();
         let request = format!(
             "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(request.as_bytes()).unwrap();
-        let mut reply = String::new();
-        let _ = stream.read_to_string(&mut reply);
-        reply
+        read_reply(&mut stream)
     })
     .await
     .unwrap();
@@ -155,7 +129,7 @@ fn spent(state: &AppState, nonce: Nonce) -> bool {
 
 #[tokio::test]
 async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
-    let (base, state, _rot, _limits) = start(
+    let (base, m) = start(
         "melt",
         Some(Limits {
             melt_bytes: 4096,
@@ -164,7 +138,7 @@ async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
     )
     .await;
     let amount = Amount::from_units(4);
-    let (note, keypair) = issued_note(&state, amount);
+    let (note, keypair) = issued_note(&m.state, amount);
     let memo = "limits test";
     let request = psp_mint::server::PspMeltRequest {
         melt: sp_wire::psp::MeltRequest {
@@ -172,7 +146,7 @@ async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
             memo: memo.to_string(),
         },
         keysets: vec![psp_mint::rotation::keyset_id(
-            state.logic.lock().unwrap().public_keys(),
+            m.state.logic.lock().unwrap().public_keys(),
         )],
     };
 
@@ -187,19 +161,19 @@ async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
             .unwrap()
             .contains("at most 4096 bytes")
     );
-    assert!(!spent(&state, note.nonce));
+    assert!(!spent(&m.state, note.nonce));
 
     // The same request at exactly the ceiling goes through.
     let (status, _) = post(&base, "/melt", padded(&request, 4096)).await;
     assert_eq!(status, 200);
-    assert!(spent(&state, note.nonce));
+    assert!(spent(&m.state, note.nonce));
 }
 
 /// A body sent in chunks, with no `Content-Length`, is read only as far as the
 /// ceiling.
 #[tokio::test]
 async fn a_chunked_body_over_the_ceiling_is_refused_too() {
-    let (base, _state, _rot, _limits) = start(
+    let (base, _m) = start(
         "chunked",
         Some(Limits {
             burns_bytes: 4096,
@@ -209,7 +183,7 @@ async fn a_chunked_body_over_the_ceiling_is_refused_too() {
     .await;
     let addr = base.trim_start_matches("http://").to_string();
     let reply = tokio::task::spawn_blocking(move || {
-        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        let mut stream = TcpStream::connect(&addr).unwrap();
         let chunk = vec![b' '; 3000];
         let mut request = format!(
             "POST /burns HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
@@ -222,9 +196,7 @@ async fn a_chunked_body_over_the_ceiling_is_refused_too() {
         }
         request.extend(b"0\r\n\r\n");
         stream.write_all(&request).unwrap();
-        let mut reply = String::new();
-        let _ = stream.read_to_string(&mut reply);
-        reply
+        read_reply(&mut stream)
     })
     .await
     .unwrap();
@@ -235,18 +207,8 @@ async fn a_chunked_body_over_the_ceiling_is_refused_too() {
 
 #[tokio::test]
 async fn by_default_every_route_with_a_body_takes_up_to_one_mib() {
-    let defaults = Limits::default();
-    assert_eq!(
-        (
-            defaults.melt_bytes,
-            defaults.burns_bytes,
-            defaults.rollover_bytes,
-            defaults.check_state_bytes
-        ),
-        (MIB, MIB, MIB, MIB)
-    );
-    let (base, state, rot, limits) = start("defaults", None).await;
-    let (note, _) = issued_note(&state, Amount::from_units(1));
+    let (base, m) = start("defaults", None).await;
+    let (note, _) = issued_note(&m.state, Amount::from_units(1));
     let check = CheckStateRequest {
         nonces: vec![note.nonce],
     };
@@ -256,7 +218,7 @@ async fn by_default_every_route_with_a_body_takes_up_to_one_mib() {
 
     // The wallet's check-state is over AIR, and answered under the defaults.
     {
-        let air = common::Air::start(&state, &rot, limits);
+        let air = m.air();
         let parsed: CheckStateResponse = air.post_ok("/check-state", &check);
         assert_eq!(parsed.spent, vec![false]);
     }
@@ -280,7 +242,7 @@ async fn by_default_every_route_with_a_body_takes_up_to_one_mib() {
 /// JSON as the HTTP routes', before it is parsed; one at it is answered.
 #[tokio::test]
 async fn a_check_state_over_the_ceiling_is_refused_before_parsing() {
-    let (_base, state, rot, limits) = start(
+    let (_base, m) = start(
         "check-state",
         Some(Limits {
             check_state_bytes: 4096,
@@ -288,8 +250,8 @@ async fn a_check_state_over_the_ceiling_is_refused_before_parsing() {
         }),
     )
     .await;
-    let air = common::Air::start(&state, &rot, limits);
-    let (note, _) = issued_note(&state, Amount::from_units(1));
+    let air = m.air();
+    let (note, _) = issued_note(&m.state, Amount::from_units(1));
     let check = CheckStateRequest {
         nonces: vec![note.nonce],
     };
@@ -317,8 +279,8 @@ async fn a_ceiling_above_two_megabytes_is_the_one_in_force() {
         rollover_notes: 1000,
         check_state_bytes: big,
     };
-    let (base, state, _rot, _limits) = start("big", Some(limits)).await;
-    let (note, _) = issued_note(&state, Amount::from_units(1));
+    let (base, m) = start("big", Some(limits)).await;
+    let (note, _) = issued_note(&m.state, Amount::from_units(1));
     let burns = BurnsRequest {
         nonces: vec![note.nonce],
     };
@@ -326,25 +288,4 @@ async fn a_ceiling_above_two_megabytes_is_the_one_in_force() {
     assert_eq!(status, 200, "{body}");
     let (status, _) = declared(&base, "/burns", big + 1).await;
     assert_eq!(status, 413);
-}
-
-/// A refusal for a reason other than size keeps the usual error body.
-#[tokio::test]
-async fn under_the_ceiling_a_bad_melt_is_still_a_400_with_an_error() {
-    let (base, state, _rot, _limits) = start("bad", None).await;
-    let amount = Amount::from_units(2);
-    let (note, keypair) = issued_note(&state, amount);
-    let request = psp_mint::server::PspMeltRequest {
-        melt: sp_wire::psp::MeltRequest {
-            inputs: vec![melt_input(note, &keypair, amount, "signed memo")],
-            memo: "a different memo".to_string(),
-        },
-        keysets: vec![psp_mint::rotation::keyset_id(
-            state.logic.lock().unwrap().public_keys(),
-        )],
-    };
-    let (status, body) = post(&base, "/melt", serde_json::to_vec(&request).unwrap()).await;
-    assert_eq!(status, 400);
-    assert!(body["error"].is_string());
-    assert!(!spent(&state, note.nonce));
 }

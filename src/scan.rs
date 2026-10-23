@@ -370,7 +370,19 @@ mod since_tests {
         assert_eq!(second.next.block_hash, "h96");
         // a damaged checkpoint is an error, not a silent rescan
         std::fs::write(dir.join(CHECKPOINT_FILE), "nope").unwrap();
-        assert!(Checkpoint::load(&dir).is_err());
+        let e = Checkpoint::load(&dir).unwrap_err();
+        assert!(
+            e.starts_with(&format!(
+                "{} is damaged:",
+                dir.join(CHECKPOINT_FILE).display()
+            )) && e.ends_with("It is never replaced; fix or move it by hand"),
+            "{e}"
+        );
+        // and it is left as it was
+        assert_eq!(
+            std::fs::read_to_string(dir.join(CHECKPOINT_FILE)).unwrap(),
+            "nope"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -452,25 +464,19 @@ mod tests {
         assert_eq!(hex::encode(&data), PAYLOAD_HEX);
         assert!(payload::decode(&data).is_ok());
     }
-
     #[test]
-    fn direct_push() {
+    fn op_return_data_is_read_and_malformed_scripts_are_refused() {
+        // a direct push
         assert_eq!(
             op_return_data(&[0x6a, 0x02, 0xaa, 0xbb]),
             Some(vec![0xaa, 0xbb])
         );
-    }
-
-    #[test]
-    fn pushdata2_and_pushdata4() {
+        // OP_PUSHDATA2 and OP_PUSHDATA4
         let mut s = vec![0x6a, 0x4d, 0x02, 0x00, 1, 2];
         assert_eq!(op_return_data(&s), Some(vec![1, 2]));
         s = vec![0x6a, 0x4e, 0x01, 0x00, 0x00, 0x00, 9];
         assert_eq!(op_return_data(&s), Some(vec![9]));
-    }
-
-    #[test]
-    fn rejects_malformed_scripts() {
+        // malformed scripts are refused
         assert_eq!(op_return_data(&[]), None);
         assert_eq!(op_return_data(&[0x6a]), None);
         assert_eq!(op_return_data(&[0x6a, 0x00]), None);

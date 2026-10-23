@@ -8,17 +8,18 @@
 //! that port free; `local_server::start` says so when it is not. One server
 //! serves every test of this binary, and the tests take turns on it.
 
+mod common;
+
 use std::path::PathBuf;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use mint_core::MintLogic;
 use mint_types::{Amount, BlindNonce, MintOutput};
 use psp_mint::delivery::{Deliverer, Report, retry_after};
-use psp_mint::records::Records;
+use psp_mint::records::{Records, SharedRecords};
 use psp_mint::scan::Received;
-use psp_mint::settle::{self, Issue, Settlement};
+use psp_mint::server::Limits;
+use psp_mint::settle::{self, Issue, Policy, ReconcileTerms, Settlement};
 use rand::rngs::OsRng;
 use secp256k1::SECP256K1;
 use sp_wire::ServiceDid;
@@ -66,31 +67,27 @@ fn down(server: &ServerRef) -> ServerRef {
     }
 }
 
-/// A mint with its DID key and records, in a folder of its own.
+/// A mint wired as `serve` wires it (see `common::PspMint`), with a DID key for
+/// delivering.
 struct Env {
-    dir: PathBuf,
-    logic: MintLogic,
-    records: Records,
+    mint: common::PspMint,
+    shared: SharedRecords,
     key: SecretKey,
     psp: ServiceDid,
 }
 
 fn env(name: &str) -> Env {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let dir = std::env::temp_dir().join(format!(
-        "psp-mint-delivery-{}-{name}-{}",
-        std::process::id(),
-        N.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    let logic = psp_mint::mint::open(&dir, Amount::from_units(1024)).unwrap();
-    let records = Records::open(&dir.join("settlements.json")).unwrap();
+    let mint = common::PspMint::open(
+        &format!("delivery-{name}"),
+        1_800_000_000,
+        Limits::default(),
+    );
+    let shared = std::sync::Arc::clone(&mint.records);
     let key = SecretKey::new();
     let psp = addr::key_to_did(&key.public_key());
     Env {
-        dir,
-        logic,
-        records,
+        mint,
+        shared,
         key,
         psp,
     }
@@ -98,20 +95,54 @@ fn env(name: &str) -> Env {
 
 impl Env {
     fn records_path(&self) -> PathBuf {
-        self.dir.join("settlements.json")
+        self.mint.records_path()
     }
 
-    /// Settle a payment of `sats` carrying `payload`, at 6 confirmations.
+    /// The records the deliverer and the settlement share.
+    fn records(&self) -> MutexGuard<'_, Records> {
+        self.shared.lock().unwrap()
+    }
+
+    /// Settle a payment of `sats` carrying `payload`, at 6 confirmations, with no
+    /// fees.
     fn settle(&mut self, txid: &str, sats: u64, payload: &[u8]) -> Settlement {
+        self.settle_under(txid, sats, payload, &Policy::default())
+    }
+
+    /// As [`Env::settle`], under `policy`: the locks are taken in the order the
+    /// scan takes them (the records, the mint, the rotor).
+    fn settle_under(
+        &mut self,
+        txid: &str,
+        sats: u64,
+        payload: &[u8],
+        policy: &Policy,
+    ) -> Settlement {
         let received = Received {
             txid: txid.to_string(),
             confirmations: 6,
             value_sats: sats,
             payload: Some(payload.to_vec()),
         };
-        settle::settle(&self.logic, &mut self.records, &received, &mut || {
-            Ok(BTC_10K)
-        })
+        self.settle_received(&received, policy)
+    }
+
+    fn settle_received(&mut self, received: &Received, policy: &Policy) -> Settlement {
+        let mut records = self.shared.lock().unwrap();
+        let logic = self.mint.state.logic.lock().unwrap();
+        let rotor = self.mint.rot.rotor.lock().unwrap();
+        let previous = rotor
+            .previous
+            .as_ref()
+            .map(|(keys, logic)| (keys.id.as_str(), logic));
+        settle::settle_ruled(
+            &logic,
+            previous,
+            &mut records,
+            received,
+            &mut || Ok(BTC_10K),
+            policy,
+        )
         .unwrap()
     }
 
@@ -198,7 +229,7 @@ fn a_settled_purchase_is_delivered_and_the_payer_reads_it_with_no_paste() {
 
     let mut deliverer = e.deliverer(&server);
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         delivered_report()
     );
 
@@ -235,7 +266,7 @@ fn a_settled_purchase_is_delivered_and_the_payer_reads_it_with_no_paste() {
         Some(hex::encode(&sealed).as_str())
     );
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         Report::default()
     );
 }
@@ -259,7 +290,7 @@ fn a_rejection_is_delivered_with_its_reason() {
     let mut deliverer = e.deliverer(&server);
     // both records: the first purchase's signatures and the second's rejection
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         Report {
             delivered: 2,
             ..Report::default()
@@ -279,7 +310,8 @@ fn a_rejection_is_delivered_with_its_reason() {
     );
     // it says what was paid and that the purchase stays open for the window
     assert_eq!((refused.paid_sats, refused.paid_cents), (5_000, 50));
-    let rec = e.records.get("tx2").unwrap();
+    let records = e.records();
+    let rec = records.get("tx2").unwrap();
     assert_eq!(rec.open_until, Some(refused.open_until));
     assert!(refused.open_until > opened.issued_at);
     assert_eq!(rec.forfeited_at, None);
@@ -300,7 +332,7 @@ fn a_held_payment_is_delivered_with_what_was_paid_and_forfeited_when_its_window_
 
     let mut deliverer = e.deliverer(&server);
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         delivered_report()
     );
     let purchase = wire::purchase_id(&bytes);
@@ -317,19 +349,88 @@ fn a_held_payment_is_delivered_with_what_was_paid_and_forfeited_when_its_window_
 
     // open inside the window, and shown as such
     let until = held.open_until;
-    assert!(e.records.forfeit_expired(until - 1).unwrap().is_empty());
-    let open = e.records.reconciliation();
+    assert!(e.records().forfeit_expired(until - 1).unwrap().is_empty());
+    let open = e.records().reconciliation();
     assert_eq!((open.open.payments, open.open.sats), (1, 1_000));
     assert_eq!(open.forfeited.payments, 0);
 
     // the window closes unsettled: forfeited, the mint keeps the BTC, and it is
     // shown apart
-    assert_eq!(e.records.forfeit_expired(until).unwrap(), vec!["tx1"]);
+    assert_eq!(e.records().forfeit_expired(until).unwrap(), vec!["tx1"]);
     let after = Records::open(&e.records_path()).unwrap().reconciliation();
     assert_eq!(after.open.payments, 0);
     assert_eq!((after.forfeited.payments, after.forfeited.sats), (1, 1_000));
     // the record the payer was sent is still there to read
     assert!(read(&server, &address).is_some());
+}
+
+/// Fees on: the first read of every purchase is prepaid and comes off what was
+/// paid, and a held payment carries the rules the fees make.
+#[test]
+fn with_fees_the_first_read_is_prepaid_and_a_held_payment_carries_the_rules() {
+    let server = server();
+    let mut e = env("fees");
+    let policy = Policy {
+        fees: ReconcileTerms {
+            fee_units: 2,
+            write_fee_units: 1,
+            read_fee_units: 1,
+            ..ReconcileTerms::default()
+        },
+        ..Policy::default()
+    };
+
+    // 6 units paid, less the first read (1): exactly the 5 asked for
+    let exact_payer = reply();
+    let exact = payload(exact_payer.did.as_bytes(), &outputs(&[4, 1]));
+    issued(e.settle_under("tx1", 6_000, &exact, &policy));
+    // 12 units paid, less the first read (1): 11 against the 16 asked for, short
+    // beyond the target, and no output can be dropped to fit
+    let held_payer = reply();
+    let short = payload(held_payer.did.as_bytes(), &outputs(&[16]));
+    assert!(matches!(
+        e.settle_under("tx2", 12_000, &short, &policy),
+        Settlement::PaidUnsettled(_)
+    ));
+    {
+        let records = e.records();
+        assert_eq!(records.get("tx1").unwrap().read_prepaid_units, 1);
+        assert_eq!(records.get("tx2").unwrap().read_prepaid_units, 1);
+    }
+
+    let mut deliverer = e.deliverer(&server);
+    assert_eq!(
+        deliverer.pass_shared(&e.shared, Instant::now()),
+        Report {
+            delivered: 2,
+            ..Report::default()
+        }
+    );
+    let purchase = wire::purchase_id(&short);
+    let address = wire::delivery_address(&e.psp, &held_payer.did, &purchase);
+    let sealed = read(&server, &address).expect("the held record is on the server");
+    let opened = wire::open_record(&held_payer.key, &e.psp, &purchase, &sealed).unwrap();
+    let Outcome::Held(held) = opened.outcome else {
+        panic!("a held payment delivers a held record");
+    };
+    assert_eq!((held.paid_sats, held.requested_units), (12_000, 16));
+    // 12 paid, less the first read (1), the fee (2), the write (1) and the
+    // follow-up's read (1) leaves 7; the follow-up's read and the first are both
+    // in the prepaid reads of the rules
+    let rules = held.rules.expect("the rules ride with the held record");
+    assert_eq!(
+        (
+            rules.due_units,
+            rules.reconciliation_fee_units,
+            rules.read_prepaid_units,
+            rules.write_prepaid_units
+        ),
+        (7, 2, 2, 1)
+    );
+    // the report counts the first reads, which were taken at settlement
+    let recon = e.records().reconciliation();
+    assert_eq!(recon.read_prepaid_units, 2);
+    assert_eq!((recon.fees_units, recon.write_prepaid_units), (0, 0));
 }
 
 #[test]
@@ -342,10 +443,13 @@ fn a_payment_that_cannot_be_read_has_nothing_to_deliver() {
         value_sats: 5_000,
         payload: Some(vec![0]),
     };
-    settle::settle(&e.logic, &mut e.records, &received, &mut || Ok(BTC_10K)).unwrap();
+    assert!(matches!(
+        e.settle_received(&received, &Policy::default()),
+        Settlement::Rejected(settle::Rejection::BadPayload(_))
+    ));
     let mut deliverer = e.deliverer(&server);
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         Report::default()
     );
 }
@@ -364,17 +468,17 @@ fn air_down_at_settlement_then_a_later_pass_delivers_exactly_one_record() {
     let mut deliverer = e.deliverer(&down(&server));
     let t0 = Instant::now();
     assert_eq!(
-        deliverer.pass(&mut e.records, t0),
+        deliverer.pass_shared(&e.shared, t0),
         Report {
             failed: 1,
             ..Report::default()
         }
     );
-    assert_eq!(e.records.undelivered().len(), 1);
+    assert_eq!(e.records().undelivered().len(), 1);
     assert_eq!(read(&server, &address), None);
     // the sealed record was made and saved before the write was tried
     let saved = e
-        .records
+        .records()
         .get("tx1")
         .unwrap()
         .delivery
@@ -385,7 +489,7 @@ fn air_down_at_settlement_then_a_later_pass_delivers_exactly_one_record() {
 
     // inside the wait: left alone, no attempt
     assert_eq!(
-        deliverer.pass(&mut e.records, t0 + Duration::from_secs(1)),
+        deliverer.pass_shared(&e.shared, t0 + Duration::from_secs(1)),
         Report {
             waiting: 1,
             ..Report::default()
@@ -394,14 +498,14 @@ fn air_down_at_settlement_then_a_later_pass_delivers_exactly_one_record() {
     // after the wait: tried again, still down, and the wait doubles
     let t1 = t0 + retry_after(1) + Duration::from_secs(1);
     assert_eq!(
-        deliverer.pass(&mut e.records, t1),
+        deliverer.pass_shared(&e.shared, t1),
         Report {
             failed: 1,
             ..Report::default()
         }
     );
     assert_eq!(
-        deliverer.pass(&mut e.records, t1 + retry_after(1)),
+        deliverer.pass_shared(&e.shared, t1 + retry_after(1)),
         Report {
             waiting: 1,
             ..Report::default()
@@ -409,10 +513,10 @@ fn air_down_at_settlement_then_a_later_pass_delivers_exactly_one_record() {
     );
 
     // AIR is back, and the mint restarted (new deliverer, records read from disk)
-    let mut records = Records::open(&e.records_path()).unwrap();
+    let records = Mutex::new(Records::open(&e.records_path()).unwrap());
     let mut deliverer = e.deliverer(&server);
     assert_eq!(
-        deliverer.pass(&mut records, Instant::now()),
+        deliverer.pass_shared(&records, Instant::now()),
         delivered_report()
     );
     let sealed = read(&server, &address).expect("delivered");
@@ -423,7 +527,7 @@ fn air_down_at_settlement_then_a_later_pass_delivers_exactly_one_record() {
         "the payer can open it"
     );
     assert_eq!(
-        deliverer.pass(&mut records, Instant::now()),
+        deliverer.pass_shared(&records, Instant::now()),
         Report::default()
     );
     assert!(
@@ -445,8 +549,8 @@ fn a_write_that_got_through_unacknowledged_is_found_stored_not_written_twice() {
 
     // the first pass makes and saves the record, but AIR is down
     let mut deliverer = e.deliverer(&down(&server));
-    deliverer.pass(&mut e.records, Instant::now());
-    let delivery = e.records.get("tx1").unwrap().delivery.clone().unwrap();
+    deliverer.pass_shared(&e.shared, Instant::now());
+    let delivery = e.records().get("tx1").unwrap().delivery.clone().unwrap();
     let sealed = hex::decode(delivery.sealed.unwrap()).unwrap();
 
     // meanwhile a write of those bytes landed, and its answer was lost
@@ -455,10 +559,10 @@ fn a_write_that_got_through_unacknowledged_is_found_stored_not_written_twice() {
 
     let mut deliverer = e.deliverer(&server);
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         delivered_report()
     );
-    assert!(e.records.undelivered().is_empty());
+    assert!(e.records().undelivered().is_empty());
 }
 
 #[test]
@@ -478,18 +582,18 @@ fn a_different_record_at_the_address_is_reported_and_never_overwritten() {
 
     let mut deliverer = e.deliverer(&server);
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         Report {
             abandoned: 1,
             ..Report::default()
         }
     );
-    let delivery = e.records.get("tx1").unwrap().delivery.clone().unwrap();
+    let delivery = e.records().get("tx1").unwrap().delivery.clone().unwrap();
     assert!(!delivery.delivered);
     assert!(delivery.abandoned.unwrap().contains("different record"));
     // not tried again
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         Report::default()
     );
     let address = wire::delivery_address(&e.psp, &payer.did, &purchase);
@@ -507,15 +611,15 @@ fn a_reply_did_that_is_not_a_key_is_given_up_on_not_retried_for_ever() {
     issued(e.settle("tx1", 2_000, &bytes));
     let mut deliverer = e.deliverer(&server);
     assert_eq!(
-        deliverer.pass(&mut e.records, Instant::now()),
+        deliverer.pass_shared(&e.shared, Instant::now()),
         Report {
             abandoned: 1,
             ..Report::default()
         }
     );
-    assert!(e.records.undelivered().is_empty());
+    assert!(e.records().undelivered().is_empty());
     assert!(
-        e.records
+        e.records()
             .get("tx1")
             .unwrap()
             .delivery
@@ -523,30 +627,5 @@ fn a_reply_did_that_is_not_a_key_is_given_up_on_not_retried_for_ever() {
             .unwrap()
             .abandoned
             .is_some()
-    );
-}
-
-#[test]
-fn a_settlements_file_from_before_delivery_still_reads_and_owes_nothing() {
-    let server = server();
-    let e = env("old-state");
-    std::fs::write(
-        e.records_path(),
-        r#"{"aa": {"locked_price_cents": 1000000, "issued": true, "over_under_bps": 0,
-            "status": "issued", "late": false, "skipped_units": 0, "credit_cents": 0,
-            "reason": null, "payer_did": "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
-            "requested_units": 5, "value_sats": 5000},
-          "bb": {"locked_price_cents": 1000000, "issued": false, "over_under_bps": null,
-            "status": "rejected", "late": false, "skipped_units": 0, "credit_cents": 0,
-            "reason": "NoDataOutput"}}"#,
-    )
-    .unwrap();
-    let mut records = Records::open(&e.records_path()).unwrap();
-    assert_eq!(records.len(), 2);
-    assert!(records.undelivered().is_empty());
-    let mut deliverer = e.deliverer(&server);
-    assert_eq!(
-        deliverer.pass(&mut records, Instant::now()),
-        Report::default()
     );
 }
