@@ -2,6 +2,10 @@
 
 psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.5.0 (2026-10-22): sp-wire v0.5.0 from GitHub
+
+**Builds from GitHub with no local patch.** `Cargo.toml` names `sp-wire` at tag `v0.5.0` (it named `v0.4.0`, which has no `air-client`), and the committed `Cargo.lock` follows. sp-wire 0.5.0 pins AIR at `eae5133` (3.0.0 plus the `SecretKey` export) and air_server at `v1.0.1`, which takes `air` from crates.io, so `Cargo.toml` adds `[patch.crates-io] air` at that AIR commit; the commented local patches for AIR and air_server are gone, and the README's "Building" says this. No code change. Tests: 260, unchanged.
+
 ## 0.5.0 (unreleased): regtest round 1 (ROADMAP item 18)
 
 - **Behaviour change: caps on the size ceilings and the item count, checked when the settings load.** `server.melt_max_request_bytes`, `server.rollover_max_request_bytes`, `server.burns_max_request_bytes` and `server.check_state_max_request_bytes` are 16,384 to 15,728,640 bytes (were 4,096 to 1 GiB; 15 MiB is the most one AIR message carries). `rollover.max_items` is 64 to 25,000 (was 1 to 100,000). The three flat fees (`reconciliation.fee`, `reconciliation.write_fee`, `delivery.read_fee`) get no cap: they keep their old bound of 0 to 2^62 and are 0 by default. PSP units cannot be split and nothing stops a buyer from making a small purchase anyway, so raising these fees can eat up a small purchase before delivery; `settle.rs` holds a purchase that `delivery.read_fee` eats up as `paid_unsettled` (a `Held` delivery, 0 units due), and a credit that `reconciliation.fee` eats up comes to 0 units due; a reconciliation of either is refused with `nothing_to_issue` and the payment or credit is forfeited when its window closes (DESIGN.md says so). Defaults are unchanged. A settings file outside a range now stops the mint at start, naming the setting, the value and the range. The numbers are worked in DESIGN.md, "Caps on sizes and fees".

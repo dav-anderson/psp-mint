@@ -13,20 +13,13 @@ dependencies = [
 
 [[package]]
 name = "air"
-version = "2.0.3"
-source = "git+https://github.com/ramp-stack/air?rev=8e281d585ef0280812c109f67e248d5579c1970e#8e281d585ef0280812c109f67e248d5579c1970e"
+version = "3.0.0"
+source = "git+https://github.com/ramp-stack/air?rev=eae5133414fca493fa80ab3facf28248df9ad65d#eae5133414fca493fa80ab3facf28248df9ad65d"
 dependencies = [
- "arc-swap",
- "axum",
  "chacha20-poly1305",
  "chrono",
- "crossfire",
- "futures",
- "futures-util",
  "hex",
- "im",
  "log",
- "postage",
  "postcard",
  "rusqlite",
  "secp256k1 0.31.1",
@@ -34,9 +27,36 @@ dependencies = [
  "serde_json",
  "serde_with",
  "tokio",
+ "url",
+]
+
+[[package]]
+name = "air_server"
+version = "1.0.1"
+source = "git+https://github.com/ramp-stack/air_server?rev=efef62161d2924114be360424ead37220927d099#efef62161d2924114be360424ead37220927d099"
+dependencies = [
+ "air",
+ "arc-swap",
+ "axum",
+ "crossfire",
+ "easy_secp256k1",
+ "futures",
+ "futures-util",
+ "hex",
+ "im",
+ "postage",
+ "postcard",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "secp256k1 0.31.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tokio-util",
- "url",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -153,6 +173,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "base58ck"
+version = "0.1.101"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "365c0acd5b2e8dd0111a46c4faea83fb3cfb6e39a49a7c73a06e090db7b2eff0"
+dependencies = [
+ "bitcoin_hashes 0.14.101",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -175,15 +204,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "bech32"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
+
+[[package]]
+name = "bitcoin"
+version = "0.32.102"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb0ce8bd5baaa0d303a19915a6d93afed161f528654e42da2a7a97d05c59499a"
+dependencies = [
+ "base58ck",
+ "bech32",
+ "bitcoin-io 0.1.101",
+ "bitcoin-units",
+ "bitcoin_hashes 0.14.101",
+ "hex-conservative 0.2.3",
+ "hex_lit",
+ "secp256k1 0.29.1",
+]
+
+[[package]]
 name = "bitcoin-consensus-encoding"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9daa31138eb443d5751b207f3f64154e2bb09cd59960562ccc7a7112be38147f"
 dependencies = [
- "bitcoin-internals",
+ "bitcoin-internals 0.7.0",
  "hex-conservative 1.3.0",
  "serde",
 ]
+
+[[package]]
+name = "bitcoin-internals"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a90bbbfa552b49101a230fb2668f3f9ef968c81e6f83cf577e1d4b80f689e1aa"
 
 [[package]]
 name = "bitcoin-internals"
@@ -201,13 +258,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoin-io"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "26792cd2bf245069a1c5acb06aa7ad7abe1de69b507c90b490bca81e0665d0ee"
+dependencies = [
+ "bitcoin-internals 0.4.2",
+]
+
+[[package]]
+name = "bitcoin-units"
+version = "0.1.101"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cb95693f371d089a4b5b6fc41c6f3ea6e01ee8c15388335dfac8ea685173b51"
+dependencies = [
+ "bitcoin-consensus-encoding",
+]
+
+[[package]]
 name = "bitcoin_hashes"
 version = "0.14.101"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bca4c7abb40c8817d77403c880988cfd484f23ab2365726afb2f798363e2c4a2"
 dependencies = [
- "bitcoin-io",
+ "bitcoin-io 0.1.101",
  "hex-conservative 0.2.3",
+]
+
+[[package]]
+name = "bitcoin_hashes"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e5d09f16329cd545d7e6008b2c6b2af3a90bc678cf41ac3d2f6755943301b16"
+dependencies = [
+ "bitcoin-io 0.2.0",
+ "hex-conservative 0.3.2",
 ]
 
 [[package]]
@@ -391,7 +476,7 @@ checksum = "adb5e5c51e448ac2309883593482db91a5549c528d08a36aaa87bba13e5a40ae"
 dependencies = [
  "crossbeam-utils",
  "futures-core",
- "parking_lot 0.11.2",
+ "parking_lot 0.12.5",
  "pointers",
  "smallvec",
  "tokio",
@@ -486,6 +571,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
+name = "easy_secp256k1"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c306face3479f85b27718a33448778a029a97452ffe1d48123ebb982e5ee47e9"
+dependencies = [
+ "bitcoin",
+ "bitcoin_hashes 0.16.0",
+ "chacha20-poly1305",
+ "secp256k1 0.29.1",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -510,7 +607,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -778,12 +875,27 @@ dependencies = [
 
 [[package]]
 name = "hex-conservative"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830e599c2904b08f0834ee6337d8fe8f0ed4a63b5d9e7a7f49c0ffa06d08d360"
+dependencies = [
+ "arrayvec",
+]
+
+[[package]]
+name = "hex-conservative"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "271e0d19bcb473b6675739a2b536076b24a082316cb5199ad918edce10c599e8"
 dependencies = [
  "arrayvec",
 ]
+
+[[package]]
+name = "hex_lit"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3011d1213f159867b13cfd6ac92d2cd5f1345762c63be3554e84092d85a50bbd"
 
 [[package]]
 name = "http"
@@ -863,7 +975,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -1416,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "psp-mint"
-version = "0.3.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "bdhke",
@@ -1488,7 +1600,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1698,7 +1810,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -1762,12 +1874,22 @@ version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]
@@ -1835,11 +1957,22 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "secp256k1"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
+dependencies = [
+ "bitcoin_hashes 0.14.101",
+ "rand 0.8.8",
+ "secp256k1-sys 0.10.1",
+]
+
+[[package]]
+name = "secp256k1"
 version = "0.30.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b50c5943d326858130af85e049f2661ba3c78b26589b8ab98e65e80ae44a1252"
 dependencies = [
- "bitcoin_hashes",
+ "bitcoin_hashes 0.14.101",
  "rand 0.8.8",
  "secp256k1-sys 0.10.1",
  "serde",
@@ -1851,7 +1984,7 @@ version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2c3c81b43dc2d8877c216a3fccf76677ee1ebccd429566d3e67447290d0c42b2"
 dependencies = [
- "bitcoin_hashes",
+ "bitcoin_hashes 0.14.101",
  "rand 0.9.5",
  "secp256k1-sys 0.11.0",
  "serde",
@@ -2084,16 +2217,18 @@ dependencies = [
 
 [[package]]
 name = "sp-wire"
-version = "0.4.0"
-source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.4.0#60ed3bca435c9613e4c94fde0eab72d2e3c6ce89"
+version = "0.5.0"
+source = "git+https://github.com/dav-anderson/sp-wire.git?tag=v0.5.0#b5305f49bb3a99c8eb0ac4ec30594f68966b3f96"
 dependencies = [
  "air",
+ "air_server",
  "hex",
  "mint-types",
  "secp256k1 0.30.0",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
 ]
 
 [[package]]
@@ -2676,6 +2811,15 @@ checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
