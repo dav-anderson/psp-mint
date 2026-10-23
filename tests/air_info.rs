@@ -19,8 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use mint_server::api::CheckStateRequest;
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, transaction_sighash};
 use psp_mint::air_listener::{self, NEXT_FILE, Serve, Settings};
 use psp_mint::records::SharedRecords;
@@ -37,6 +36,7 @@ use sp_wire::air_request::{
     MintInfo, STATUS_REFUSED, STATUS_UNAVAILABLE, Served, VerifyError, local_server,
     verify_receipt,
 };
+use sp_wire::keys::CheckStateRequest;
 use sp_wire::seal::SecretKey;
 use sp_wire::{ServiceDid, WIRE_VERSION};
 

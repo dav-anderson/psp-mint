@@ -12,12 +12,12 @@ mod common;
 use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 
-use mint_server::api::{CheckStateRequest, CheckStateResponse};
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
 use psp_mint::server::{BurnsRequest, Limits};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
+use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
 
 const MIB: usize = 1024 * 1024;
 
@@ -141,7 +141,7 @@ async fn a_melt_over_the_ceiling_is_refused_before_parsing_and_burns_nothing() {
     let (note, keypair) = issued_note(&m.state, amount);
     let memo = "limits test";
     let request = psp_mint::server::PspMeltRequest {
-        melt: sp_wire::psp::MeltRequest {
+        melt: sp_wire::melt::MeltRequest {
             inputs: vec![melt_input(note, &keypair, amount, memo)],
             memo: memo.to_string(),
         },

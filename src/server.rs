@@ -6,8 +6,8 @@
 //! spend and reconcile, which settles an open payment against the shared
 //! settlement records and answers only an accepted request). What is left on HTTP is local to the SPI and the operator:
 //! the ESP mint's `/melt` and `/burns`, `/audit` and `/health`. The audit and
-//! the melt handlers are mint-server's, the same ones `mintd` uses, mounted
-//! over the PSP's own `MintLogic` in the same process. One process owns the
+//! the melt handlers are this mint's own, over the PSP's own `MintLogic`
+//! (`mint_core::state::AppState`) in the same process. One process owns the
 //! database, so the API, the AIR listener and the payment scanner share the
 //! mint behind one mutex.
 //!
@@ -15,8 +15,8 @@
 //!
 //! - `POST /melt`: burn notes, bound to a memo that every input signs. The ESP
 //!   mint uses this to burn PSP in an exchange. This is the PSP's own handler,
-//!   which records the memo of each burn (see `melts`) and otherwise does what
-//!   mint-server's does.
+//!   which records the memo of each burn (see `melts`) and checks each input
+//!   against the keyset it names.
 //! - `POST /burns`: for each nonce, whether it is spent and the memo it was burned
 //!   under. The ESP mint uses this to tell, on a retry, a note it burned itself
 //!   from a note that was burned by someone else.
@@ -58,9 +58,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodRouter, get, post};
 use axum::{Json, Router};
 use mint_core::MintLogic;
-use mint_server::api::{self, MeltRequest, MeltResponse};
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{Amount, MintInput, Nonce};
+use sp_wire::keys::{CheckStateRequest, CheckStateResponse, KeysResponse};
+use sp_wire::melt::MeltResponse;
 
 use crate::melts::MeltLog;
 use crate::records::{Records, SharedRecords};
@@ -102,10 +103,6 @@ pub type SharedMelts = Arc<Mutex<MeltLog>>;
 pub fn app_state(logic: MintLogic) -> Arc<AppState> {
     Arc::new(AppState {
         logic: Mutex::new(logic),
-        // Only `/admin/issue` reads this, and that route is not mounted. It is a
-        // random value nobody is given, so even a mistaken mount would not open
-        // unilateral issuance.
-        admin_token: hex::encode(rand::random::<[u8; 32]>()),
     })
 }
 
@@ -472,11 +469,7 @@ async fn melt_handler(
     State((state, melts, rot)): State<MeltState>,
     Json(req): Json<PspMeltRequest>,
 ) -> Result<Json<MeltResponse>, ApiFailure> {
-    let PspMeltRequest { melt, keysets } = req;
-    let req = MeltRequest {
-        inputs: melt.inputs,
-        memo: melt.memo,
-    };
+    let PspMeltRequest { melt: req, keysets } = req;
     let mut logic = state.logic.lock().map_err(|_| {
         failure(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -698,11 +691,21 @@ struct LimitFor {
 
 type RotState = (Arc<AppState>, SharedRotating);
 
+/// The totals of the `/audit` body: the units issued, redeemed and still
+/// outstanding over every generation. The handler adds `paid`, `burned` and
+/// `reissued` to the JSON.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AuditResponse {
+    pub issued: Amount,
+    pub redeemed: Amount,
+    pub outstanding: Amount,
+}
+
 /// The keys call: the public key for each denomination now in force.
-fn keys_response(state: &AppState, rot: &SharedRotating) -> Result<api::KeysResponse, ApiFailure> {
+fn keys_response(state: &AppState, rot: &SharedRotating) -> Result<KeysResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let _r = rotor_of(rot, &mut logic)?;
-    Ok(api::KeysResponse {
+    Ok(KeysResponse {
         keys: logic.public_keys().clone(),
     })
 }
@@ -712,8 +715,8 @@ fn keys_response(state: &AppState, rot: &SharedRotating) -> Result<api::KeysResp
 fn check_state_response(
     state: &AppState,
     rot: &SharedRotating,
-    req: api::CheckStateRequest,
-) -> Result<api::CheckStateResponse, ApiFailure> {
+    req: CheckStateRequest,
+) -> Result<CheckStateResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let rotor = rotor_of(rot, &mut logic)?;
     let prev = rotor.previous.as_ref().map(|(_, l)| l);
@@ -723,7 +726,7 @@ fn check_state_response(
             spent_in(&logic, prev, n).map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))?,
         );
     }
-    Ok(api::CheckStateResponse { spent })
+    Ok(CheckStateResponse { spent })
 }
 
 /// Issued and redeemed over every generation, the deleted ones included, and
@@ -755,7 +758,7 @@ async fn audit_handler(
         let store = rot.rollovers.lock().map_err(|_| poisoned())?;
         (store.paid(), store.paid_burned(), store.paid_kept())
     };
-    let mut body = serde_json::to_value(api::AuditResponse {
+    let mut body = serde_json::to_value(AuditResponse {
         issued: i,
         redeemed: d,
         outstanding: Amount::from_units(i.units.saturating_sub(d.units)),
@@ -926,7 +929,7 @@ pub fn air_served_with(
             "check-state",
             limits.check_state_bytes,
             body,
-            |req: api::CheckStateRequest| check_state_response(state, rot, req),
+            |req: CheckStateRequest| check_state_response(state, rot, req),
         ),
         _ => return None,
     })

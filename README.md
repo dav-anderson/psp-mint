@@ -191,7 +191,7 @@ A payment that is **held**, a purchase that was **rejected** with a readable rep
 
 ## Local HTTP API
 
-The HTTP API is local to the SPI and the operator; wallets do not use it (they use AIR, above). It is served on `server.bind`, which must be a loopback address. The handlers are mint-server's, mounted over the PSP's own mint in the same process, except `/melt`, which is the PSP's own handler: it does what mint-server's does and also keeps the memo of each burn (see [DESIGN.md](DESIGN.md), "Burn memos"), and `/burns`, which is the PSP's own route. The scanner and the API share the mint behind one mutex. The scanner locks it once per payment and never while it waits on the exchanges for a price.
+The HTTP API is local to the SPI and the operator; wallets do not use it (they use AIR, above). It is served on `server.bind`, which must be a loopback address. The handlers are this mint's own, over the PSP's own mint in the same process (mint-core's `AppState`: the mint behind one mutex); `/melt` also keeps the memo of each burn (see [DESIGN.md](DESIGN.md), "Burn memos"), and `/burns` is a route of this mint only. The bodies of `/keys`, `/check-state` and `/melt` are sp-wire's (`keys`, `melt`). The scanner and the API share the mint behind one mutex. The scanner locks it once per payment and never while it waits on the exchanges for a price.
 
 | Route | What it does |
 |---|---|

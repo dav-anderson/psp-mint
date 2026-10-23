@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use psp_mint::air_listener::{self, Serve, Settings};
 use psp_mint::melts::MeltLog;
 use psp_mint::records::{Records, SharedRecords};

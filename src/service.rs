@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use mint_core::MintLogic;
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use sp_wire::seal::SecretKey;
 
 use crate::delivery::Deliverer;

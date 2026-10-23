@@ -8,16 +8,15 @@ mod common;
 
 use std::sync::Arc;
 
-use mint_server::api::{
-    AuditResponse, CheckStateRequest, CheckStateResponse, MeltRequest, MeltResponse,
-};
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
 };
-use psp_mint::server::{Burn, BurnsRequest, BurnsResponse, Limits, fatal};
+use psp_mint::server::{AuditResponse, Burn, BurnsRequest, BurnsResponse, Limits, fatal};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
+use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
+use sp_wire::melt::{MeltRequest, MeltResponse};
 
 use common::PspMint;
 
@@ -30,7 +29,7 @@ fn ks(state: &AppState, melt: MeltRequest) -> psp_mint::server::PspMeltRequest {
     let id = psp_mint::rotation::keyset_id(state.logic.lock().unwrap().public_keys());
     psp_mint::server::PspMeltRequest {
         keysets: vec![id; melt.inputs.len()],
-        melt: sp_wire::psp::MeltRequest {
+        melt: sp_wire::melt::MeltRequest {
             inputs: melt.inputs,
             memo: melt.memo,
         },

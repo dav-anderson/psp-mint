@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::Amount;
 use psp_mint::config::{self, Config};
 use psp_mint::delivery::Deliverer;

@@ -13,15 +13,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use mint_server::api::{AuditResponse, CheckStateRequest, CheckStateResponse};
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
 };
 use psp_mint::rotation::{RolloverRequest, RolloverResponse, Rollovers, RotationResponse, Rotor};
-use psp_mint::server::{KeysetsResponse, PspMeltRequest, SharedRotating};
+use psp_mint::server::{AuditResponse, KeysetsResponse, PspMeltRequest, SharedRotating};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
+use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
 
 const T: u64 = 1_800_000_000;
 const H: u64 = 3600;
@@ -140,7 +140,7 @@ fn melt(notes: &[(Note, Keypair)], amount: Amount, memo: &str, keysets: &[&str])
         .collect();
     let h = melt_sighash(&unsigned, memo.as_bytes());
     PspMeltRequest {
-        melt: sp_wire::psp::MeltRequest {
+        melt: sp_wire::melt::MeltRequest {
             inputs: unsigned
                 .into_iter()
                 .zip(notes)

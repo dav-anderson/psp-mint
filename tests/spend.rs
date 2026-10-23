@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use mint_server::api::{CheckStateRequest, CheckStateResponse};
-use mint_server::state::AppState;
+use mint_core::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
 use psp_mint::balance::{self, Figure};
 use psp_mint::rotation::{
@@ -26,6 +25,7 @@ use psp_mint::server::{KeysetsResponse, Limits, PspMeltRequest, SharedRotating};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use serde_json::Value;
+use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
 use sp_wire::psp::PspHandover;
 
 const T: u64 = 1_800_000_000;
@@ -171,7 +171,7 @@ impl Mint {
         };
         let h = melt_sighash(std::slice::from_ref(&unsigned), memo.as_bytes());
         let req = PspMeltRequest {
-            melt: sp_wire::psp::MeltRequest {
+            melt: sp_wire::melt::MeltRequest {
                 inputs: vec![MintInput {
                     spend_signature: SECP256K1.sign_schnorr(&h, &note.1),
                     ..unsigned

@@ -49,7 +49,7 @@ fn melt_request(mint: &PspMint, note: Note, keypair: &Keypair, amount: Amount) -
     let id = psp_mint::rotation::keyset_id(mint.state.logic.lock().unwrap().public_keys());
     PspMeltRequest {
         keysets: vec![id],
-        melt: sp_wire::psp::MeltRequest {
+        melt: sp_wire::melt::MeltRequest {
             inputs: vec![input],
             memo: memo.to_string(),
         },
