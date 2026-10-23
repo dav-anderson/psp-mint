@@ -18,9 +18,17 @@
 //! nothing. So is a value of the wrong type or out of range: the mint lists
 //! every problem and does not start.
 //!
-//! The settings are read once, at startup. There is no reload: a change takes
-//! effect at the next start. `PSP_DATA_DIR` is not a setting, because the file
-//! lives in it.
+//! Reloading: send the running mint `SIGHUP`. It reads the file and the
+//! environment again, checks the result, and swaps it in all at once, or keeps the
+//! old values and says why ([`Handle`]). Every setting in `SPECS` has a `reload`
+//! flag: `true` is a setting that "reloads live" (the fees, the limits, the
+//! settlement rules, the price rules, the scan interval, the health allowance,
+//! the burn settings and the RPC address, cookie and timeout); `false` is a
+//! setting that "needs a restart" (the listen address, the network, the bitcoin
+//! wallet, the keys and rotation, the AIR server). It is read once, when the
+//! process opens the mint; a reload names a change to it and leaves the running
+//! value alone until the mint is restarted, which is a brief downtime (see the
+//! README). `PSP_DATA_DIR` is not a setting, because the file lives in it.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -113,6 +121,11 @@ pub struct Spec {
     /// The default, as written in the file.
     pub default: &'static str,
     pub units: &'static str,
+    /// Whether a running mint picks up a change on `SIGHUP` as it is ("reloads
+    /// live"). A setting with `false` ("needs a restart") is read once, when the
+    /// process opens the mint: `SIGHUP` names a change to it and the running
+    /// value stays until the mint is restarted (see the README).
+    pub reload: bool,
     pub what: &'static str,
 }
 
@@ -127,6 +140,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_BIND",
         default: "127.0.0.1:3000",
         units: "host:port",
+        reload: false,
         what: "The address of the HTTP API that is left (`serve` only): `/melt` and `/burns` (the ESP mint's calls, inside the SPI), `/audit` (the operator's report) and `/health` (read by the SPI and the health monitor). Must be a loopback address: wallets reach this mint over AIR only, never over HTTP.",
     },
     Spec {
@@ -134,6 +148,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_MELT_MAX_BYTES",
         default: "1048576",
         units: "bytes",
+        reload: true,
         what: "The ceiling on one `POST /melt` body (1 MiB). A larger body is refused with 413 before it is parsed: nothing is burned. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
@@ -141,6 +156,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_ROLLOVER_MAX_BYTES",
         default: "1048576",
         units: "bytes",
+        reload: true,
         what: "The ceiling on one rollover request or one spend request (1 MiB), which come over AIR. A larger body is refused with 413 before it is parsed: nothing is burned. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
@@ -148,6 +164,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_ROLLOVER_MAX_ITEMS",
         default: "1000",
         units: "notes",
+        reload: true,
         what: "The most notes in one rollover request, and the most notes in and the most change outputs out of one spend request. More is refused 400 before anything is burned. 64 to 25000: at least the 64 outputs one amount can need, at most what fits one AIR message.",
     },
     Spec {
@@ -155,6 +172,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_BURNS_MAX_BYTES",
         default: "1048576",
         units: "bytes",
+        reload: true,
         what: "The ceiling on one `POST /burns` body (1 MiB). A larger body is refused with 413 before it is parsed. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
@@ -162,6 +180,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_CHECK_STATE_MAX_BYTES",
         default: "1048576",
         units: "bytes",
+        reload: true,
         what: "The ceiling on one check-state request (1 MiB), which comes over AIR. A larger body is refused with 413 before it is parsed. 16384 to 15728640 (15 MiB: the most one AIR message carries).",
     },
     Spec {
@@ -169,6 +188,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_NETWORK",
         default: "main",
         units: "network",
+        reload: false,
         what: "main, regtest, signet or testnet. `--regtest`, `--signet` or `--testnet` on the command line overrides it. Picks the defaults below and the data folder.",
     },
     Spec {
@@ -176,6 +196,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RPC_URL",
         default: "http://127.0.0.1:8332",
         units: "URL",
+        reload: true,
         what: "Bitcoin Core's RPC address, without the wallet path. Default per network: port 8332 main, 18443 regtest, 38332 signet, 18332 testnet.",
     },
     Spec {
@@ -183,6 +204,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_WALLET",
         default: "psp-main",
         units: "name",
+        reload: false,
         what: "The Bitcoin Core wallet that receives payments. Default per network: psp-main, psp-regtest, psp-signet, psp-testnet.",
     },
     Spec {
@@ -190,6 +212,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_COOKIE",
         default: "$HOME/Library/Application Support/Bitcoin/.cookie (macOS), $HOME/.bitcoin/.cookie (Linux)",
         units: "path",
+        reload: true,
         what: "Bitcoin Core's RPC cookie file. Default per network: bitcoind's own (`.cookie`, `regtest/.cookie`, `signet/.cookie`, `testnet3/.cookie` under its data directory).",
     },
     Spec {
@@ -197,6 +220,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RPC_TIMEOUT_SECS",
         default: "30",
         units: "seconds",
+        reload: true,
         what: "How long one RPC call may take before the scan fails and is retried.",
     },
     Spec {
@@ -204,6 +228,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_SCAN_INTERVAL_SECS",
         default: "120",
         units: "seconds",
+        reload: true,
         what: "Time between wallet scans (`serve` only).",
     },
     Spec {
@@ -211,6 +236,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_HEALTH_INTERVALS",
         default: "3",
         units: "scan intervals",
+        reload: true,
         what: "`/health` fails after this many scan intervals plus `scan.health_grace_secs` without a successful scan (`serve` only).",
     },
     Spec {
@@ -218,6 +244,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_HEALTH_GRACE_SECS",
         default: "60",
         units: "seconds",
+        reload: true,
         what: "Added to `scan.health_intervals` intervals before `/health` fails, for a slow price fetch.",
     },
     Spec {
@@ -225,6 +252,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_PRICE_MAX_AGE_SECS",
         default: "120",
         units: "seconds",
+        reload: true,
         what: "A quote whose time is further than this from now is excluded.",
     },
     Spec {
@@ -232,6 +260,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_PRICE_MAX_SPREAD_BPS",
         default: "200",
         units: "basis points",
+        reload: true,
         what: "With two usable quotes, wait if they differ by more than this of the lower one (2%).",
     },
     Spec {
@@ -239,6 +268,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_PRICE_TIMEOUT_SECS",
         default: "10",
         units: "seconds",
+        reload: true,
         what: "How long one ticker request may take.",
     },
     Spec {
@@ -246,6 +276,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_LOCK_CONFIRMATIONS",
         default: "1",
         units: "confirmations",
+        reload: true,
         what: "A payment's price is locked when it is first seen with this many confirmations.",
     },
     Spec {
@@ -253,6 +284,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_MIN_CONFIRMATIONS",
         default: "6",
         units: "confirmations",
+        reload: true,
         what: "A payment is settled, at its locked price, once it has this many confirmations.",
     },
     Spec {
@@ -260,6 +292,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_PRICE_TOLERANCE",
         default: "0.01",
         units: "fraction, 0 to 1 (0.01 is 1%)",
+        reload: true,
         what: "How far a payment may miss the requested amount, over or under, and still settle in full as if it were exact: every requested note is signed, and nothing is credited, dropped or kept. It covers the BTC price moving between the price lock (settle.lock_confirmations) and settlement (settle.min_confirmations), which no payer should be penalised or credited for. Widen it in a volatile market. It must not be more than settle.payment_reconciliation_target (the mint refuses to start otherwise), because that setting handles the payments outside it. See the README.",
     },
     Spec {
@@ -267,6 +300,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_PAYMENT_RECONCILIATION_TARGET",
         default: "0.10",
         units: "fraction, 0 to 1 (0.10 is 10%)",
+        reload: true,
         what: "For a payment outside settle.price_tolerance, which is genuinely wrong: how far it may miss the requested amount before the mint stops absorbing the difference and reconciles it. Over by no more than this: the mint keeps the excess; over by more: the excess is recorded as credit for the payer's DID. Short: the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid, those notes are signed and the mint keeps the remainder; otherwise nothing is signed and the payment is held as paid but unsettled. Tighter is fairer to payers but sends more payments to credit or reconciliation; looser settles more automatically but keeps or forgoes more value. See the README.",
     },
     Spec {
@@ -274,6 +308,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RECONCILIATION_WINDOW_DAYS",
         default: "14",
         units: "days",
+        reload: true,
         what: "How long a credit, a held payment (paid but unsettled) or a rejected purchase stays open, counted from when the mint settles the payment. The payer is told over AIR, and the window is in the record. When it closes with the payment still open, the mint forfeits it: it keeps the BTC, owes no credit, and /audit shows it apart. The payer's wallet deletes the purchase's key at the same time. An open payment is settled by a reconciliation request over AIR (kind 15, see reconciliation.fee) before the window closes. 1 to 365.",
     },
     Spec {
@@ -281,6 +316,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RECONCILIATION_FEE",
         default: "0",
         units: "PSP units",
+        reload: true,
         what: "The fee taken when a reconciliation settles an open payment (kind 15): a corrected request for a held or rejected payment, or the claim of a credit. It comes out of what the request may carry, so the request's outputs add up to the payment's value less this fee (and less reconciliation.write_fee and delivery.read_fee), and the PSP keeps the difference; /audit shows it apart as fees_units. It is fixed for a payment when its window opens, in the rules the first delivery carries, so a later change does not touch payments that are already open. 0 or more whole PSP units; 0 (the default) takes no fee.",
     },
     Spec {
@@ -288,6 +324,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RECONCILIATION_MAX_ATTEMPTS",
         default: "2",
         units: "attempts",
+        reload: true,
         what: "How many requests refused for their content a payment accepts before it ignores every further one and is left to be forfeited when its window closes. An attempt is a request signed by the right reply key, for an open payment, refused for its content, with a new hash; a bad signature, an unknown payment and an identical resend are not counted. A refused request gets no reply. The second attempt exists only for the rare keyset-rotation race, where the wallet built its notes on a keyset that left the live window. Fixed for a payment when its window opens. 1 to 1000; 2 by default.",
     },
     Spec {
@@ -295,6 +332,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RECONCILIATION_WRITE_FEE",
         default: "0",
         units: "PSP units",
+        reload: true,
         what: "The cost of the one kind 15 write, which the SPI prepays on the wallet's behalf (bound to the open payment's reply key and capped by reconciliation.max_attempts). It is taken from what the request may carry, once per payment: the SPI absorbs the cost of a second attempt. /audit shows it as write_prepaid_units. Fixed for a payment when its window opens. 0 or more whole PSP units; 0 (the default) takes nothing. Only the amount is recorded today: the prepaid AIR write itself is not built (it waits on AIR).",
     },
     Spec {
@@ -302,6 +340,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_RECONCILIATION_ROUND_UP_FROM",
         default: "9",
         units: "cents, 1 to 10",
+        reload: true,
         what: "The value is the cents remainder from which a credit rounds up to the next whole PSP unit: 1 means round up from 0.1, 9 (the default) from 0.9, and 10 never rounds up. A credit is in USD cents and a PSP unit is 10 cents, so a credit of 259 cents is 25 units and 9 cents over: at 9 it rounds up to 26 units and the SPI gives away 1 cent; at 10 it rounds down to 25 and the SPI keeps the 9 cents. At the default the SPI gives away at most 1 cent and keeps at most 8. /audit shows the cents kept and given away as rounding_kept_cents and rounding_given_cents. Fixed for a payment when its window opens.",
     },
     Spec {
@@ -309,13 +348,47 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_DELIVERY_READ_FEE",
         default: "0",
         units: "PSP units",
+        reload: true,
         what: "The read cost the PSP prepays for each record a payer must read: the first delivery record of a purchase, and the follow-up record, the answer to an accepted reconciliation request. The first one's cost comes off the bitcoin payment before it is assessed (the purchase buys that many units less); the follow-up's comes off what a reconciliation may carry. /audit shows it as read_prepaid_units. It is meant to be very small. Fixed for a payment when its window opens. 0 or more whole PSP units; 0 (the default) takes nothing. Only the amounts are recorded today: the prepaid AIR read itself is not built (it waits on AIR).",
+    },
+    Spec {
+        key: "burn.enabled",
+        env: "PSP_BURN_ENABLED",
+        default: "false",
+        units: "true or false",
+        reload: true,
+        what: "Whether the PSP the mint is paid (the `pay` of a spend, kind 14) may be burned. False (the default): none is burned, and the mint reissues every paid unit as PSP notes in a file in `revenue/` under the data folder, for the SPI's own ecash-wallet to take in (`ecash-wallet receive-psp`). True: the mint reissues paid PSP only while the SPI's wallet holds less than `burn.threshold_psp`, and burns the rest. With no usable wallet balance figure (`burn.balance_file`) nothing is burned. Only paid PSP is ever burned: the PSP the ESP mint burns for an exchange, and the PSP bought with bitcoin, are not touched by this setting.",
+    },
+    Spec {
+        key: "burn.threshold_psp",
+        env: "PSP_BURN_THRESHOLD_PSP",
+        default: "0",
+        units: "PSP units",
+        reload: true,
+        what: "With `burn.enabled` true: the PSP the SPI's wallet is kept at. Measured against what the wallet holds now: the balance the SPI last published in `burn.balance_file`, plus the PSP the mint has reissued since (`reissued` in `/audit`). Paid PSP is reissued only up to the room left under it (threshold less what the wallet holds); the rest is burned, all of it once the wallet holds the threshold or more, and reissuing starts again when the wallet spends. 0 burns every paid unit whenever a figure is usable. Ignored while `burn.enabled` is false.",
+    },
+    Spec {
+        key: "burn.balance_file",
+        env: "PSP_BURN_BALANCE_FILE",
+        default: "",
+        units: "path",
+        reload: true,
+        what: "Where the SPI publishes its wallet's PSP balance for `burn.threshold_psp`: a JSON file `{\"psp\": N, \"reissued\": N, \"at\": N}` that `spi` writes (the balance, the mint's own `reissued` total read right after it, and the time in seconds). Empty (the default): `wallet_balance.json` in the network's data folder. Read at each spend, and only while `burn.enabled` is true. A file that is missing, unreadable, not that shape, or older than `burn.balance_max_age_secs` gives no figure, and then every paid unit is reissued: the mint never burns on a guess.",
+    },
+    Spec {
+        key: "burn.balance_max_age_secs",
+        env: "PSP_BURN_BALANCE_MAX_AGE_SECS",
+        default: "86400",
+        units: "seconds, 1 to 604,800",
+        reload: true,
+        what: "How old the balance figure in `burn.balance_file` may be before the mint ignores it (and reissues every paid unit). A figure dated more than a minute ahead of the clock is ignored too. 1 to 604,800 (a week). Ignored while `burn.enabled` is false.",
     },
     Spec {
         key: "mint.max_denomination_units",
         env: "PSP_MAX_DENOMINATION_UNITS",
         default: "16777216",
         units: "PSP units",
+        reload: false,
         what: "The largest denomination (powers of two from 1). Only used when the mint's keys are first made; an existing `mint_keys.json` keeps its denominations.",
     },
     Spec {
@@ -323,6 +396,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_ROTATION_ACTIVATION_HOURS",
         default: "8760",
         units: "hours",
+        reload: false,
         what: "Hours from the mint's first issuance (recorded once in first_issue.json) to its first key rotation. 0 = never rotate (one key set, one spent list).",
     },
     Spec {
@@ -330,6 +404,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_ROTATION_PERIOD_HOURS",
         default: "87600",
         units: "hours",
+        reload: false,
         what: "Hours between key rotations (10 years). Notes of the previous key set stay good until the next rotation; then that set and its spent list are deleted. 0 = never rotate. When rotation is on it must be at least 24: BTC claims need time to settle before a rotation (the mint refuses to start otherwise).",
     },
     Spec {
@@ -337,6 +412,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_STORAGE_MINT_STATE",
         default: "",
         units: "service DIDs (66 hex characters)",
+        reload: false,
         what: "Which AIR services keep this mint's state (keys, spent lists, records), as an ordered list of service IDs: index 0 is the primary and the rest are secondaries, in the order they would be promoted. A service ID is the service's AIR DID, a 33-byte compressed key in hex (66 characters, starting 02 or 03); the old 32-byte x-only form is refused. In the environment the IDs are separated by commas; in the file it is an array of strings or one such string. One entry: that service holds the state and the mint keeps a local backup copy. Empty (the default): local only. At most 8, no duplicates. Setting only for now: nothing reads or writes the AIR yet (see DESIGN.md in sandbox-mint, \"AIR storage requirements\").",
     },
     Spec {
@@ -344,6 +420,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_AIR_SERVER",
         default: "",
         units: "AIR server name (66 hex characters)",
+        reload: false,
         what: "The AIR server the listener holds reads on and writes replies to: its identity, a public key in AIR's compressed hex form (66 characters). The listener checks the server's signed challenge against it. Required by serve: the AIR listener always runs, because AIR is the only way wallets reach this mint. Until the AIR resolves a DID to a server (upstream item 4), this is configuration.",
     },
     Spec {
@@ -351,6 +428,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_AIR_HOST",
         default: "",
         units: "host or IP, no port",
+        reload: false,
         what: "Where that AIR server is: a host name or an IP (127.0.0.1 for the SPI's own AIR server). No port: the AIR client always uses 5702 (ws). Required by serve, with air.server.",
     },
     Spec {
@@ -358,6 +436,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_AIR_HELD_READS",
         default: "16",
         units: "reads",
+        reload: false,
         what: "How many mailbox slots the listener holds a read on, ahead of the next unfinished one. More lets more wallets be answered at once without waiting for a slot to be reached; each held read costs the AIR server about 2 KB. The AIR server closes the whole session at its 257th held read, so the most accepted is 200.",
     },
     Spec {
@@ -365,6 +444,7 @@ pub const SPECS: &[Spec] = &[
         env: "PSP_AIR_TIMEOUT_SECS",
         default: "10",
         units: "seconds",
+        reload: false,
         what: "How long the AIR server may take to answer one Create or Read before the listener counts the try as failed (a reply is tried three times), and how long a connection may take when the mint writes a delivery record.",
     },
 ];
@@ -406,6 +486,14 @@ pub struct Config {
     pub reconciliation_round_up_from: u64,
     /// `delivery.read_fee`, in PSP units.
     pub delivery_read_fee: u64,
+    /// `burn.enabled`.
+    pub burn_enabled: bool,
+    /// `burn.threshold_psp`, in PSP units.
+    pub burn_threshold_psp: u64,
+    /// `burn.balance_file`; empty: the default place.
+    pub burn_balance_file: String,
+    /// `burn.balance_max_age_secs`.
+    pub burn_balance_max_age_secs: u64,
     pub max_denomination_units: u64,
     pub rotation_activation_hours: u64,
     pub rotation_period_hours: u64,
@@ -460,6 +548,10 @@ impl Config {
             reconciliation_write_fee: 0,
             reconciliation_round_up_from: settle::DEFAULT_ROUND_UP_FROM_CENTS,
             delivery_read_fee: 0,
+            burn_enabled: false,
+            burn_threshold_psp: 0,
+            burn_balance_file: String::new(),
+            burn_balance_max_age_secs: crate::balance::DEFAULT_MAX_AGE_SECS,
             max_denomination_units: DEFAULT_MAX_DENOMINATION_UNITS,
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
@@ -529,6 +621,15 @@ fn whole<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
         .map_err(|_| format!("{key} = `{value}` is not a whole number (no sign, no decimals)"))
 }
 
+/// `true` or `false`, and nothing else.
+fn truth(key: &str, value: &str) -> Result<bool, String> {
+    match value.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!("{key} = `{value}` must be true or false")),
+    }
+}
+
 impl Config {
     /// The current value of a setting, as it is written in the file.
     pub fn get(&self, key: &str) -> Option<String> {
@@ -564,6 +665,10 @@ impl Config {
             "reconciliation.write_fee" => self.reconciliation_write_fee.to_string(),
             "reconciliation.round_up_from" => self.reconciliation_round_up_from.to_string(),
             "delivery.read_fee" => self.delivery_read_fee.to_string(),
+            "burn.enabled" => self.burn_enabled.to_string(),
+            "burn.threshold_psp" => self.burn_threshold_psp.to_string(),
+            "burn.balance_file" => self.burn_balance_file.clone(),
+            "burn.balance_max_age_secs" => self.burn_balance_max_age_secs.to_string(),
             "mint.max_denomination_units" => self.max_denomination_units.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
@@ -621,6 +726,10 @@ impl Config {
                 self.reconciliation_round_up_from = whole(key, value)?
             }
             "delivery.read_fee" => self.delivery_read_fee = whole(key, value)?,
+            "burn.enabled" => self.burn_enabled = truth(key, value)?,
+            "burn.threshold_psp" => self.burn_threshold_psp = whole(key, value)?,
+            "burn.balance_file" => self.burn_balance_file = value.trim().to_string(),
+            "burn.balance_max_age_secs" => self.burn_balance_max_age_secs = whole(key, value)?,
             "mint.max_denomination_units" => self.max_denomination_units = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
             "rotation.period_hours" => self.rotation_period_hours = whole(key, value)?,
@@ -775,6 +884,20 @@ impl Config {
             "cents; 10 never rounds up",
         );
         range(
+            "burn.threshold_psp",
+            self.burn_threshold_psp,
+            0,
+            MAX_FEE_UNITS,
+            "whole PSP units; 0 burns every paid unit",
+        );
+        range(
+            "burn.balance_max_age_secs",
+            self.burn_balance_max_age_secs,
+            1,
+            604_800,
+            "seconds",
+        );
+        range(
             "mint.max_denomination_units",
             self.max_denomination_units,
             1,
@@ -861,18 +984,18 @@ impl Config {
         // What is set is checked when the settings load; that both are set is
         // checked by `serve` (`require_air`), so the other commands do not need
         // them.
-        if !self.air_server.is_empty() {
-            if let Err(e) = sp_wire::seal::parse_public_key(&self.air_server) {
-                problems.push(format!(
-                    "air.server = `{}` is not an AIR server name (a public key of 66 hex characters): {e}",
-                    self.air_server
-                ));
-            }
+        if !self.air_server.is_empty()
+            && let Err(e) = sp_wire::seal::parse_public_key(&self.air_server)
+        {
+            problems.push(format!(
+                "air.server = `{}` is not an AIR server name (a public key of 66 hex characters): {e}",
+                self.air_server
+            ));
         }
-        if !self.air_host.is_empty() {
-            if let Some(why) = air_host_problem(&self.air_host) {
-                problems.push(format!("air.host = `{}` {why}", self.air_host));
-            }
+        if !self.air_host.is_empty()
+            && let Some(why) = air_host_problem(&self.air_host)
+        {
+            problems.push(format!("air.host = `{}` {why}", self.air_host));
         }
         if problems.is_empty() {
             Ok(())
@@ -980,6 +1103,19 @@ impl Config {
             rollover_bytes: self.rollover_max_request_bytes,
             rollover_notes: self.rollover_max_items,
             check_state_bytes: self.check_state_max_request_bytes,
+            burn: self.burn(),
+            balance: crate::balance::Source {
+                file: crate::balance::intern(&self.burn_balance_file),
+                max_age_secs: self.burn_balance_max_age_secs,
+            },
+        }
+    }
+
+    /// What a spend does with the PSP it is paid (`burn.*`).
+    pub fn burn(&self) -> crate::rotation::BurnPolicy {
+        crate::rotation::BurnPolicy {
+            enabled: self.burn_enabled,
+            threshold_psp: self.burn_threshold_psp,
         }
     }
 }
@@ -1088,6 +1224,11 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
                     problems.push(format!("{key} must be a whole number, not the decimal {f}"))
                 }
                 toml::Value::String(s) => pairs.push((key, s.clone())),
+                // A boolean is a choice only for the burn switch; anywhere else it is a type
+                // error, as a number is.
+                toml::Value::Boolean(b) if key.starts_with("burn.") => {
+                    pairs.push((key, b.to_string()))
+                }
                 toml::Value::Array(items) if key.starts_with("storage.") => {
                     let ids: Vec<&str> = items.iter().filter_map(|v| v.as_str()).collect();
                     if ids.len() == items.len() {
@@ -1212,10 +1353,10 @@ pub fn load_with(
         config.cookie = network.default_cookie(&home);
     }
 
-    if problems.is_empty() {
-        if let Err(list) = config.validate() {
-            problems.extend(list);
-        }
+    if problems.is_empty()
+        && let Err(list) = config.validate()
+    {
+        problems.extend(list);
     }
     if problems.is_empty() {
         Ok(Loaded {
@@ -1231,6 +1372,130 @@ pub fn load_with(
 /// The real environment.
 pub fn process_env(name: &str) -> Option<String> {
     std::env::var(name).ok()
+}
+
+impl Config {
+    /// The settings that need a restart (`Spec::reload` is false), put back to
+    /// what the running mint has. Returns each key the file changes with the
+    /// value the file gives it: they wait for a restart.
+    fn keep_restart_only(
+        &mut self,
+        running: &Config,
+    ) -> Result<Vec<(&'static str, String)>, Vec<String>> {
+        let mut ignored = Vec::new();
+        let mut problems = Vec::new();
+        for spec in SPECS.iter().filter(|s| !s.reload) {
+            let (new, old) = (self.get(spec.key), running.get(spec.key));
+            if new == old {
+                continue;
+            }
+            ignored.push((spec.key, new.unwrap_or_default()));
+            if let Some(old) = old
+                && let Err(e) = self.set(spec.key, &old)
+            {
+                problems.push(e);
+            }
+        }
+        if problems.is_empty() {
+            Ok(ignored)
+        } else {
+            Err(problems)
+        }
+    }
+}
+
+/// What a reload did: the lines to log, and the settings that need a restart
+/// and that the file changes, each with the value the file gives it. They are
+/// not applied: the running mint keeps its values until it is restarted.
+#[derive(Debug)]
+pub struct Reloaded {
+    pub lines: Vec<String>,
+    pub needs_restart: Vec<(&'static str, String)>,
+}
+
+/// The running mint's settings, swapped all at once on a reload (`SIGHUP`).
+///
+/// A reload reads the file and the environment again and checks the result like
+/// a start does. If anything is wrong it changes nothing and says what. If not,
+/// every setting with `reload` in `SPECS` takes its new value at once, for the
+/// next request or the next scan; the others (`reload: false`: the address, the
+/// bitcoin wallet and network, the keys, the rotation, the AIR server) keep the
+/// value the process is running with, and the reload returns which of them the
+/// file changes, so that the caller can say they wait for a restart. A request
+/// already running finishes with the values it started with.
+pub struct Handle {
+    inner: std::sync::RwLock<std::sync::Arc<Config>>,
+    /// The network flag the process was started with, which beats the file.
+    flag: Option<Network>,
+}
+
+impl Handle {
+    pub fn new(config: Config, flag: Option<Network>) -> Self {
+        Handle {
+            inner: std::sync::RwLock::new(std::sync::Arc::new(config)),
+            flag,
+        }
+    }
+
+    /// The settings now in force. A request or a scan takes this once, at the
+    /// start, and uses it throughout.
+    pub fn current(&self) -> std::sync::Arc<Config> {
+        match self.inner.read() {
+            Ok(guard) => std::sync::Arc::clone(&guard),
+            // A writer only swaps a pointer, so a poisoned lock still holds a
+            // whole config.
+            Err(poisoned) => std::sync::Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    fn replace(&self, config: Config) {
+        let next = std::sync::Arc::new(config);
+        match self.inner.write() {
+            Ok(mut guard) => *guard = next,
+            Err(poisoned) => *poisoned.into_inner() = next,
+        }
+    }
+
+    /// Read the file and the environment again. On success the new settings are
+    /// in force at once, except the ones that need a restart, which keep their
+    /// running value until the mint is restarted. On any problem nothing
+    /// changes. Returns the lines to log and the restart-only settings the file
+    /// changes.
+    pub fn reload(
+        &self,
+        data_dir: &Path,
+        env: &dyn Fn(&str) -> Option<String>,
+    ) -> Result<Reloaded, Vec<String>> {
+        let loaded = load_with(data_dir, env, self.flag)?;
+        let running = self.current();
+        let mut next = loaded.config;
+        let ignored = next.keep_restart_only(&running)?;
+        let mut lines = Vec::new();
+        for spec in SPECS {
+            let before = running.get(spec.key).unwrap_or_default();
+            let after = next.get(spec.key).unwrap_or_default();
+            if before != after {
+                lines.push(format!(
+                    "  {} changed from {before} to {after} {}",
+                    spec.key, spec.units
+                ));
+            }
+        }
+        for (key, new) in &ignored {
+            lines.push(format!(
+                "  {key} is changed in the file from {} to {new}: it needs a restart (a brief downtime) and waits for one",
+                running.get(key).unwrap_or_default()
+            ));
+        }
+        if lines.is_empty() {
+            lines.push("  no setting changed".to_string());
+        }
+        self.replace(next);
+        Ok(Reloaded {
+            lines,
+            needs_restart: ignored,
+        })
+    }
 }
 
 /// The expected value for the operating system the tests run on: bitcoind's
@@ -1770,6 +2035,266 @@ mod tests {
         assert_eq!(c.limits().rollover_bytes, 6000);
         assert_eq!(c.limits().rollover_notes, 7);
         assert_eq!(c.wallet_url(), "http://node:8332/wallet/psp-main");
+    }
+
+    #[test]
+    fn a_reload_swaps_in_the_live_settings_and_keeps_the_old_ones_on_any_problem() {
+        let dir = scratch("reload");
+        let handle = Handle::new(load(&dir, &env_of(&[])).unwrap().config, None);
+        let before = handle.current();
+        assert_eq!(before.min_confirmations, 6);
+        assert!(!before.burn_enabled);
+
+        fs::write(
+            dir.join(FILE_NAME),
+            "[settle]\nmin_confirmations = 3\n[burn]\nenabled = true\nthreshold_psp = 500\n",
+        )
+        .unwrap();
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        let lines = reloaded.lines;
+        assert!(
+            reloaded.needs_restart.is_empty(),
+            "{:?}",
+            reloaded.needs_restart
+        );
+        let now = handle.current();
+        assert_eq!(now.min_confirmations, 3);
+        assert_eq!(
+            now.burn(),
+            crate::rotation::BurnPolicy {
+                enabled: true,
+                threshold_psp: 500
+            }
+        );
+        for line in [
+            "  settle.min_confirmations changed from 6 to 3 confirmations",
+            "  burn.enabled changed from false to true",
+            "  burn.threshold_psp changed from 0 to 500 PSP units",
+        ] {
+            assert!(
+                lines.iter().any(|l| l.starts_with(line)),
+                "{line:?} not in {lines:?}"
+            );
+        }
+        // A scan or request that took its settings before still has the old ones.
+        assert_eq!(before.min_confirmations, 6);
+
+        // A bad file changes nothing, and says what is wrong.
+        fs::write(
+            dir.join(FILE_NAME),
+            "[settle]\nmin_confirmations = \"many\"\n",
+        )
+        .unwrap();
+        let problems = handle.reload(&dir, &env_of(&[])).unwrap_err();
+        assert!(!problems.is_empty(), "{problems:?}");
+        assert_eq!(handle.current().min_confirmations, 3);
+        assert!(handle.current().burn_enabled);
+
+        // Taking the file away puts the defaults back, and a second reload
+        // with nothing changed says so.
+        fs::remove_file(dir.join(FILE_NAME)).unwrap();
+        handle.reload(&dir, &env_of(&[])).unwrap();
+        assert_eq!(handle.current().min_confirmations, 6);
+        assert!(!handle.current().burn_enabled);
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        assert_eq!(reloaded.lines, vec!["  no setting changed".to_string()]);
+        assert!(reloaded.needs_restart.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reload_keeps_the_restart_only_settings_and_says_so() {
+        let dir = scratch("reload-restart");
+        let handle = Handle::new(load(&dir, &env_of(&[])).unwrap().config, None);
+        fs::write(
+            dir.join(FILE_NAME),
+            "[server]\nbind = \"127.0.0.1:4100\"\n[bitcoin]\nwallet = \"other\"\n[rotation]\nperiod_hours = 48\n[scan]\ninterval_secs = 60\n",
+        )
+        .unwrap();
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        let lines = &reloaded.lines;
+        // The file's values for the restart-only settings are handed back, so
+        // that the caller can name them; none is applied.
+        assert_eq!(
+            reloaded.needs_restart,
+            vec![
+                ("server.bind", "127.0.0.1:4100".to_string()),
+                ("bitcoin.wallet", "other".to_string()),
+                ("rotation.period_hours", "48".to_string()),
+            ]
+        );
+        let c = handle.current();
+        assert_eq!(c.bind, "127.0.0.1:3000");
+        assert_eq!(c.wallet, "psp-main");
+        assert_eq!(c.get("rotation.period_hours").as_deref(), Some("87600"));
+        // The live one in the same file did change.
+        assert_eq!(c.scan_interval_secs, 60);
+        for (key, from, to) in [
+            ("server.bind", "127.0.0.1:3000", "127.0.0.1:4100"),
+            ("bitcoin.wallet", "psp-main", "other"),
+            ("rotation.period_hours", "87600", "48"),
+        ] {
+            let line = format!(
+                "  {key} is changed in the file from {from} to {to}: it needs a restart (a brief downtime) and waits for one"
+            );
+            assert!(lines.contains(&line), "{line:?} not in {lines:?}");
+        }
+        // The next reload says it again while the file still differs.
+        let again = handle.reload(&dir, &env_of(&[])).unwrap();
+        assert!(
+            again
+                .lines
+                .iter()
+                .any(|l| l.starts_with("  server.bind is changed in the file")),
+            "{:?}",
+            again.lines
+        );
+        assert_eq!(again.needs_restart.len(), 3);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_reload_changes_the_health_allowance_with_no_restart() {
+        let dir = scratch("reload-health");
+        let handle = Handle::new(load(&dir, &env_of(&[])).unwrap().config, None);
+        assert_eq!(handle.current().health_stale_after_secs(), 3 * 120 + 60);
+        fs::write(
+            dir.join(FILE_NAME),
+            "[scan]\nhealth_intervals = 5\nhealth_grace_secs = 10\n",
+        )
+        .unwrap();
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        assert!(
+            reloaded.needs_restart.is_empty(),
+            "{:?}",
+            reloaded.needs_restart
+        );
+        for line in [
+            "  scan.health_intervals changed from 3 to 5 scan intervals",
+            "  scan.health_grace_secs changed from 60 to 10 seconds",
+        ] {
+            assert!(
+                reloaded.lines.iter().any(|l| l == line),
+                "{line:?} not in {:?}",
+                reloaded.lines
+            );
+        }
+        assert_eq!(handle.current().health_intervals, 5);
+        assert_eq!(handle.current().health_grace_secs, 10);
+        assert_eq!(handle.current().health_stale_after_secs(), 5 * 120 + 10);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_restart_only_settings_are_exactly_the_ones_a_reload_cannot_apply() {
+        let restart: Vec<&str> = SPECS.iter().filter(|s| !s.reload).map(|s| s.key).collect();
+        assert_eq!(
+            restart,
+            vec![
+                "server.bind",
+                "bitcoin.network",
+                "bitcoin.wallet",
+                "mint.max_denomination_units",
+                "rotation.activation_hours",
+                "rotation.period_hours",
+                "storage.mint_state",
+                "air.server",
+                "air.host",
+                "air.held_reads",
+                "air.timeout_secs",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_burn_settings_are_off_by_default_and_refuse_what_is_not_a_choice() {
+        let c = Config::defaults("/h");
+        assert_eq!(
+            c.burn(),
+            crate::rotation::BurnPolicy {
+                enabled: false,
+                threshold_psp: 0
+            }
+        );
+        assert_eq!(c.limits().burn, c.burn());
+        // The figure is read from the data folder, and is good for 24 hours, unless told.
+        assert_eq!(c.limits().balance, crate::balance::Source::default());
+        let dir = scratch("burn");
+        fs::write(dir.join(FILE_NAME), "[burn]\nenabled = \"yes\"\n").unwrap();
+        let p = load(&dir, &env_of(&[])).unwrap_err();
+        assert!(!p.is_empty(), "{p:?}");
+        // The file is gone before the environment cases, or only its error
+        // would come back.
+        fs::remove_file(dir.join(FILE_NAME)).unwrap();
+        let p = load(&dir, &env_of(&[("PSP_BURN_ENABLED", "maybe")])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("burn.enabled") && x.contains("true or false")),
+            "{p:?}"
+        );
+        let p = load(
+            &dir,
+            &env_of(&[
+                ("PSP_BURN_ENABLED", "true"),
+                ("PSP_BURN_THRESHOLD_PSP", "5000000000000000000"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("burn.threshold_psp") && x.contains("out of range")),
+            "{p:?}"
+        );
+        let ok = load(
+            &dir,
+            &env_of(&[
+                ("PSP_BURN_ENABLED", "true"),
+                ("PSP_BURN_THRESHOLD_PSP", "250"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            ok.config.burn(),
+            crate::rotation::BurnPolicy {
+                enabled: true,
+                threshold_psp: 250
+            }
+        );
+        // Where the figure is and how old it may be: a path, and 1 s to a week.
+        let p = load(&dir, &env_of(&[("PSP_BURN_BALANCE_MAX_AGE_SECS", "0")])).unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("burn.balance_max_age_secs") && x.contains("out of range")),
+            "{p:?}"
+        );
+        let p = load(
+            &dir,
+            &env_of(&[("PSP_BURN_BALANCE_MAX_AGE_SECS", "604801")]),
+        )
+        .unwrap_err();
+        assert!(
+            p.iter()
+                .any(|x| x.contains("burn.balance_max_age_secs") && x.contains("out of range")),
+            "{p:?}"
+        );
+        let ok = load(
+            &dir,
+            &env_of(&[
+                (
+                    "PSP_BURN_BALANCE_FILE",
+                    "/srv/spi-share/wallet_balance.json",
+                ),
+                ("PSP_BURN_BALANCE_MAX_AGE_SECS", "600"),
+            ]),
+        )
+        .unwrap();
+        let source = ok.config.limits().balance;
+        assert_eq!(source.max_age_secs, 600);
+        assert_eq!(
+            source.path(std::path::Path::new("/data")),
+            std::path::PathBuf::from("/srv/spi-share/wallet_balance.json")
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

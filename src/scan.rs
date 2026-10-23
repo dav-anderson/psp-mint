@@ -183,10 +183,10 @@ pub fn since(
         if entry.get("category").and_then(Value::as_str) != Some("receive") {
             continue;
         }
-        if let Some(txid) = entry.get("txid").and_then(Value::as_str) {
-            if seen.insert(txid.to_string()) {
-                txids.push(txid.to_string());
-            }
+        if let Some(txid) = entry.get("txid").and_then(Value::as_str)
+            && seen.insert(txid.to_string())
+        {
+            txids.push(txid.to_string());
         }
     }
     for txid in pending {

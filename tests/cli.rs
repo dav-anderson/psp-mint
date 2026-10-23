@@ -160,6 +160,35 @@ fn help_prints_the_usage_and_nothing_else_and_names_no_removed_command() {
 }
 
 #[test]
+fn version_names_the_program_and_the_libraries_and_reads_and_writes_nothing() {
+    let s = sandbox("version");
+    let long = s.run(&["--version"]);
+    let short = s.run(&["-V"]);
+    assert_eq!((long.code, short.code), (Some(0), Some(0)));
+    assert_eq!(long.stdout, short.stdout);
+    assert_eq!((long.stderr.as_str(), short.stderr.as_str()), ("", ""));
+    let lines: Vec<&str> = long.stdout.lines().collect();
+    assert_eq!(lines[0], format!("psp-mint {}", env!("CARGO_PKG_VERSION")));
+    // Each other line is `name x.y.z`, and the two libraries every mint is built
+    // on are there.
+    for line in &lines[1..] {
+        let (name, version) = line.split_once(' ').expect(line);
+        assert!(
+            !name.is_empty() && version.split('.').count() == 3,
+            "{line}"
+        );
+    }
+    for library in ["sp-wire ", "mint-core "] {
+        assert!(
+            lines.iter().any(|l| l.starts_with(library)),
+            "{library}missing in {lines:?}"
+        );
+    }
+    // Nothing was read: not the settings, not the data folder.
+    assert!(s.written().is_empty());
+}
+
+#[test]
 fn an_unknown_command_is_refused_and_the_removed_migrate_is_unknown() {
     let s = sandbox("unknown");
     for word in ["frobnicate", "migrate"] {

@@ -278,6 +278,7 @@ async fn a_ceiling_above_two_megabytes_is_the_one_in_force() {
         rollover_bytes: big,
         rollover_notes: 1000,
         check_state_bytes: big,
+        ..Limits::default()
     };
     let (base, m) = start("big", Some(limits)).await;
     let (note, _) = issued_note(&m.state, Amount::from_units(1));

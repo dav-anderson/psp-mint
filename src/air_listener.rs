@@ -178,7 +178,12 @@ pub async fn run(
 ) -> Result<(), String> {
     tokio::pin!(stop);
     let did = addr::key_to_did(&key.public_key());
-    let client = client::connect(&settings.server).await.map_err(|e| e.0)?;
+    // A stop that comes while the connection is still being made ends the
+    // listener too: a stop does not wait for an AIR server that is slow.
+    let client = tokio::select! {
+        connected = client::connect(&settings.server) => connected.map_err(|e| e.0)?,
+        _ = &mut stop => return Ok(()),
+    };
     let mut next = read_next(&settings.state_dir)?;
     println!(
         "AIR listener: mint {did} on AIR server {} ({}), next slot {next}, {} held reads",
@@ -299,15 +304,27 @@ async fn handle_fill(
 }
 
 /// Run the listener on the calling thread, with a runtime of its own, until it
-/// fails. For a thread of its own: `serve` starts one so that the HTTP API's
-/// runtime and the listener never share a thread. A panic in `serve` ends the
-/// thread, like a crash of the process would (the tests use that).
-pub fn run_blocking(settings: &Settings, key: &SecretKey, serve: &Serve) -> Result<(), String> {
+/// fails or until `stop` is sent (or its sender is dropped): then it finishes
+/// the slot it is answering and returns `Ok`, which is how a stop and the
+/// snapshot quiet the listener. The slots it has not read stay in the AIR
+/// server, and the next listener resumes from the stored counter. For a thread
+/// of its own: `serve` starts one so that the HTTP API's runtime and the
+/// listener never share a thread. A panic in `serve` ends the thread, like a
+/// crash of the process would (the tests use that).
+pub fn run_blocking(
+    settings: &Settings,
+    key: &SecretKey,
+    serve: &Serve,
+    stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(|e| format!("could not start a runtime: {e}"))?;
-    runtime.block_on(run(settings, key, serve, std::future::pending()))
+    runtime.block_on(run(settings, key, serve, async move {
+        // Sent, or the sender was dropped: either way the listener is to stop.
+        stop.await.ok();
+    }))
 }
 
 #[cfg(test)]

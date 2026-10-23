@@ -701,10 +701,10 @@ pub fn settle_ruled(
 ) -> Result<Settlement, SettleError> {
     let (terms, fees) = (&policy.terms, &policy.fees);
     let txid = received.txid.as_str();
-    if let Some(existing) = records.get(txid) {
-        if existing.status != Status::Locked {
-            return Ok(Settlement::AlreadySettled(existing.status));
-        }
+    if let Some(existing) = records.get(txid)
+        && existing.status != Status::Locked
+    {
+        return Ok(Settlement::AlreadySettled(existing.status));
     }
     if received.confirmations < terms.lock_confirmations {
         return Ok(Settlement::Waiting {

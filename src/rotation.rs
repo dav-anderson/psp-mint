@@ -326,10 +326,9 @@ impl Rotor {
                     .to_str()
                     .and_then(|n| n.strip_prefix("gen-"))
                     .and_then(|n| n.parse::<u64>().ok())
+                    && exists(base, n)
                 {
-                    if exists(base, n) {
-                        newest = newest.max(n);
-                    }
+                    newest = newest.max(n);
                 }
             }
         }
@@ -579,9 +578,58 @@ impl Rotor {
 
 // ---- the rollover swap ------------------------------------------------------
 
-use mint_types::{MintInput, MintOutputOutcome, transaction_sighash};
+use mint_types::{
+    BlindNonce, MintInput, MintOutput, MintOutputOutcome, Nonce, Note, transaction_sighash,
+};
+use rand::rngs::OsRng;
+use sp_wire::psp::{HandedPspNote, PspHandover};
 
 pub const ROLLOVERS_FILE: &str = "rollovers.json";
+/// The folder under the network's data folder where the PSP the mint reissues to
+/// the SPI's wallet is written, one file for each spend (`<request hash>.json`, a
+/// [`PspHandover`]).
+pub const REVENUE_DIR: &str = "revenue";
+
+/// What a spend does with the PSP it is paid (`burn.enabled` and
+/// `burn.threshold_psp`). The threshold is measured against what the SPI's
+/// wallet holds now (see [`crate::balance`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BurnPolicy {
+    /// Whether any paid PSP may be burned. Off (the default): none is.
+    pub enabled: bool,
+    /// With burning on: how many PSP units the SPI's wallet is kept at. Paid
+    /// PSP is reissued while the wallet holds less than this, and burned once
+    /// it holds this much or more.
+    pub threshold_psp: u64,
+}
+
+impl BurnPolicy {
+    /// How much of `pay` is reissued to the SPI's wallet, given `held`, the PSP
+    /// the wallet is taken to hold now (`None`: there is no usable figure, see
+    /// [`crate::balance`]). All of it unless burning is on and there is a
+    /// figure, and then only what fits under the threshold: the room between
+    /// `held` and `burn.threshold_psp`. The rest of `pay` is burned.
+    pub fn keep(&self, pay: u64, held: Option<u64>) -> u64 {
+        match held {
+            Some(held) if self.enabled => pay.min(self.threshold_psp.saturating_sub(held)),
+            _ => pay,
+        }
+    }
+}
+
+/// One note planned for the SPI's wallet, saved before anything of its spend is
+/// burned so that a crash cannot lose its secrets or issue it twice. The note is
+/// made from this and the mint's key when the spend finishes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct RevenuePlan {
+    amount: u64,
+    /// The keyset that signs it (the current one when the spend began).
+    keyset: String,
+    /// The secret of the note's nonce: the key that spends it.
+    nonce_secret: SecretKey,
+    /// The blinding factor, so a retry blinds, issues and unblinds the same note.
+    blinding_key: SecretKey,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Rollovers {
@@ -608,6 +656,19 @@ pub struct Rollovers {
     /// shrink with them. Saved in the same write as the answer it counts, so a
     /// crash cannot count a payment twice or lose one.
     paid: u64,
+    /// Of `paid`: the PSP units burned (the revenue the mint destroyed).
+    paid_burned: u64,
+    /// Of `paid`: the PSP units reissued to the SPI's wallet, as notes in a
+    /// [`PspHandover`] file. `paid_burned` plus `paid_kept` is `paid`, except for
+    /// notes a deleted keyset could no longer sign (counted as burned).
+    paid_kept: u64,
+    /// The notes each spend in flight will reissue, by request hash, decided and
+    /// saved with the spend's `pending` entry. An empty list is a decision to
+    /// reissue nothing.
+    plans: BTreeMap<String, Vec<RevenuePlan>>,
+    /// The notes of finished spends that are not yet in a file in `revenue/`,
+    /// by request hash. Written by [`Rollovers::flush_revenue`].
+    revenue: BTreeMap<String, Vec<HandedPspNote>>,
     #[serde(skip)]
     path: PathBuf,
 }
@@ -637,9 +698,85 @@ impl Rollovers {
             .collect()
     }
 
-    /// The PSP units burned as payments by finished spends (see the field).
+    /// The PSP units paid in finished spends (see the field): burned plus
+    /// reissued to the SPI's wallet.
     pub fn paid(&self) -> u64 {
         self.paid
+    }
+
+    /// Of [`Rollovers::paid`], the units burned.
+    pub fn paid_burned(&self) -> u64 {
+        self.paid_burned
+    }
+
+    /// Of [`Rollovers::paid`], the units reissued to the SPI's wallet.
+    pub fn paid_kept(&self) -> u64 {
+        self.paid_kept
+    }
+
+    /// The units reissued so far plus those the spends in flight will reissue:
+    /// the mint's side of what the SPI wallet is taken to hold (see
+    /// [`crate::balance::held`]), which `burn.threshold_psp` is measured against.
+    fn reissue_total(&self) -> u64 {
+        let planned: u64 = self
+            .plans
+            .values()
+            .flatten()
+            .fold(0u64, |sum, p| sum.saturating_add(p.amount));
+        self.paid_kept.saturating_add(planned)
+    }
+
+    /// The network's data folder, where this store's file is.
+    pub fn dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
+    /// Write the notes of finished spends to `revenue/<request hash>.json` under
+    /// the network's data folder, then forget them here. A file is rewritten
+    /// whole if a crash left it half done, and a note is never written under two
+    /// names. The files are readable by the mint's group, so the person who runs
+    /// the SPI's wallet can take them in; whoever can read one holds its notes
+    /// until the wallet has swapped them. Returns how many files were written.
+    pub fn flush_revenue(&mut self) -> Result<usize, String> {
+        if self.revenue.is_empty() {
+            return Ok(0);
+        }
+        let base = self
+            .path
+            .parent()
+            .ok_or_else(|| format!("{} has no folder", self.path.display()))?;
+        let dir = base.join(REVENUE_DIR);
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o750))
+                .map_err(|e| format!("cannot set the mode of {}: {e}", dir.display()))?;
+        }
+        let ids: Vec<String> = self.revenue.keys().cloned().collect();
+        for id in &ids {
+            let file = PspHandover {
+                notes: self.revenue[id].clone(),
+            };
+            let bytes = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+            let path = dir.join(format!("{id}.json"));
+            write_new(&path, &bytes)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+                    .map_err(|e| format!("cannot set the mode of {}: {e}", path.display()))?;
+            }
+        }
+        for id in &ids {
+            self.revenue.remove(id);
+        }
+        self.save()?;
+        Ok(ids.len())
     }
 
     /// Drop stored answers (rollovers and spends) whose keyset was deleted.
@@ -932,14 +1069,26 @@ pub fn check_spend_shape(req: &PspSpendRequest, max_items: usize) -> Result<(), 
 /// paid total in one write, only then is the reply made. A retry of the same
 /// request gets the stored answer; a retry after a crash finishes the request.
 ///
-/// `pay` is burned and never reissued: the inputs are redeemed in full, the
-/// change is issued, and the difference is the mint's revenue.
+/// `pay` is never returned to the payer: the inputs are redeemed in full, the
+/// change is issued, and the difference is the SPI's revenue. By default the mint
+/// reissues it as PSP notes for the SPI's own wallet (written to a file in
+/// `revenue/` by [`Rollovers::flush_revenue`]); with `burn.enabled` it reissues
+/// only what fits between what the SPI's wallet holds and `burn.threshold_psp`,
+/// and burns the rest. What the wallet holds comes from `figure`, the balance the
+/// SPI published, which the caller read before taking any lock; with no figure
+/// (`None`) everything is reissued. Only paid PSP is ever burned here. The notes
+/// reissued are planned and saved with the request before anything is burned, so
+/// a crash cannot lose them or issue them twice, a retry makes the same notes,
+/// and a request resumed after a crash keeps the decision it was first given
+/// whatever the figure says by then.
 pub fn spend(
     current: &MintLogic,
     rotor: &Rotor,
     store: &mut Rollovers,
     req: &PspSpendRequest,
     max_items: usize,
+    burn: BurnPolicy,
+    figure: Option<crate::balance::Figure>,
 ) -> Result<PspSpendResponse, SpendError> {
     use SpendError::*;
     check_spend_shape(req, max_items)?;
@@ -1050,6 +1199,9 @@ pub fn spend(
         plan.push((logic, sk, input, spent));
     }
     if !resumed {
+        let held = figure.map(|f| crate::balance::held(&f, store.reissue_total()));
+        let keep = burn.keep(req.pay, held);
+        let plans = plan_revenue(&rotor.current, keep)?;
         store.pending.insert(id.clone(), rotor.current.epoch);
         store.holds.insert(
             id.clone(),
@@ -1058,6 +1210,7 @@ pub fn spend(
                 .map(|i| hex::encode(i.note.nonce.0.serialize()))
                 .collect(),
         );
+        store.plans.insert(id.clone(), plans);
         store.save().map_err(Internal)?;
     }
     for (logic, sk, input, spent) in plan {
@@ -1085,6 +1238,18 @@ pub fn spend(
         outcomes.push(out);
         keys.push(out_keys.pk[&o.amount]);
     }
+    // The notes for the SPI's wallet, from the plans saved with the request. A
+    // plan whose keyset has been deleted since (a request resumed more than a
+    // key period later) cannot be signed: its units count as burned.
+    let mut revenue: Vec<HandedPspNote> = Vec::new();
+    for planned in store.plans.get(&id).cloned().unwrap_or_default() {
+        let Ok(side) = rotor.resolve(&planned.keyset) else {
+            continue;
+        };
+        let (logic, keys) = gen_of(side);
+        revenue.push(make_revenue_note(logic, keys, &planned, resumed)?);
+    }
+    let kept: u64 = revenue.iter().map(|n| n.amount).sum();
     let answer = PspSpendResponse {
         keyset: out_keys.id.clone(),
         epoch: out_keys.epoch,
@@ -1092,14 +1257,112 @@ pub fn spend(
         keys,
         paid: req.pay,
     };
-    // The answer and the payment it counts go in one write.
+    // The answer, the payment it counts and the notes reissued go in one write.
     store.spends.insert(id.clone(), answer.clone());
     store.paid = store.paid.saturating_add(req.pay);
+    store.paid_kept = store.paid_kept.saturating_add(kept);
+    store.paid_burned = store
+        .paid_burned
+        .saturating_add(req.pay.saturating_sub(kept));
+    if !revenue.is_empty() {
+        store.revenue.insert(id.clone(), revenue);
+    }
+    store.plans.remove(&id);
     store.pending.remove(&id);
     store.burned.remove(&id);
     store.holds.remove(&id);
     store.save().map_err(Internal)?;
+    // Best effort: the answer is stored, so a failed write is tried again by the
+    // next flush (the scan loop makes one every pass) and costs the payer nothing.
+    if let Err(e) = store.flush_revenue() {
+        eprintln!("could not write the reissued PSP to revenue/, will retry: {e}");
+    }
     Ok(answer)
+}
+
+/// The denominations that add up to `units`, largest first, from the keys of
+/// `keys`. `None` when they cannot (no denomination of 1).
+fn split_units(keys: &GenKeys, mut units: u64) -> Option<Vec<u64>> {
+    let mut sizes: Vec<u64> = keys.sk.keys().map(|a| a.units).collect();
+    sizes.sort_unstable_by(|a, b| b.cmp(a));
+    let mut out = Vec::new();
+    for size in sizes {
+        while size > 0 && units >= size {
+            out.push(size);
+            units -= size;
+        }
+    }
+    (units == 0).then_some(out)
+}
+
+/// The notes to reissue for `keep` units of `pay`: fresh keys for each, none of
+/// them signed yet.
+fn plan_revenue(keys: &GenKeys, keep: u64) -> Result<Vec<RevenuePlan>, SpendError> {
+    if keep == 0 {
+        return Ok(Vec::new());
+    }
+    let sizes = split_units(keys, keep).ok_or_else(|| {
+        SpendError::Internal(format!(
+            "cannot split {keep} units into this mint's denominations"
+        ))
+    })?;
+    Ok(sizes
+        .into_iter()
+        .map(|amount| RevenuePlan {
+            amount,
+            keyset: keys.id.clone(),
+            nonce_secret: SecretKey::new(&mut OsRng),
+            blinding_key: SecretKey::new(&mut OsRng),
+        })
+        .collect())
+}
+
+/// Make the note a plan describes: blind its nonce with the planned factor, have
+/// the mint issue and sign it (a blind nonce already used is signed again, as
+/// for the change, when `resumed`), and unblind it. The note is the mint's own
+/// work from end to end, which is what the SPI's wallet then swaps for notes only
+/// it knows.
+fn make_revenue_note(
+    logic: &MintLogic,
+    keys: &GenKeys,
+    plan: &RevenuePlan,
+    resumed: bool,
+) -> Result<HandedPspNote, SpendError> {
+    let amount = Amount::from_units(plan.amount);
+    let sk = keys
+        .sk
+        .get(&amount)
+        .ok_or_else(|| SpendError::Internal(format!("{} is not a denomination", plan.amount)))?;
+    let pk = keys
+        .pk
+        .get(&amount)
+        .ok_or_else(|| SpendError::Internal(format!("{} has no public key", plan.amount)))?;
+    let nonce = Nonce(PublicKey::from_secret_key(
+        secp256k1::SECP256K1,
+        &plan.nonce_secret,
+    ));
+    let (blinded, blinding) =
+        bdhke::blind_message(&nonce.as_hash_preimage(), Some(plan.blinding_key));
+    let output = MintOutput {
+        amount,
+        blind_nonce: BlindNonce(blinded),
+    };
+    let outcome = match logic.issue_with_key(sk, &output) {
+        Ok(out) => out,
+        Err(mint_types::MintOutputError::BlindNonceAlreadyUsed) if resumed => {
+            MintOutputOutcome(bdhke::sign_message(sk, &blinded))
+        }
+        Err(e) => return Err(SpendError::Internal(e.to_string())),
+    };
+    Ok(HandedPspNote {
+        amount: plan.amount,
+        note: Note {
+            nonce,
+            signature: bdhke::unblind_message(&outcome.0, &blinding, pk),
+        },
+        spend_secret: plan.nonce_secret,
+        keyset: plan.keyset.clone(),
+    })
 }
 
 /// The schedule for `config`, read from the files only (no database is opened,
@@ -1118,7 +1381,7 @@ pub fn describe_offline(base: &Path, activation_hours: u64, period_hours: u64) -
             .ok()
             .and_then(|b| serde_json::from_slice::<MintConfig>(&b).ok())
             .map(|c| keyset_id(&keygen::public_keys(&c)))
-            .unwrap_or_else(|| "(made at the next start)".into())
+            .unwrap_or_else(|| "(made when the mint next opens its data)".into())
     };
     let t = |o: Option<u64>| o.map(|v| v.to_string()).unwrap_or_else(|| "not yet".into());
     let mut out = vec![

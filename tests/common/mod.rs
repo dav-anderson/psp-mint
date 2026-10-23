@@ -101,7 +101,7 @@ pub fn start_serving(
         timeout_secs: 10,
         state_dir: dir,
     };
-    let key = key.clone();
+    let key = *key;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let thread = thread::Builder::new()
         .name("test-air-listener".into())
@@ -209,7 +209,7 @@ impl Air {
         let listener = start_serving(&server, &key, scratch(), serve);
         let config = |reply_wait_secs, attempts| AskConfig {
             server: server.server.clone(),
-            mint: did.clone(),
+            mint: did,
             wire_version: WIRE_VERSION,
             network: NETWORK.to_string(),
             reply_wait_secs,
@@ -387,11 +387,11 @@ impl PspMint {
 
     /// The local HTTP API, as `serve` builds it.
     pub fn router(&self) -> axum::Router {
-        server::router_audited(
+        server::router_live(
             Arc::clone(&self.state),
             Arc::clone(&self.health),
             Arc::clone(&self.melts),
-            self.limits,
+            Arc::new(server::LiveLimits::new(self.limits)),
             Arc::clone(&self.rot),
             self.records_path(),
         )

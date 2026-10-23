@@ -65,7 +65,7 @@ use mint_types::{Amount, MintInput, Nonce};
 use crate::melts::MeltLog;
 use crate::records::{Records, SharedRecords};
 use crate::rotation::{
-    PspSpendRequest, RolloverError, RolloverRequest, Rollovers, Rotor, SpendError,
+    BurnPolicy, PspSpendRequest, RolloverError, RolloverRequest, Rollovers, Rotor, SpendError,
 };
 
 // The wire types live in sp-wire; they are re-exported so the paths are unchanged.
@@ -77,14 +77,20 @@ pub use sp_wire::psp::{Burn, BurnsRequest, BurnsResponse, KeysetsResponse, PspMe
 pub struct Rotating {
     pub rotor: Mutex<Rotor>,
     pub rollovers: Mutex<Rollovers>,
+    /// The network's data folder (where the rollovers file is). Read without a
+    /// lock: a spend looks for the SPI's wallet balance figure there before it
+    /// takes any.
+    pub dir: std::path::PathBuf,
 }
 pub type SharedRotating = Arc<Rotating>;
 
 impl Rotating {
     pub fn new(rotor: Rotor, rollovers: Rollovers) -> SharedRotating {
+        let dir = rollovers.dir();
         Arc::new(Rotating {
             rotor: Mutex::new(rotor),
             rollovers: Mutex::new(rollovers),
+            dir,
         })
     }
 }
@@ -118,7 +124,9 @@ pub fn now_secs() -> u64 {
 pub struct Health {
     started: u64,
     last_scan: AtomicU64,
-    stale_after_secs: u64,
+    /// Changed by a reload of the settings (`set_stale_after_secs`): it follows
+    /// `scan.interval_secs`, `scan.health_intervals` and `scan.health_grace_secs`.
+    stale_after_secs: AtomicU64,
     network: String,
 }
 
@@ -130,9 +138,21 @@ impl Health {
         Arc::new(Health {
             started: now_secs(),
             last_scan: AtomicU64::new(0),
-            stale_after_secs,
+            stale_after_secs: AtomicU64::new(stale_after_secs),
             network: network.to_string(),
         })
+    }
+
+    /// Change how long without a successful pass `/health` waits before it
+    /// reports a failure. A reload of the settings calls this, so that
+    /// `scan.interval_secs`, `scan.health_intervals` and `scan.health_grace_secs`
+    /// take effect with no restart.
+    pub fn set_stale_after_secs(&self, secs: u64) {
+        self.stale_after_secs.store(secs, Ordering::Relaxed);
+    }
+
+    pub fn stale_after_secs(&self) -> u64 {
+        self.stale_after_secs.load(Ordering::Relaxed)
     }
 
     pub fn network(&self) -> &str {
@@ -170,16 +190,17 @@ impl Health {
     /// The status code and body for `/health` at time `now`.
     pub fn report(&self, lock_poisoned: bool, now: u64) -> (StatusCode, serde_json::Value) {
         let last = self.last_scan();
+        let stale_after = self.stale_after_secs();
         let age = last.map(|t| now.saturating_sub(t));
         let since_start = now.saturating_sub(self.started);
         let status = if lock_poisoned {
             "mint_lock_poisoned"
         } else {
             match age {
-                Some(a) if a > self.stale_after_secs => "scan_stale",
+                Some(a) if a > stale_after => "scan_stale",
                 Some(_) => "ok",
                 // no pass yet: give the first one the same allowance
-                None if since_start > self.stale_after_secs => "scan_stale",
+                None if since_start > stale_after => "scan_stale",
                 None => "starting",
             }
         };
@@ -191,9 +212,12 @@ impl Health {
             "status": status,
             "last_scan_unix": last,
             "seconds_since_last_scan": age,
-            "stale_after_secs": self.stale_after_secs,
+            "stale_after_secs": stale_after,
             "wire_version": sp_wire::WIRE_VERSION,
             "network": self.network,
+            // What `spi upgrade` reads after a restart to see that the new
+            // binary is the one answering.
+            "version": env!("CARGO_PKG_VERSION"),
         });
         (code, body)
     }
@@ -532,9 +556,11 @@ async fn burns_handler(
         .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
-/// The ceilings on request bodies, one for each route that takes a body
-/// (`server.*_max_request_bytes` in the config), and the most notes in one
-/// rollover (`rollover.max_items`).
+/// The settings a request reads when it is accepted, which a reload changes for
+/// the next request: the ceilings on request bodies, one for each route that
+/// takes a body (`server.*_max_request_bytes` in the config), the most notes in
+/// one rollover (`rollover.max_items`), and what a spend does with the PSP it is
+/// paid (`burn.*`), with where the SPI wallet's balance figure is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     pub melt_bytes: usize,
@@ -542,6 +568,35 @@ pub struct Limits {
     pub rollover_bytes: usize,
     pub rollover_notes: usize,
     pub check_state_bytes: usize,
+    pub burn: BurnPolicy,
+    /// `burn.balance_file` and `burn.balance_max_age_secs`.
+    pub balance: crate::balance::Source,
+}
+
+/// The [`Limits`] now in force, swapped as a whole by a reload. A request takes
+/// them once, when it is accepted, and uses them throughout.
+pub struct LiveLimits(std::sync::RwLock<Limits>);
+
+impl LiveLimits {
+    pub fn new(limits: Limits) -> Self {
+        LiveLimits(std::sync::RwLock::new(limits))
+    }
+
+    pub fn get(&self) -> Limits {
+        match self.0.read() {
+            Ok(guard) => *guard,
+            // A writer only swaps a small copy value, so a poisoned lock still
+            // holds a whole one.
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    pub fn set(&self, limits: Limits) {
+        match self.0.write() {
+            Ok(mut guard) => *guard = limits,
+            Err(poisoned) => *poisoned.into_inner() = limits,
+        }
+    }
 }
 
 impl Default for Limits {
@@ -553,6 +608,8 @@ impl Default for Limits {
             rollover_bytes: bytes,
             rollover_notes: sp_wire::psp::MAX_ROLLOVER_NOTES,
             check_state_bytes: bytes,
+            burn: BurnPolicy::default(),
+            balance: crate::balance::Source::default(),
         }
     }
 }
@@ -587,7 +644,8 @@ fn too_large_body(size: Option<u64>, limit: usize) -> serde_json::Value {
 /// Read a request body, but only up to `limit` bytes, before the handler parses
 /// it. A body that says it is too large is refused without reading any of it,
 /// and one that does not say is read only as far as the limit.
-async fn limit_body(State(limit): State<usize>, request: Request, next: Next) -> Response {
+async fn limit_body(State(which): State<LimitFor>, request: Request, next: Next) -> Response {
+    let limit = (which.pick)(&which.live.get());
     let declared = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -616,11 +674,26 @@ async fn limit_body(State(limit): State<usize>, request: Request, next: Next) ->
 /// axum's own default (2 MB) for the extractor behind it.
 fn limited<S: Clone + Send + Sync + 'static>(
     route: MethodRouter<S>,
-    limit: usize,
+    live: Arc<LiveLimits>,
+    pick: fn(&Limits) -> usize,
 ) -> MethodRouter<S> {
+    // axum's own limit is the highest a ceiling can be; the route's ceiling, read
+    // from the settings in force when the request comes, is `limit_body`'s.
     route
-        .layer(DefaultBodyLimit::max(limit))
-        .layer(middleware::from_fn_with_state(limit, limit_body))
+        .layer(DefaultBodyLimit::max(
+            crate::config::MAX_REQUEST_BYTES_CAP as usize,
+        ))
+        .layer(middleware::from_fn_with_state(
+            LimitFor { live, pick },
+            limit_body,
+        ))
+}
+
+/// Which ceiling a route has, read from the settings in force at each request.
+#[derive(Clone)]
+struct LimitFor {
+    live: Arc<LiveLimits>,
+    pick: fn(&Limits) -> usize,
 }
 
 type RotState = (Arc<AppState>, SharedRotating);
@@ -654,10 +727,14 @@ fn check_state_response(
 }
 
 /// Issued and redeemed over every generation, the deleted ones included, and
-/// `paid`: the PSP units burned as payments by PSP spends (kind 14), which is the
-/// SPI's revenue. `paid` is part of `redeemed` (the notes of a spend are
-/// redeemed whole, and the change is issued) and is counted apart from every
-/// other burn, such as what the ESP mint burns through `/melt` for exchanges.
+/// the SPI's revenue from PSP spends (kind 14): `paid`, the PSP units paid to the
+/// mint in all, of which `burned` was burned and `reissued` was made into PSP
+/// notes for the SPI's own wallet (a file in `revenue/`; see `burn.enabled`).
+/// `paid` is `burned` plus `reissued`. The notes of a spend are redeemed whole
+/// and its change is issued, so the paid units leave `outstanding` when burned
+/// and stay in it as the SPI's own PSP when reissued. All of it is counted apart
+/// from every other burn, such as what the ESP mint burns through `/melt` for
+/// exchanges.
 async fn audit_handler(
     State((state, rot)): State<RotState>,
 ) -> Result<Json<serde_json::Value>, ApiFailure> {
@@ -674,7 +751,10 @@ async fn audit_handler(
     i += Amount::from_units(ri);
     d += Amount::from_units(rd);
     // Lock order: the mint, the rotor, then the rollovers (as a rollover does).
-    let paid = rot.rollovers.lock().map_err(|_| poisoned())?.paid();
+    let (paid, burned, reissued) = {
+        let store = rot.rollovers.lock().map_err(|_| poisoned())?;
+        (store.paid(), store.paid_burned(), store.paid_kept())
+    };
     let mut body = serde_json::to_value(api::AuditResponse {
         issued: i,
         redeemed: d,
@@ -682,6 +762,8 @@ async fn audit_handler(
     })
     .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     body["paid"] = serde_json::json!(paid);
+    body["burned"] = serde_json::json!(burned);
+    body["reissued"] = serde_json::json!(reissued);
     Ok(Json(body))
 }
 
@@ -826,7 +908,16 @@ pub fn air_served_with(
             "spend",
             limits.rollover_bytes,
             body,
-            |req: PspSpendRequest| spend_response(state, rot, &req, limits.rollover_notes),
+            |req: PspSpendRequest| {
+                spend_response(
+                    state,
+                    rot,
+                    &req,
+                    limits.rollover_notes,
+                    limits.burn,
+                    &limits.balance,
+                )
+            },
         ),
         // The corrected request or the credit claim of an open payment. It shares
         // the rollover's two ceilings too. Only an accepted request is answered.
@@ -961,15 +1052,25 @@ fn spend_response(
     rot: &SharedRotating,
     req: &PspSpendRequest,
     max_items: usize,
+    burn: BurnPolicy,
+    balance: &crate::balance::Source,
 ) -> Result<crate::rotation::PspSpendResponse, ApiFailure> {
     // Cheap checks first, before the mint lock is taken.
     if let Err(e) = crate::rotation::check_spend_shape(req, max_items) {
         return Err(spend_failure(e));
     }
+    // The SPI wallet's balance figure is read here, before any lock, and only
+    // when burning is on: with burning off the file is not looked at.
+    let figure = if burn.enabled {
+        crate::balance::current(balance, &rot.dir, now_secs())
+    } else {
+        None
+    };
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let rotor = rotor_of(rot, &mut logic)?;
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
-    crate::rotation::spend(&logic, &rotor, &mut store, req, max_items).map_err(spend_failure)
+    crate::rotation::spend(&logic, &rotor, &mut store, req, max_items, burn, figure)
+        .map_err(spend_failure)
 }
 
 fn spend_failure(e: SpendError) -> ApiFailure {
@@ -992,12 +1093,14 @@ fn spend_failure(e: SpendError) -> ApiFailure {
 /// open and forfeited, the fees and the rounding), read from the settlement
 /// records file at `records` when it is asked for. The wallet-facing calls (keys,
 /// keysets, rotation, rollover, check-state, spend, reconcile) are not routes:
-/// they are answered over AIR (`air_served_with`).
-pub fn router_audited(
+/// they are answered over AIR (`air_served_with`). The ceilings are the ones a
+/// reload changes: each request on `/melt` and `/burns` is held to the ceiling
+/// in `limits` when it arrives.
+pub fn router_live(
     state: Arc<AppState>,
     health: Arc<Health>,
     melts: SharedMelts,
-    limits: Limits,
+    limits: Arc<LiveLimits>,
     rot: SharedRotating,
     records: PathBuf,
 ) -> Router {
@@ -1007,8 +1110,14 @@ pub fn router_audited(
         .route("/health", get(health_handler))
         .with_state((Arc::clone(&state), health));
     let melt_routes = Router::new()
-        .route("/melt", limited(post(melt_handler), limits.melt_bytes))
-        .route("/burns", limited(post(burns_handler), limits.burns_bytes))
+        .route(
+            "/melt",
+            limited(post(melt_handler), Arc::clone(&limits), |l| l.melt_bytes),
+        )
+        .route(
+            "/burns",
+            limited(post(burns_handler), limits, |l| l.burns_bytes),
+        )
         .with_state((Arc::clone(&state), melts, Arc::clone(&rot)));
     Router::new()
         .route(

@@ -147,7 +147,7 @@ impl Env {
     }
 
     fn deliverer(&self, server: &ServerRef) -> Deliverer {
-        Deliverer::new(server.clone(), 2, self.key.clone())
+        Deliverer::new(server.clone(), 2, self.key)
     }
 }
 

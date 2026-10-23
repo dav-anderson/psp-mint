@@ -1,6 +1,6 @@
 //! `/audit` shows the payments held open and the payments forfeited apart from
 //! the issued, redeemed and outstanding totals, as `serve` builds the router
-//! (`router_audited`, with the mint's settlement records). Over a real server on
+//! (`router_live`, with the mint's settlement records). Over a real server on
 //! a local port. Every figure of the report, with fees, is checked in
 //! `tests/reconcile.rs`.
 

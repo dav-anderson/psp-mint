@@ -62,7 +62,15 @@ fn the_commands_in_the_readme_are_the_commands_help_prints() {
         .collect();
     assert_eq!(
         printed,
-        ["serve", "run", "config", "pubkey", "encrypt", "--help"]
+        [
+            "serve",
+            "run",
+            "config",
+            "pubkey",
+            "encrypt",
+            "--help",
+            "--version"
+        ]
     );
 
     let text = readme();
@@ -81,7 +89,7 @@ fn the_commands_in_the_readme_are_the_commands_help_prints() {
 #[test]
 fn the_settings_table_in_the_readme_is_the_table_the_program_reads() {
     let text = readme();
-    let table = rows(section(&text, "Settings"), 5);
+    let table = rows(section(&text, "Settings"), 6);
     assert_eq!(
         table.iter().map(|r| unquote(&r[0])).collect::<Vec<_>>(),
         SPECS.iter().map(|s| s.key).collect::<Vec<_>>(),
@@ -97,7 +105,19 @@ fn the_settings_table_in_the_readme_is_the_table_the_program_reads() {
             spec.key,
             row[3]
         );
-        assert!(!row[4].is_empty(), "{} says nothing", spec.key);
+        assert!(!row[5].is_empty(), "{} says nothing", spec.key);
+        // The column that says when a change applies is the program's flag.
+        let applies = row[4].replace("**", "");
+        assert_eq!(
+            applies,
+            if spec.reload {
+                "reloads live"
+            } else {
+                "needs a restart"
+            },
+            "{}",
+            spec.key
+        );
         // The defaults that depend on the network (and the operating system)
         // are described, not copied: see the "Networks" section.
         let per_network = ["bitcoin.rpc_url", "bitcoin.wallet", "bitcoin.cookie"];
@@ -124,5 +144,47 @@ fn the_settings_table_in_the_readme_is_the_table_the_program_reads() {
                 row[2]
             );
         }
+    }
+}
+
+#[test]
+fn the_readme_lists_each_setting_as_reloads_live_or_needs_a_restart_as_the_program_does() {
+    let text = readme();
+    let reloading = section(&text, "Reloading, restarting and snapshots");
+    let bullet = |lead: &str| -> Vec<String> {
+        let line = reloading
+            .lines()
+            .find(|l| l.starts_with(&format!("- **{lead}**")))
+            .unwrap_or_else(|| panic!("the README has no `- **{lead}**` list"));
+        line.split('`')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect()
+    };
+    let (live, restart) = (bullet("Reloads live"), bullet("Needs a restart"));
+    // A listed name is a setting, or a section's settings (`price.*`).
+    let names = |list: &[String], key: &str| {
+        list.iter()
+            .filter(|n| match n.strip_suffix(".*") {
+                Some(section) => key.starts_with(&format!("{section}.")),
+                None => n.as_str() == key,
+            })
+            .count()
+    };
+    for spec in SPECS {
+        let (in_live, in_restart) = (names(&live, spec.key), names(&restart, spec.key));
+        let expected = if spec.reload { (1, 0) } else { (0, 1) };
+        assert_eq!(
+            (in_live, in_restart),
+            expected,
+            "{}: the README must list it once, under {}",
+            spec.key,
+            if spec.reload {
+                "Reloads live"
+            } else {
+                "Needs a restart"
+            }
+        );
     }
 }

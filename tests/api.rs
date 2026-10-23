@@ -493,6 +493,8 @@ async fn health_reports_the_last_successful_scan() {
     assert!(body["last_scan_unix"].is_null());
     assert_eq!(body["wire_version"], sp_wire::WIRE_VERSION);
     assert_eq!(body["network"], common::NETWORK);
+    // What `spi upgrade` checks after a restart: the build that answers.
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
 
     health.record_scan();
     let (code, body) = health_json(&base).await;
@@ -510,6 +512,24 @@ async fn health_fails_when_the_last_scan_is_too_old() {
     assert_eq!(code, reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["status"], "scan_stale");
     assert_eq!(body["stale_after_secs"], 100);
+}
+
+#[tokio::test]
+async fn a_new_health_allowance_applies_to_the_next_health_request() {
+    // A reload of scan.health_intervals or scan.health_grace_secs changes this
+    // allowance in the running mint (psp-mint's `SIGHUP`).
+    let (base, mint) = start("health-allowance").await;
+    mint.health
+        .record_scan_at(psp_mint::server::now_secs() - 500);
+    let (code, body) = health_json(&base).await;
+    assert_eq!(code, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["stale_after_secs"], 100);
+
+    mint.health.set_stale_after_secs(1_000);
+    let (code, body) = health_json(&base).await;
+    assert_eq!(code, reqwest::StatusCode::OK);
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["stale_after_secs"], 1_000);
 }
 
 #[tokio::test]

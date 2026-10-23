@@ -252,10 +252,10 @@ pub fn reconcile(
     let record = records.get(&txid).expect("matched").clone();
 
     // An identical resend of an accepted request gets its stored answer.
-    if let Some(done) = &record.reconciled {
-        if done.hash == hash {
-            return Ok(done.response.clone());
-        }
+    if let Some(done) = &record.reconciled
+        && done.hash == hash
+    {
+        return Ok(done.response.clone());
     }
     let resumed = match &record.reconcile_pending {
         Some(pending) if pending.hash == hash => true,

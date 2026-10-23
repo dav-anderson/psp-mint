@@ -105,7 +105,7 @@ struct Listener {
     thread: Option<JoinHandle<Result<(), String>>>,
 }
 
-fn start_listener(server: &ServerRef, key: &SecretKey, dir: &PathBuf, info: Info) -> Listener {
+fn start_listener(server: &ServerRef, key: &SecretKey, dir: &Path, info: Info) -> Listener {
     start_serving(
         server,
         key,
@@ -114,19 +114,14 @@ fn start_listener(server: &ServerRef, key: &SecretKey, dir: &PathBuf, info: Info
     )
 }
 
-fn start_serving(
-    server: &ServerRef,
-    key: &SecretKey,
-    dir: &PathBuf,
-    serve: Arc<Serve>,
-) -> Listener {
+fn start_serving(server: &ServerRef, key: &SecretKey, dir: &Path, serve: Arc<Serve>) -> Listener {
     let settings = Settings {
         server: server.clone(),
         held_reads: 16,
         timeout_secs: 10,
-        state_dir: dir.clone(),
+        state_dir: dir.to_path_buf(),
     };
-    let key = key.clone();
+    let key = *key;
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let thread = thread::Builder::new()
         .name("test-air-listener".into())
@@ -182,7 +177,7 @@ impl Drop for Listener {
 fn config(server: &ServerRef, did: &ServiceDid, wait: u64, attempts: u32) -> AskConfig {
     AskConfig {
         server: server.clone(),
-        mint: did.clone(),
+        mint: *did,
         wire_version: WIRE_VERSION,
         network: NETWORK.to_string(),
         reply_wait_secs: wait,
@@ -254,7 +249,7 @@ fn wait_for_cell(server: &ServerRef, key: &SecretKey) {
     }
 }
 
-fn wait_for_next(dir: &PathBuf, want: u32) {
+fn wait_for_next(dir: &Path, want: u32) {
     let until = Instant::now() + Duration::from_secs(10);
     loop {
         let now = air_listener::read_next(dir).unwrap();

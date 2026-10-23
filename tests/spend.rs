@@ -1,5 +1,8 @@
 //! A PSP spend with change over AIR (kind 14): notes in, change out, an amount
-//! paid that the mint burns and never reissues.
+//! paid. The mint reissues what is paid to the SPI's own ecash-wallet (a file in
+//! `revenue/`), or burns it when `burn.enabled` is on and the SPI's wallet already
+//! holds `burn.threshold_psp` (the wallet's balance as `spi` last published it
+//! in `wallet_balance.json`, plus what the mint has reissued since).
 //!
 //! The spend goes through the mint's real listener on a real `air_server` (see
 //! `common`), as a wallet's request does. The calls that stay on HTTP because
@@ -14,13 +17,16 @@ use std::sync::atomic::Ordering;
 use mint_server::api::{CheckStateRequest, CheckStateResponse};
 use mint_server::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash};
+use psp_mint::balance::{self, Figure};
 use psp_mint::rotation::{
-    PspSpendRequest, PspSpendResponse, ROLLOVERS_FILE, Rollovers, RotationResponse,
+    BurnPolicy, PspSpendRequest, PspSpendResponse, REVENUE_DIR, ROLLOVERS_FILE, Rollovers,
+    RotationResponse,
 };
 use psp_mint::server::{KeysetsResponse, Limits, PspMeltRequest, SharedRotating};
 use rand::rngs::OsRng;
-use secp256k1::{Keypair, SECP256K1, SecretKey};
+use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use serde_json::Value;
+use sp_wire::psp::PspHandover;
 
 const T: u64 = 1_800_000_000;
 const H: u64 = 3600;
@@ -42,6 +48,8 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 struct Mint {
+    /// The mint's data folder.
+    dir: PathBuf,
     base: String,
     state: Arc<AppState>,
     rot: SharedRotating,
@@ -59,6 +67,7 @@ async fn start_with(dir: &Path, clock: u64, limits: Limits) -> Mint {
     let air = mint.air();
     let base = mint.http().await;
     Mint {
+        dir: dir.to_path_buf(),
         base,
         state: Arc::clone(&mint.state),
         rot: Arc::clone(&mint.rot),
@@ -131,6 +140,25 @@ impl Mint {
         ["issued", "redeemed", "outstanding", "paid"].map(|k| a[k].as_u64().expect(k))
     }
 
+    /// Of what was paid, the units burned and the units reissued, as `/audit`
+    /// gives them.
+    async fn paid_split(&self) -> [u64; 2] {
+        let a = self.audit().await;
+        ["burned", "reissued"].map(|k| a[k].as_u64().expect(k))
+    }
+
+    /// The mint's `reissued` total, as `/audit` gives it.
+    async fn reissued(&self) -> u64 {
+        self.audit().await["reissued"].as_u64().expect("reissued")
+    }
+
+    /// What `spi` does: the wallet holds `psp` now. It reads the wallet first and
+    /// the mint's `reissued` second, and writes both with the time.
+    async fn wallet_holds(&self, psp: u64) {
+        let reissued = self.reissued().await;
+        publish(&self.dir, psp, reissued, psp_mint::server::now_secs());
+    }
+
     async fn spend(&self, req: &PspSpendRequest) -> (u16, Value) {
         self.air.post_json("/spend", req)
     }
@@ -173,6 +201,40 @@ impl Mint {
         serde_json::from_value::<CheckStateResponse>(body)
             .unwrap()
             .spent
+    }
+}
+
+/// The figure `spi` publishes for the mint, written to the mint's data folder.
+fn publish(dir: &Path, psp: u64, reissued: u64, at: u64) {
+    let text = serde_json::to_string(&Figure { psp, reissued, at }).unwrap();
+    std::fs::write(dir.join(balance::FILE), text).unwrap();
+}
+
+/// The file the mint wrote in `revenue/` for the spend with request hash `hash`,
+/// read as the SPI's wallet reads it.
+fn revenue_file(dir: &Path, hash: &str) -> PspHandover {
+    let path = dir.join(REVENUE_DIR).join(format!("{hash}.json"));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    PspHandover::read(&bytes).unwrap()
+}
+
+/// Each note in `file` is genuine (signed by the mint) and its spend secret is
+/// the secret of its nonce.
+fn assert_genuine(m: &Mint, file: &PspHandover) {
+    let logic = m.state.logic.lock().unwrap();
+    for held in &file.notes {
+        assert_eq!(
+            held.note.nonce.0,
+            PublicKey::from_secret_key(SECP256K1, &held.spend_secret),
+            "the spend secret is the nonce's"
+        );
+        logic
+            .verify_note(&MintInput {
+                amount: Amount::from_units(held.amount),
+                note: held.note,
+                spend_signature: zero_sig(),
+            })
+            .expect("the reissued note is genuine");
     }
 }
 
@@ -274,7 +336,7 @@ impl Built {
 }
 
 #[tokio::test]
-async fn a_spend_with_change_burns_the_payment_and_signs_the_change() {
+async fn a_spend_with_change_reissues_the_payment_and_signs_the_change() {
     let m = start(&scratch("change"), T).await;
     let (a, b) = (m.issue(4), m.issue(2));
     let cur = m.current().await;
@@ -289,13 +351,20 @@ async fn a_spend_with_change_burns_the_payment_and_signs_the_change() {
         m.spent(&[&a, &b, &change[0]]).await,
         vec![true, true, false]
     );
-    // 6 issued and burned whole, 4 issued as change: the 2 paid is gone for good.
-    assert_eq!(m.totals().await, [10, 6, 4, 2]);
+    // 6 issued and burned whole; 4 issued as change and 2 reissued to the SPI's
+    // wallet (burning is off): the 2 paid is outstanding again, in a file.
+    assert_eq!(m.totals().await, [12, 6, 6, 2]);
+    assert_eq!(m.paid_split().await, [0, 2]);
+    let file = revenue_file(&m.dir, &built.req.hash());
+    assert_eq!(file.units(), 2);
+    assert_eq!(file.notes[0].keyset, cur);
+    assert_genuine(&m, &file);
 
-    // A retry gets the stored answer and burns nothing more.
+    // A retry gets the stored answer and reissues nothing more.
     let (code, again) = m.spend(&built.req).await;
     assert_eq!((code, again), (200, body));
-    assert_eq!(m.totals().await, [10, 6, 4, 2]);
+    assert_eq!(m.totals().await, [12, 6, 6, 2]);
+    assert_eq!(revenue_file(&m.dir, &built.req.hash()), file);
 }
 
 #[tokio::test]
@@ -310,7 +379,7 @@ async fn an_exact_spend_needs_no_change_and_no_change_keyset() {
     assert!(got.outcomes.is_empty() && got.keys.is_empty());
     assert_eq!((got.keyset.as_str(), got.paid), (cur.as_str(), 4));
     assert_eq!(m.spent(&[&a]).await, vec![true]);
-    assert_eq!(m.totals().await, [4, 4, 0, 4]);
+    assert_eq!(m.totals().await, [8, 4, 4, 4]);
 }
 
 #[tokio::test]
@@ -391,7 +460,7 @@ async fn the_same_note_in_two_spends_is_spent_by_the_first_only() {
         (400, Some("note_spent_elsewhere"), &serde_json::json!([0])),
         "{body}"
     );
-    assert_eq!(m.totals().await, [6, 4, 2, 2], "paid once");
+    assert_eq!(m.totals().await, [8, 4, 4, 2], "paid once");
 }
 
 #[tokio::test]
@@ -451,8 +520,8 @@ async fn keysets_are_live_the_way_a_rollover_needs_them() {
     );
     assert_eq!(m.spent(&[&d]).await, vec![false], "`d` was never burned");
     // The audit still counts the deleted set: 4 notes of 4 and two changes of 2
-    // issued; the two spent notes redeemed whole; 2 + 2 paid.
-    assert_eq!(m.totals().await, [20, 8, 12, 4]);
+    // issued, and the 2 + 2 paid reissued; the two spent notes redeemed whole.
+    assert_eq!(m.totals().await, [24, 8, 16, 4]);
 }
 
 #[tokio::test]
@@ -465,13 +534,14 @@ async fn the_payment_is_counted_apart_from_what_exchanges_burn() {
     assert_eq!(m.totals().await, [6, 2, 4, 0]);
     let built = build(&[(&b, 4, &cur)], "", &[], 4, "service fee");
     assert_eq!(m.spend(&built.req).await.0, 200);
-    assert_eq!(m.totals().await, [6, 6, 0, 4]);
+    assert_eq!(m.totals().await, [10, 6, 4, 4]);
 }
 
 #[tokio::test]
 async fn a_spend_cut_short_after_the_burn_is_finished_by_the_retry() {
-    // `claimed`: a change output was also claimed before the crash (the crash
-    // came while signing); otherwise it came right after the burn.
+    // `claimed`: a change output and the reissued note were also claimed before
+    // the crash (the crash came while signing); otherwise it came right after
+    // the burn.
     for claimed in [false, true] {
         let dir = scratch(if claimed {
             "crash-signing"
@@ -484,11 +554,16 @@ async fn a_spend_cut_short_after_the_burn_is_finished_by_the_retry() {
         let built = build(&[(&a, 4, &cur)], &cur, &[1, 1], 2, "crash");
         let hash = built.req.hash();
         // The state a crash leaves: pending and holding the note, the note
-        // burned, no answer stored.
+        // burned, no answer stored, and the note planned for the SPI's wallet
+        // (saved with `pending`, before anything was burned).
+        let planned_nonce = SecretKey::from_slice(&[0x0b; 32]).unwrap();
+        let planned_blind = SecretKey::from_slice(&[0x0c; 32]).unwrap();
         std::fs::write(
             dir.join(ROLLOVERS_FILE),
             common::rollovers_file(serde_json::json!({"pending": {hash.clone(): 0},
-                "holds": {hash.clone(): [hex::encode(a.0.nonce.0.serialize())]}})),
+                "holds": {hash.clone(): [hex::encode(a.0.nonce.0.serialize())]},
+                "plans": {hash.clone(): [{"amount": 2, "keyset": cur,
+                    "nonce_secret": planned_nonce, "blinding_key": planned_blind}]}})),
         )
         .unwrap();
         {
@@ -500,6 +575,20 @@ async fn a_spend_cut_short_after_the_burn_is_finished_by_the_retry() {
                 .unwrap();
             if claimed {
                 logic.issue_with_key(&sk(1), &built.req.outputs[0]).unwrap();
+                let (blinded, _) = bdhke::blind_message(
+                    &Nonce(PublicKey::from_secret_key(SECP256K1, &planned_nonce))
+                        .as_hash_preimage(),
+                    Some(planned_blind),
+                );
+                logic
+                    .issue_with_key(
+                        &sk(2),
+                        &MintOutput {
+                            amount: Amount::from_units(2),
+                            blind_nonce: BlindNonce(blinded),
+                        },
+                    )
+                    .unwrap();
             }
         }
         // The restart: the state is read back from disk.
@@ -518,16 +607,26 @@ async fn a_spend_cut_short_after_the_burn_is_finished_by_the_retry() {
         assert_eq!(code, 200, "claimed={claimed}: {body}");
         let got = answer(body.clone());
         assert_eq!(built.notes(&m, &got).len(), 2, "both outputs signed");
-        // Counted once: 4 issued and burned, 2 issued as change, 2 paid.
-        assert_eq!(m.totals().await, [6, 4, 2, 2], "claimed={claimed}");
+        // Counted once: 4 issued and burned, 2 issued as change, 2 paid and
+        // reissued.
+        assert_eq!(m.totals().await, [8, 4, 4, 2], "claimed={claimed}");
         let (code, again) = m.spend(&built.req).await;
         assert_eq!((code, again), (200, body));
-        assert_eq!(m.totals().await, [6, 4, 2, 2]);
+        assert_eq!(m.totals().await, [8, 4, 4, 2]);
+        let on_disk = Rollovers::open(&dir).unwrap();
         assert_eq!(
-            Rollovers::open(&dir).unwrap().paid(),
-            2,
+            (on_disk.paid(), on_disk.paid_kept(), on_disk.paid_burned()),
+            (2, 2, 0),
             "the payment is on disk once"
         );
+        // The note in the file is the planned one, made again after the crash
+        // (and, when its blind nonce was already claimed, signed again).
+        let file = revenue_file(&dir, &hash);
+        assert_eq!(file.notes.len(), 1, "claimed={claimed}");
+        assert_eq!(file.notes[0].amount, 2);
+        assert_eq!(file.notes[0].spend_secret, planned_nonce);
+        assert_eq!(file.notes[0].keyset, cur);
+        assert_genuine(&m, &file);
     }
 }
 
@@ -653,4 +752,229 @@ async fn the_shape_of_a_spend_is_checked_before_anything_is_burned() {
         "nothing was burned"
     );
     assert_eq!(m.totals().await, [6, 0, 6, 0]);
+}
+
+#[tokio::test]
+async fn paid_psp_above_the_burn_threshold_is_burned_and_the_rest_reissued() {
+    // Burning on, with the SPI's wallet to be kept at 3 PSP. The wallet is empty
+    // when `spi` publishes its balance and takes in nothing more, so what it
+    // holds is what the mint has reissued since: the first payment is reissued
+    // whole, the second only up to the threshold, the third not at all.
+    let limits = Limits {
+        burn: BurnPolicy {
+            enabled: true,
+            threshold_psp: 3,
+        },
+        ..Default::default()
+    };
+    let dir = scratch("burn");
+    let m = start_with(&dir, T, limits).await;
+    m.wallet_holds(0).await;
+    let (a, b, c) = (m.issue(4), m.issue(4), m.issue(4));
+    let cur = m.current().await;
+
+    let first = build(&[(&a, 4, &cur)], &cur, &[2], 2, "one");
+    assert_eq!(m.spend(&first.req).await.0, 200);
+    assert_eq!(m.paid_split().await, [0, 2]);
+    assert_eq!(revenue_file(&dir, &first.req.hash()).units(), 2);
+
+    let second = build(&[(&b, 4, &cur)], &cur, &[2], 2, "two");
+    assert_eq!(m.spend(&second.req).await.0, 200);
+    assert_eq!(m.paid_split().await, [1, 3], "1 burned, 1 reissued");
+    let file = revenue_file(&dir, &second.req.hash());
+    assert_eq!(file.units(), 1);
+    assert_genuine(&m, &file);
+
+    let third = build(&[(&c, 4, &cur)], &cur, &[2], 2, "three");
+    assert_eq!(m.spend(&third.req).await.0, 200);
+    assert_eq!(m.paid_split().await, [3, 3], "all of the third burned");
+    assert!(
+        !dir.join(REVENUE_DIR)
+            .join(format!("{}.json", third.req.hash()))
+            .exists(),
+        "nothing reissued above the threshold"
+    );
+    // 12 issued + 3 changes of 2 + 3 reissued; 3 notes of 4 redeemed; 6 paid.
+    assert_eq!(m.totals().await, [21, 12, 9, 6]);
+}
+
+#[tokio::test]
+async fn burning_on_with_a_zero_threshold_burns_every_payment_when_the_figure_is_usable() {
+    let limits = Limits {
+        burn: BurnPolicy {
+            enabled: true,
+            threshold_psp: 0,
+        },
+        ..Default::default()
+    };
+    let dir = scratch("burn-all");
+    let m = start_with(&dir, T, limits).await;
+    m.wallet_holds(0).await;
+    let a = m.issue(4);
+    let cur = m.current().await;
+    let built = build(&[(&a, 4, &cur)], &cur, &[2], 2, "all burned");
+    assert_eq!(m.spend(&built.req).await.0, 200);
+    assert_eq!(m.paid_split().await, [2, 0]);
+    assert_eq!(m.totals().await, [6, 4, 2, 2]);
+    assert!(!dir.join(REVENUE_DIR).exists(), "no file for nothing");
+}
+
+/// A mint with burning on, `threshold` PSP, and `n` notes of 4 to spend.
+async fn burning(name: &str, threshold: u64, n: usize) -> (Mint, PathBuf, Vec<Held>, String) {
+    let limits = Limits {
+        burn: BurnPolicy {
+            enabled: true,
+            threshold_psp: threshold,
+        },
+        ..Default::default()
+    };
+    let dir = scratch(name);
+    let m = start_with(&dir, T, limits).await;
+    let notes = (0..n).map(|_| m.issue(4)).collect();
+    let cur = m.current().await;
+    (m, dir, notes, cur)
+}
+
+/// Pay 2 from a note of 4 (change 2) and check the spend went through.
+async fn pay_two(m: &Mint, note: &Held, cur: &str, memo: &str) -> PspSpendRequest {
+    let built = build(&[(note, 4, cur)], cur, &[2], 2, memo);
+    let (code, body) = m.spend(&built.req).await;
+    assert_eq!(code, 200, "{memo}: {body}");
+    built.req
+}
+
+#[tokio::test]
+async fn burning_follows_what_the_wallet_holds_up_to_the_threshold_and_back_down() {
+    // Threshold 3, each payment 2. Burned and reissued totals after each spend:
+    // under (2 held: room for 1), at (3 held: none), over (4 held: none), then
+    // the wallet spends and holds 0 again: room for the whole payment.
+    let (m, _dir, notes, cur) = burning("burn-follows", 3, 5).await;
+
+    m.wallet_holds(1).await;
+    pay_two(&m, &notes[0], &cur, "under").await;
+    assert_eq!(m.paid_split().await, [0, 2], "1 held, room for 2");
+
+    // The wallet took the 2 in: 3 held, which is the threshold.
+    m.wallet_holds(3).await;
+    pay_two(&m, &notes[1], &cur, "at").await;
+    assert_eq!(m.paid_split().await, [2, 2], "at the threshold, none kept");
+
+    m.wallet_holds(2).await;
+    pay_two(&m, &notes[2], &cur, "one under").await;
+    assert_eq!(m.paid_split().await, [3, 3], "2 held, room for 1");
+
+    m.wallet_holds(4).await;
+    pay_two(&m, &notes[3], &cur, "over").await;
+    assert_eq!(
+        m.paid_split().await,
+        [5, 3],
+        "over the threshold, none kept"
+    );
+
+    m.wallet_holds(0).await;
+    pay_two(&m, &notes[4], &cur, "spent").await;
+    assert_eq!(
+        m.paid_split().await,
+        [5, 5],
+        "the wallet spent, so the payment is kept again"
+    );
+}
+
+#[tokio::test]
+async fn units_reissued_since_the_figure_count_as_held_and_a_figure_from_before_does_not() {
+    // `spi` published 0 held and 0 reissued. Two payments of 2 later the wallet
+    // has not yet taken them in, but they are the wallet's: the third payment
+    // finds 4 held and the threshold of 5 leaves room for 1.
+    let (m, _dir, notes, cur) = burning("burn-since", 5, 3).await;
+    m.wallet_holds(0).await;
+    pay_two(&m, &notes[0], &cur, "one").await;
+    pay_two(&m, &notes[1], &cur, "two").await;
+    assert_eq!(m.paid_split().await, [0, 4]);
+    pay_two(&m, &notes[2], &cur, "three").await;
+    assert_eq!(m.paid_split().await, [1, 5], "4 held, room for 1");
+}
+
+#[tokio::test]
+async fn without_a_usable_figure_every_paid_unit_is_reissued_not_burned() {
+    // A threshold of 0 burns every unit when there is a figure, so a payment
+    // that is reissued whole shows that the mint did not guess.
+    let (m, dir, notes, cur) = burning("burn-no-figure", 0, 4).await;
+    let now = psp_mint::server::now_secs();
+    let path = dir.join(balance::FILE);
+
+    // No file at all.
+    pay_two(&m, &notes[0], &cur, "missing").await;
+    assert_eq!(m.paid_split().await, [0, 2]);
+
+    // A file that is not a figure: `reissued` and `at` are missing, which the
+    // real type cannot make.
+    std::fs::write(&path, r#"{"psp": 0}"#).unwrap();
+    pay_two(&m, &notes[1], &cur, "malformed").await;
+    assert_eq!(m.paid_split().await, [0, 4]);
+
+    // A figure older than `burn.balance_max_age_secs` (24 hours by default).
+    publish(&dir, 0, 0, now - 48 * H);
+    pay_two(&m, &notes[2], &cur, "stale").await;
+    assert_eq!(m.paid_split().await, [0, 6]);
+
+    // A figure dated ahead of the clock.
+    publish(&dir, 0, 0, now + 7200);
+    pay_two(&m, &notes[3], &cur, "from the future").await;
+    assert_eq!(m.paid_split().await, [0, 8]);
+
+    // And a fresh one is trusted: now the same mint burns.
+    let extra = m.issue(4);
+    m.wallet_holds(0).await;
+    pay_two(&m, &extra, &cur, "fresh").await;
+    assert_eq!(m.paid_split().await, [2, 8]);
+}
+
+#[tokio::test]
+async fn with_burning_off_the_figure_is_not_read() {
+    // Threshold 0 and a wallet that holds a great deal would burn everything if
+    // burning were on.
+    let limits = Limits {
+        burn: BurnPolicy {
+            enabled: false,
+            threshold_psp: 0,
+        },
+        ..Default::default()
+    };
+    let dir = scratch("burn-off");
+    let m = start_with(&dir, T, limits).await;
+    m.wallet_holds(1_000_000).await;
+    let a = m.issue(4);
+    let cur = m.current().await;
+    pay_two(&m, &a, &cur, "off").await;
+    assert_eq!(m.paid_split().await, [0, 2]);
+}
+
+#[tokio::test]
+async fn a_spend_resumed_after_a_crash_keeps_the_decision_it_was_planned_with() {
+    // Burning on with room for everything (the wallet is empty, threshold 10),
+    // but the request was planned earlier, when it was decided to keep 1 of the
+    // 2 paid. The retry finishes that plan and does not decide again.
+    let (m, dir, notes, cur) = burning("burn-resume", 10, 1).await;
+    m.wallet_holds(0).await;
+    let a = &notes[0];
+    let built = build(&[(a, 4, &cur)], &cur, &[2], 2, "resume");
+    let hash = built.req.hash();
+    let planned_nonce = SecretKey::from_slice(&[0x0b; 32]).unwrap();
+    let planned_blind = SecretKey::from_slice(&[0x0c; 32]).unwrap();
+    std::fs::write(
+        dir.join(ROLLOVERS_FILE),
+        common::rollovers_file(serde_json::json!({"pending": {hash.clone(): 0},
+            "holds": {hash.clone(): [hex::encode(a.0.nonce.0.serialize())]},
+            "plans": {hash.clone(): [{"amount": 1, "keyset": cur,
+                "nonce_secret": planned_nonce, "blinding_key": planned_blind}]}})),
+    )
+    .unwrap();
+    *m.rot.rollovers.lock().unwrap() = Rollovers::open(&dir).unwrap();
+
+    let (code, body) = m.spend(&built.req).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(m.paid_split().await, [1, 1], "1 burned, 1 kept, as planned");
+    let file = revenue_file(&dir, &hash);
+    assert_eq!(file.units(), 1);
+    assert_genuine(&m, &file);
 }

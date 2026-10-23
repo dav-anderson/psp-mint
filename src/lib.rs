@@ -1,6 +1,8 @@
 pub mod air_listener;
+pub mod balance;
 pub mod config;
 pub mod delivery;
+pub mod lockfile;
 pub mod melts;
 pub mod network;
 pub mod payload;
@@ -14,3 +16,6 @@ pub mod seal;
 pub mod server;
 pub mod service;
 pub mod settle;
+pub mod snapshot;
+pub mod stop;
+pub mod version;

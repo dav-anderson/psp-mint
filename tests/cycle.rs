@@ -218,7 +218,7 @@ fn a_pass_settles_delivers_and_forfeits_and_saves_the_checkpoint() {
     );
 
     // delivered over AIR: both records are owed, and the payers read them
-    let mut deliverer = Some(Deliverer::new((*server).clone(), 2, did.clone()));
+    let mut deliverer = Some(Deliverer::new((*server).clone(), 2, did));
     service::deliver(&mut deliverer, &m.records, true);
     assert!(m.records.lock().unwrap().undelivered().is_empty());
     let id = wire::purchase_id(&exact);
