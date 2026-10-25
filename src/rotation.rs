@@ -217,10 +217,14 @@ struct Retired {
     /// The keyset IDs of the deleted generations, so a request naming one is
     /// told `keyset_retired` rather than `unknown_keyset`.
     ids: Vec<String>,
-    /// Burn proofs taken from a spent list just before it is deleted: nonces
-    /// (hex) a pending rollover held that were spent in the retiring set.
-    /// Saved together with the retired ID, before anything is deleted.
-    burn_proofs: std::collections::BTreeSet<String>,
+    /// Burn proofs taken from a spent list just before it is deleted, by the
+    /// request that held the notes: request hash -> the nonces (hex) it held
+    /// that were spent in the retiring set. Only that request may use them
+    /// (`Rotor::burn_proven`). Saved together with the retired ID, before
+    /// anything is deleted, and removed when the request finishes
+    /// (`Rotor::forget_proofs`). A file written before this shape (a flat list
+    /// of nonces) does not parse, and `serve` stops naming the file.
+    burn_proofs: BTreeMap<String, std::collections::BTreeSet<String>>,
     issued: u64,
     redeemed: u64,
 }
@@ -362,16 +366,19 @@ impl Rotor {
         }
     }
 
-    /// Add a generation's totals to `retired.json` (once), then delete it.
-    fn retire(&mut self, epoch: u64) -> Result<(), Box<dyn Error>> {
-        if !self.retired.epochs.contains(&epoch) {
-            let (keys, logic) = open_gen(&self.base, epoch, self.max)?;
-            // Burn proofs from this set's spent list, the last moment it
-            // exists: notes a pending rollover holds that are spent here were
-            // burned by that rollover (no other request may take them).
-            let held = Rollovers::open(&self.base)?.held_nonces("");
-            self.retired.burn_proofs.retain(|n| held.contains(n));
-            for n in &held {
+    /// Burn proofs from this set's spent list, the last moment it exists: for
+    /// each unfinished request, the notes it holds that are spent here were
+    /// burned by that request (no other request may take them). Each proof is
+    /// kept under the request that held the note. A proof whose request no
+    /// longer holds the note (it finished) is dropped. Saved by the caller with
+    /// the retired ID.
+    fn take_proofs(&mut self, logic: &MintLogic) -> Result<(), Box<dyn Error>> {
+        let rollovers = Rollovers::open(&self.base)?;
+        let mut proofs = BTreeMap::new();
+        for (id, held) in rollovers.holds() {
+            let mut got = self.retired.burn_proofs.remove(id).unwrap_or_default();
+            got.retain(|n| held.contains(n));
+            for n in held {
                 let Ok(bytes) = hex::decode(n) else { continue };
                 let Ok(pk) = secp256k1::PublicKey::from_slice(&bytes) else {
                     continue;
@@ -380,9 +387,22 @@ impl Rotor {
                     .is_spent(mint_types::Nonce(pk))
                     .map_err(|e| e.to_string())?
                 {
-                    self.retired.burn_proofs.insert(n.clone());
+                    got.insert(n.clone());
                 }
             }
+            if !got.is_empty() {
+                proofs.insert(id.clone(), got);
+            }
+        }
+        self.retired.burn_proofs = proofs;
+        Ok(())
+    }
+
+    /// Add a generation's totals to `retired.json` (once), then delete it.
+    fn retire(&mut self, epoch: u64) -> Result<(), Box<dyn Error>> {
+        if !self.retired.epochs.contains(&epoch) {
+            let (keys, logic) = open_gen(&self.base, epoch, self.max)?;
+            self.take_proofs(&logic)?;
             let (i, d) = logic.audit_totals().map_err(|e| e.to_string())?;
             drop(logic);
             self.retired.epochs.push(epoch);
@@ -397,23 +417,7 @@ impl Rotor {
 
     fn retire_logic(&mut self, keys: GenKeys, logic: MintLogic) -> Result<(), Box<dyn Error>> {
         if !self.retired.epochs.contains(&keys.epoch) {
-            // Burn proofs from this set's spent list, the last moment it
-            // exists: notes a pending rollover holds that are spent here were
-            // burned by that rollover (no other request may take them).
-            let held = Rollovers::open(&self.base)?.held_nonces("");
-            self.retired.burn_proofs.retain(|n| held.contains(n));
-            for n in &held {
-                let Ok(bytes) = hex::decode(n) else { continue };
-                let Ok(pk) = secp256k1::PublicKey::from_slice(&bytes) else {
-                    continue;
-                };
-                if logic
-                    .is_spent(mint_types::Nonce(pk))
-                    .map_err(|e| e.to_string())?
-                {
-                    self.retired.burn_proofs.insert(n.clone());
-                }
-            }
+            self.take_proofs(&logic)?;
             let (i, d) = logic.audit_totals().map_err(|e| e.to_string())?;
             self.retired.epochs.push(keys.epoch);
             self.retired.ids.push(keys.id.clone());
@@ -504,15 +508,25 @@ impl Rotor {
         self.retired.ids.iter().any(|r| r == id)
     }
 
-    /// Issued and redeemed of the retired generations.
-    /// Whether `input` was proven burned (by the pending rollover holding it)
-    /// when its keyset was deleted; see `Retired::burn_proofs`.
-    pub fn burn_proven(&self, input: &MintInput) -> bool {
+    /// Whether `input` was proven burned by request `id` (the one holding it)
+    /// when its keyset was deleted; see `Retired::burn_proofs`. No other
+    /// request can use the proof.
+    pub fn burn_proven(&self, id: &str, input: &MintInput) -> bool {
         self.retired
             .burn_proofs
-            .contains(&hex::encode(input.note.nonce.0.serialize()))
+            .get(id)
+            .is_some_and(|n| n.contains(&hex::encode(input.note.nonce.0.serialize())))
     }
 
+    /// Drop the burn proofs of request `id`, which has finished. Saved at once.
+    pub fn forget_proofs(&mut self, id: &str) -> Result<(), Box<dyn Error>> {
+        if self.retired.burn_proofs.remove(id).is_some() {
+            save_json(&self.base.join(RETIRED_FILE), &self.retired)?;
+        }
+        Ok(())
+    }
+
+    /// Issued and redeemed of the retired generations.
     pub fn retired_totals(&self) -> (u64, u64) {
         (self.retired.issued, self.retired.redeemed)
     }
@@ -645,6 +659,10 @@ pub struct Rollovers {
     /// pending entry before anything is burned. No other rollover or melt may
     /// take them meanwhile.
     holds: BTreeMap<String, Vec<String>>,
+    /// The output blind nonces (hex) each pending rollover or spend will sign,
+    /// saved with its pending entry before anything is burned and dropped when
+    /// it finishes. No other rollover or spend may sign them meanwhile.
+    out_holds: BTreeMap<String, Vec<String>>,
     /// The answers to PSP spends (kind 14), by request hash. A spend uses the
     /// same `pending`, `burned` and `holds` as a rollover, under its own hash
     /// (the two hashes have different tags, so they never collide), so one
@@ -692,6 +710,20 @@ impl Rollovers {
     /// The notes (nonce hex) pending rollovers other than `except` hold.
     pub fn held_nonces(&self, except: &str) -> std::collections::HashSet<String> {
         self.holds
+            .iter()
+            .filter(|(h, _)| h.as_str() != except)
+            .flat_map(|(_, n)| n.iter().cloned())
+            .collect()
+    }
+
+    /// The notes each pending request holds, by request hash.
+    pub fn holds(&self) -> impl Iterator<Item = (&String, &Vec<String>)> + '_ {
+        self.holds.iter()
+    }
+
+    /// The output blind nonces (hex) pending requests other than `except` hold.
+    pub fn held_outputs(&self, except: &str) -> std::collections::HashSet<String> {
+        self.out_holds
             .iter()
             .filter(|(h, _)| h.as_str() != except)
             .flat_map(|(_, n)| n.iter().cloned())
@@ -795,10 +827,53 @@ impl Rollovers {
 pub enum RolloverError {
     Refused(String),
     Keyset(&'static str, String),
+    /// Refused with a `code` that is not about a keyset: an output's blind
+    /// nonce (`duplicate_blind_nonce`, `blind_nonce_used`, `note_held`).
+    Coded(&'static str, String),
     /// Input `index` is already spent. The body says which, so the wallet can
     /// stop offering that note (`code: note_spent_elsewhere`, `spent: [index]`).
     Spent(usize),
     Internal(String),
+}
+
+/// The position of the first output whose blind nonce an earlier one repeats.
+fn repeated_blind_nonce(outputs: &[MintOutput]) -> Option<usize> {
+    let mut seen = std::collections::HashSet::new();
+    outputs.iter().position(|o| !seen.insert(o.blind_nonce))
+}
+
+/// The checks on a new request's outputs that look at the signing set and at
+/// the other unfinished requests, made before anything is written or burned: a
+/// blind nonce the set has signed already, or one another pending rollover or
+/// spend holds. `Ok(Some(..))` is a refusal, its `code` and reason; `Err` is a
+/// fault of the store.
+fn check_outputs_free(
+    out_logic: &MintLogic,
+    store: &Rollovers,
+    id: &str,
+    outputs: &[MintOutput],
+) -> Result<Option<(&'static str, String)>, String> {
+    let held = store.held_outputs(id);
+    for (o, output) in outputs.iter().enumerate() {
+        if out_logic
+            .is_blind_nonce_used(&output.blind_nonce)
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(Some((
+                sp_wire::codes::BLIND_NONCE_USED,
+                format!("output {o}: the blind nonce was already used. Nothing was burned"),
+            )));
+        }
+        if held.contains(&hex::encode(output.blind_nonce.0.serialize())) {
+            return Ok(Some((
+                sp_wire::codes::NOTE_HELD,
+                format!(
+                    "output {o}: the blind nonce is held by an unfinished request. Nothing was burned"
+                ),
+            )));
+        }
+    }
+    Ok(None)
 }
 
 /// Run a rollover. The caller holds the mint lock and the rotor.
@@ -859,6 +934,7 @@ pub fn rollover(
     let resumed = store.pending.contains_key(&id);
     let proven = resumed && store.burned.contains(&id);
     let others = store.held_nonces(&id);
+    let own = store.holds.get(&id).cloned().unwrap_or_default();
     let gen_of = |side: Side| -> (&MintLogic, &GenKeys) {
         match side {
             Side::Current => (current, &rotor.current),
@@ -893,8 +969,17 @@ pub fn rollover(
         let (logic, keys) = match rotor.resolve(&req.input_keysets[i]) {
             Ok(side) => gen_of(side),
             // Started before its keyset was deleted: finished without
-            // burning only if the stored state proves this request burned it.
-            Err(_) if proven || rotor.burn_proven(input) => continue,
+            // burning only if the stored state proves this request burned it:
+            // its own flag, or the proof taken for this request when the set
+            // was deleted, for a note it holds. No other request has a proof.
+            Err(_)
+                if proven
+                    || (resumed
+                        && own.contains(&hex::encode(input.note.nonce.0.serialize()))
+                        && rotor.burn_proven(&id, input)) =>
+            {
+                continue;
+            }
             Err(e) if resumed => {
                 return Err(Keyset(
                     sp_wire::codes::BURN_NOT_PROVEN,
@@ -924,13 +1009,45 @@ pub fn rollover(
             .ok_or_else(|| Refused(format!("input {i}: not a denomination")))?;
         plan.push((logic, sk, input, spent));
     }
+    // The outputs, before anything is written or burned. The set that signs
+    // must have a key for each amount (the two sets are made from one maximum,
+    // but a key file already on disk is used as it is).
+    if let Some(o) = req
+        .outputs
+        .iter()
+        .find(|o| !out_keys.sk.contains_key(&o.amount) || !out_keys.pk.contains_key(&o.amount))
+    {
+        let why = format!(
+            "{} is not a denomination of keyset {}",
+            o.amount.units, out_keys.id
+        );
+        return Err(if resumed { Internal(why) } else { Refused(why) });
+    }
     if !resumed {
+        if let Some(o) = repeated_blind_nonce(&req.outputs) {
+            return Err(Coded(
+                sp_wire::codes::DUPLICATE_BLIND_NONCE,
+                format!("output {o} repeats a blind nonce. Nothing was burned"),
+            ));
+        }
+        if let Some((code, why)) =
+            check_outputs_free(out_logic, store, &id, &req.outputs).map_err(Internal)?
+        {
+            return Err(Coded(code, why));
+        }
         store.pending.insert(id.clone(), rotor.current.epoch);
         store.holds.insert(
             id.clone(),
             req.inputs
                 .iter()
                 .map(|i| hex::encode(i.note.nonce.0.serialize()))
+                .collect(),
+        );
+        store.out_holds.insert(
+            id.clone(),
+            req.outputs
+                .iter()
+                .map(|o| hex::encode(o.blind_nonce.0.serialize()))
                 .collect(),
         );
         store.save().map_err(Internal)?;
@@ -949,7 +1066,9 @@ pub fn rollover(
     let mut outcomes = Vec::new();
     let mut keys = Vec::new();
     for o in &req.outputs {
-        let sk = &out_keys.sk[&o.amount];
+        let (Some(sk), Some(pk)) = (out_keys.sk.get(&o.amount), out_keys.pk.get(&o.amount)) else {
+            return Err(Internal(format!("{} has no key", o.amount.units)));
+        };
         let out = match out_logic.issue_with_key(sk, o) {
             Ok(out) => out,
             Err(mint_types::MintOutputError::BlindNonceAlreadyUsed) if resumed => {
@@ -958,7 +1077,7 @@ pub fn rollover(
             Err(e) => return Err(Internal(e.to_string())),
         };
         outcomes.push(out);
-        keys.push(out_keys.pk[&o.amount]);
+        keys.push(*pk);
     }
     let answer = RolloverResponse {
         keyset: out_keys.id.clone(),
@@ -970,6 +1089,7 @@ pub fn rollover(
     store.pending.remove(&id);
     store.burned.remove(&id);
     store.holds.remove(&id);
+    store.out_holds.remove(&id);
     store.save().map_err(Internal)?;
     Ok(answer)
 }
@@ -1047,14 +1167,11 @@ pub fn check_spend_shape(req: &PspSpendRequest, max_items: usize) -> Result<(), 
             ));
         }
     }
-    let mut blinds = std::collections::HashSet::new();
-    for (o, output) in req.outputs.iter().enumerate() {
-        if !blinds.insert(output.blind_nonce) {
-            return Err(refuse(
-                "duplicate_blind_nonce",
-                format!("output {o} repeats a blind nonce"),
-            ));
-        }
+    if let Some(o) = repeated_blind_nonce(&req.outputs) {
+        return Err(refuse(
+            "duplicate_blind_nonce",
+            format!("output {o} repeats a blind nonce"),
+        ));
     }
     Ok(())
 }
@@ -1124,6 +1241,7 @@ pub fn spend(
     let resumed = store.pending.contains_key(&id);
     let proven = resumed && store.burned.contains(&id);
     let others = store.held_nonces(&id);
+    let own = store.holds.get(&id).cloned().unwrap_or_default();
     let gen_of = |side: Side| -> (&MintLogic, &GenKeys) {
         match side {
             Side::Current => (current, &rotor.current),
@@ -1159,8 +1277,16 @@ pub fn spend(
         let (logic, keys) = match rotor.resolve(&req.input_keysets[i]) {
             Ok(side) => gen_of(side),
             // Started before its keyset was deleted: finished without burning
-            // only if the stored state proves this request burned it.
-            Err(_) if proven || rotor.burn_proven(input) => continue,
+            // only if the stored state proves this request burned it (see
+            // `rollover`).
+            Err(_)
+                if proven
+                    || (resumed
+                        && own.contains(&hex::encode(input.note.nonce.0.serialize()))
+                        && rotor.burn_proven(&id, input)) =>
+            {
+                continue;
+            }
             Err(e) if resumed => {
                 return Err(refuse(
                     sp_wire::codes::BURN_NOT_PROVEN,
@@ -1198,7 +1324,29 @@ pub fn spend(
             .ok_or_else(|| refuse("bad_denomination", format!("input {i}: not a denomination")))?;
         plan.push((logic, sk, input, spent));
     }
+    // The change, before anything is written or burned (see `rollover`; a
+    // repeated blind nonce is refused by `check_spend_shape`).
+    if let Some(o) = req
+        .outputs
+        .iter()
+        .find(|o| !out_keys.sk.contains_key(&o.amount) || !out_keys.pk.contains_key(&o.amount))
+    {
+        let why = format!(
+            "output: {} is not a denomination of keyset {}",
+            o.amount.units, out_keys.id
+        );
+        return Err(if resumed {
+            Internal(why)
+        } else {
+            refuse("bad_denomination", why)
+        });
+    }
     if !resumed {
+        if let Some((code, why)) =
+            check_outputs_free(out_logic, store, &id, &req.outputs).map_err(Internal)?
+        {
+            return Err(refuse(code, why));
+        }
         let held = figure.map(|f| crate::balance::held(&f, store.reissue_total()));
         let keep = burn.keep(req.pay, held);
         let plans = plan_revenue(&rotor.current, keep)?;
@@ -1208,6 +1356,13 @@ pub fn spend(
             req.inputs
                 .iter()
                 .map(|i| hex::encode(i.note.nonce.0.serialize()))
+                .collect(),
+        );
+        store.out_holds.insert(
+            id.clone(),
+            req.outputs
+                .iter()
+                .map(|o| hex::encode(o.blind_nonce.0.serialize()))
                 .collect(),
         );
         store.plans.insert(id.clone(), plans);
@@ -1227,7 +1382,9 @@ pub fn spend(
     let mut outcomes = Vec::new();
     let mut keys = Vec::new();
     for o in &req.outputs {
-        let sk = &out_keys.sk[&o.amount];
+        let (Some(sk), Some(pk)) = (out_keys.sk.get(&o.amount), out_keys.pk.get(&o.amount)) else {
+            return Err(Internal(format!("{} has no key", o.amount.units)));
+        };
         let out = match out_logic.issue_with_key(sk, o) {
             Ok(out) => out,
             Err(mint_types::MintOutputError::BlindNonceAlreadyUsed) if resumed => {
@@ -1236,7 +1393,7 @@ pub fn spend(
             Err(e) => return Err(Internal(e.to_string())),
         };
         outcomes.push(out);
-        keys.push(out_keys.pk[&o.amount]);
+        keys.push(*pk);
     }
     // The notes for the SPI's wallet, from the plans saved with the request. A
     // plan whose keyset has been deleted since (a request resumed more than a
@@ -1271,6 +1428,7 @@ pub fn spend(
     store.pending.remove(&id);
     store.burned.remove(&id);
     store.holds.remove(&id);
+    store.out_holds.remove(&id);
     store.save().map_err(Internal)?;
     // Best effort: the answer is stored, so a failed write is tried again by the
     // next flush (the scan loop makes one every pass) and costs the payer nothing.

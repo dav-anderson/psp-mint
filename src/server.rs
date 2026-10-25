@@ -1098,7 +1098,7 @@ fn rollover_response(
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let melts = memos_of(rot)?;
     let mut log = melts.lock().map_err(|_| poisoned_memos())?;
-    let rotor = rotor_of(rot, &mut logic)?;
+    let mut rotor = rotor_of(rot, &mut logic)?;
     // A request over the ceiling is refused below, before it burns anything.
     if req.inputs.len() <= max_notes {
         forget_memos(
@@ -1111,7 +1111,15 @@ fn rollover_response(
     drop(log);
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
     match crate::rotation::rollover(&logic, &rotor, &mut store, req, max_notes) {
-        Ok(a) => Ok(a),
+        Ok(a) => {
+            // Finished: its burn proofs (see `Retired::burn_proofs`) are of no
+            // use any more. A resend of the answer comes back here to try again.
+            rotor
+                .forget_proofs(&req.hash())
+                .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            Ok(a)
+        }
+        Err(RolloverError::Coded(code, e)) => Err(coded(StatusCode::BAD_REQUEST, code, e)),
         Err(RolloverError::Refused(e)) => Err(coded(StatusCode::BAD_REQUEST, "refused", e)),
         Err(RolloverError::Keyset(code, e)) => Err(coded(StatusCode::BAD_REQUEST, code, e)),
         Err(RolloverError::Spent(i)) => Err((
@@ -1153,7 +1161,7 @@ fn spend_response(
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let melts = memos_of(rot)?;
     let mut log = melts.lock().map_err(|_| poisoned_memos())?;
-    let rotor = rotor_of(rot, &mut logic)?;
+    let mut rotor = rotor_of(rot, &mut logic)?;
     forget_memos(
         &logic,
         &rotor,
@@ -1162,8 +1170,13 @@ fn spend_response(
     )?;
     drop(log);
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
-    crate::rotation::spend(&logic, &rotor, &mut store, req, max_items, burn, figure)
-        .map_err(spend_failure)
+    let answer = crate::rotation::spend(&logic, &rotor, &mut store, req, max_items, burn, figure)
+        .map_err(spend_failure)?;
+    // Finished: its burn proofs are of no use any more (see `rollover_response`).
+    rotor
+        .forget_proofs(&req.hash())
+        .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(answer)
 }
 
 fn spend_failure(e: SpendError) -> ApiFailure {

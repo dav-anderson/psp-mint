@@ -17,7 +17,9 @@ use mint_core::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
 };
-use psp_mint::rotation::{RolloverRequest, RolloverResponse, Rollovers, RotationResponse, Rotor};
+use psp_mint::rotation::{
+    PspSpendRequest, RolloverRequest, RolloverResponse, Rollovers, RotationResponse, Rotor,
+};
 use psp_mint::server::{
     AuditResponse, Burn, KeysetsResponse, PspMeltRequest, SharedMelts, SharedRotating,
 };
@@ -539,18 +541,15 @@ async fn a_rollover_clears_the_stale_memo_of_a_note_and_keeps_a_real_burns() {
     );
 }
 
-/// A rollover burned before its keyset retired, its answer lost, retried after
-/// the retirement. `burn`: the note was burned before the crash; `flag`: the
-/// burn was also recorded under the request hash; `later`: the retry comes
-/// after the set the outputs name has been deleted too. Returns the status, the
-/// body and the ID of the set that should have signed: the set the request
-/// names while that is still live, else the current one.
-async fn rollover_after_retirement(
+/// The state a crash leaves in a rollover: recorded, holding its note, and
+/// (`burn`) the note burned in the input set, with (`flag`) the burn also
+/// recorded under the request hash. Returns the mint, its folder, the note and
+/// the request, before the input set is retired.
+async fn stuck_rollover(
     name: &str,
     burn: bool,
     flag: bool,
-    later: bool,
-) -> (u16, serde_json::Value, String) {
+) -> (Mint, PathBuf, (Note, Keypair), RolloverRequest) {
     let dir = scratch(name);
     let one = Amount::from_units(1);
     let m = start(&dir, T).await;
@@ -580,6 +579,22 @@ async fn rollover_after_retirement(
         }
     }
     *m.rot.rollovers.lock().unwrap() = Rollovers::open(&dir).unwrap();
+    (m, dir, n, req)
+}
+
+/// A rollover burned before its keyset retired, its answer lost, retried after
+/// the retirement. `burn`: the note was burned before the crash; `flag`: the
+/// burn was also recorded under the request hash; `later`: the retry comes
+/// after the set the outputs name has been deleted too. Returns the status, the
+/// body and the ID of the set that should have signed: the set the request
+/// names while that is still live, else the current one.
+async fn rollover_after_retirement(
+    name: &str,
+    burn: bool,
+    flag: bool,
+    later: bool,
+) -> (u16, serde_json::Value, String) {
+    let (m, _, _, req) = stuck_rollover(name, burn, flag).await;
     m.set_clock(T + 2 * H);
     let after_one: RotationResponse = m.get("/rotation").await;
     assert_eq!(after_one.previous.unwrap().id, req.keyset, "still live");
@@ -619,6 +634,121 @@ async fn a_resumed_rollover_after_retirement_finishes_only_with_stored_proof_of_
     let (code, body, signer) = rollover_after_retirement("proof-late", true, true, true).await;
     assert_eq!(code, 200, "{body}");
     assert_eq!(body["keyset"], signer.as_str(), "signed by the current set");
+}
+
+/// The request with these outputs, every input signed again by its note's key.
+fn resign(mut req: RolloverRequest, keys: &[&Keypair], outs: Vec<MintOutput>) -> RolloverRequest {
+    let h = transaction_sighash(&req.inputs, &outs);
+    for (input, key) in req.inputs.iter_mut().zip(keys) {
+        input.spend_signature = SECP256K1.sign_schnorr(&h, key);
+    }
+    req.outputs = outs;
+    req
+}
+
+/// A rollover and a spend (kind 14) of `n` that name a keyset the mint does not
+/// know are refused `unknown_keyset`, and nothing is issued for them.
+async fn forged_requests_are_refused(m: &Mint, n: &(Note, Keypair), current: &str) {
+    let issued = m.get::<AuditResponse>("/audit").await.issued;
+    let (forged, ..) = rollover(n, Amount::from_units(1024), &"ab".repeat(8), current);
+    let (code, body) = m.post("/rollover", &forged).await;
+    assert_eq!((code, body["code"].as_str()), (400, Some("unknown_keyset")));
+    // The same note in a spend (kind 14): 1024 = 512 of change + 512 paid.
+    let mut spend = PspSpendRequest {
+        input_keysets: forged.input_keysets,
+        inputs: forged.inputs,
+        keyset: current.to_string(),
+        outputs: vec![MintOutput {
+            amount: Amount::from_units(512),
+            ..forged.outputs[0].clone()
+        }],
+        pay: 512,
+        memo: String::new(),
+    };
+    spend.inputs[0].spend_signature = SECP256K1.sign_schnorr(&spend.digest(), &n.1);
+    let (code, body) = m.post("/spend", &spend).await;
+    assert_eq!((code, body["code"].as_str()), (400, Some("unknown_keyset")));
+    assert_eq!(m.get::<AuditResponse>("/audit").await.issued, issued);
+}
+
+#[tokio::test]
+async fn a_burn_proof_left_on_file_serves_no_other_request() {
+    // Fails if the guard lets a request that is not resuming use a proof
+    // (P2-01), whatever the drop does: a crash between a request's finish and
+    // the drop of its proof leaves the proof behind.
+    let (m, dir, n, req) = stuck_rollover("proof-left", true, false).await;
+    m.set_clock(T + 2 * H);
+    let current = m.get::<RotationResponse>("/rotation").await.current.id;
+    // The request is gone from the store; its proof is still on file.
+    *m.rot.rollovers.lock().unwrap() = Rollovers::open(&scratch("proof-left-store")).unwrap();
+    let nonce = hex::encode(n.0.nonce.0.serialize());
+    let file = std::fs::read(dir.join(psp_mint::rotation::RETIRED_FILE)).unwrap();
+    let saved: serde_json::Value = serde_json::from_slice(&file).unwrap();
+    assert_eq!(
+        saved["burn_proofs"],
+        serde_json::json!({ req.hash(): [nonce] })
+    );
+    forged_requests_are_refused(&m, &n, &current).await;
+}
+
+#[tokio::test]
+async fn a_burn_proof_is_kept_for_its_own_request_and_dropped_when_it_finishes() {
+    // Fails if retirement saves the proof where any request can use it (P2-01):
+    // after the stuck request is finished, a new rollover or spend naming the
+    // proven note with a keyset the mint does not know is signed at the largest
+    // denomination without burning anything.
+    let (m, dir, n, req) = stuck_rollover("proof-forged", true, false).await;
+    m.set_clock(T + 2 * H);
+    let current = m.get::<RotationResponse>("/rotation").await.current.id;
+    let proofs = || -> serde_json::Value {
+        let file = std::fs::read(dir.join(psp_mint::rotation::RETIRED_FILE)).unwrap();
+        serde_json::from_slice::<serde_json::Value>(&file).unwrap()["burn_proofs"].clone()
+    };
+    let nonce = hex::encode(n.0.nonce.0.serialize());
+    assert_eq!(proofs(), serde_json::json!({ req.hash(): [nonce] }));
+    assert_eq!(m.post("/rollover", &req).await.0, 200);
+    assert_eq!(proofs(), serde_json::json!({}), "its request is finished");
+    forged_requests_are_refused(&m, &n, &current).await;
+}
+
+#[tokio::test]
+async fn a_rollover_with_a_repeated_or_used_output_blind_nonce_is_refused_before_any_burn() {
+    // Fails if the outputs are checked after the burn (P1-07): the notes are then
+    // burned and the request stays pending, holding them.
+    let one = Amount::from_units(1);
+    let m = start(&scratch("outputs"), T).await;
+    let [a, b, c, d] = [(); 4].map(|_| m.issue(one));
+    let id = m.get::<KeysetsResponse>("/keysets").await.current;
+    // Two notes of one unit into two outputs that share a blind nonce.
+    let (mut req, ..) = rollover(&a, one, &id, &id);
+    let (second, ..) = rollover(&b, one, &id, &id);
+    req.inputs.extend(second.inputs);
+    req.input_keysets.extend(second.input_keysets);
+    let out = req.outputs[0].clone();
+    let twice = resign(req, &[&a.1, &b.1], vec![out.clone(), out]);
+    let (code, body) = m.post("/rollover", &twice).await;
+    assert_eq!(
+        (code, body["code"].as_str()),
+        (400, Some("duplicate_blind_nonce"))
+    );
+    // An output blind nonce the set already signed.
+    let (done, ..) = rollover(&c, one, &id, &id);
+    assert_eq!(m.post("/rollover", &done).await.0, 200);
+    let (again, ..) = rollover(&d, one, &id, &id);
+    let (code, body) = m
+        .post("/rollover", &resign(again, &[&d.1], done.outputs))
+        .await;
+    assert_eq!(
+        (code, body["code"].as_str()),
+        (400, Some("blind_nonce_used"))
+    );
+    let burned = common::burns(&m.base, vec![a.0.nonce, b.0.nonce, d.0.nonce]).await;
+    assert!(burned.iter().all(|n| !n.spent), "nothing burned");
+    assert_eq!(
+        m.rot.rollovers.lock().unwrap().holds().count(),
+        0,
+        "nothing pending"
+    );
 }
 
 #[tokio::test]

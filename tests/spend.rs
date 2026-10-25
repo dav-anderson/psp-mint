@@ -1004,3 +1004,35 @@ async fn a_spend_resumed_after_a_crash_keeps_the_decision_it_was_planned_with() 
     assert_eq!(file.units(), 1);
     assert_genuine(&m, &file);
 }
+
+#[tokio::test]
+async fn a_spend_with_a_used_or_held_output_blind_nonce_is_refused_before_any_burn() {
+    // Fails if the outputs are checked after the burn (P1-07), or if a pending
+    // rollover does not hold its output blind nonces (the same check serves a
+    // rollover, see `rotation.rs`).
+    let dir = scratch("outputs");
+    let m = start(&dir, T).await;
+    let (a, b, c, d) = (m.issue(4), m.issue(4), m.issue(4), m.issue(4));
+    let cur = m.current().await;
+    let first = build(&[(&a, 4, &cur)], &cur, &[2], 2, "first");
+    assert_eq!(m.spend(&first.req).await.0, 200);
+    let mut used = build(&[(&b, 4, &cur)], &cur, &[2], 2, "used");
+    used.req.outputs = first.req.outputs.clone();
+    sign_all(&mut used.req, &[&b]);
+    let (_, body) = m.spend(&used.req).await;
+    assert_eq!(body["code"], "blind_nonce_used", "{body}");
+    // A rollover of `d`, recorded and holding its note and its output.
+    let held = build(&[(&c, 4, &cur)], &cur, &[2], 2, "held");
+    let blind = hex::encode(held.req.outputs[0].blind_nonce.0.serialize());
+    std::fs::write(
+        dir.join(ROLLOVERS_FILE),
+        common::rollovers_file(serde_json::json!({"pending": {"holder": 0},
+            "holds": {"holder": [hex::encode(d.0.nonce.0.serialize())]},
+            "out_holds": {"holder": [blind]}})),
+    )
+    .unwrap();
+    *m.rot.rollovers.lock().unwrap() = Rollovers::open(&dir).unwrap();
+    let (_, body) = m.spend(&held.req).await;
+    assert_eq!(body["code"], "note_held", "{body}");
+    assert_eq!(m.spent(&[&b, &c]).await, vec![false, false]);
+}
