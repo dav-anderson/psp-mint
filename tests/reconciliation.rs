@@ -38,7 +38,7 @@ async fn audit(base: &str) -> serde_json::Value {
 
 fn check(report: &serde_json::Value) {
     // the totals are still there, and the held and forfeited payments are apart
-    assert_eq!(report["issued"], 0);
+    assert_eq!(report["issued"], "0");
     assert!(report.get("outstanding").is_some(), "{report}");
     let recon = &report["reconciliation"];
     assert_eq!(recon["forfeited"]["payments"], 2, "{report}");

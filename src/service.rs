@@ -469,7 +469,7 @@ mod tests {
             self.records.lock().unwrap().get(txid).cloned()
         }
 
-        fn issued_units(&self) -> Amount {
+        fn issued_units(&self) -> u128 {
             self.logic.lock().unwrap().audit_totals().unwrap().0
         }
     }
@@ -575,7 +575,7 @@ mod tests {
         m.run(&[received("aa", 6)], &mut price, &mut count);
         assert_eq!(issued, 1);
         assert_eq!(m.record("aa").unwrap().status, Status::Issued);
-        assert_eq!(m.issued_units(), Amount::from_units(5));
+        assert_eq!(m.issued_units(), 5);
     }
 
     #[test]
@@ -639,7 +639,7 @@ mod tests {
         assert_eq!(m.record("ours").unwrap().status, Status::Issued);
         assert!(m.record("theirs").is_none());
         assert!(m.record("cleartext").is_none());
-        assert_eq!(m.issued_units(), Amount::from_units(5));
+        assert_eq!(m.issued_units(), 5);
     }
 
     #[test]
@@ -797,7 +797,7 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, SettleError::RecordsPoisoned), "{err}");
         assert_eq!(reported, 0, "nothing was settled or reported");
-        assert_eq!(m.issued_units(), Amount::ZERO);
+        assert_eq!(m.issued_units(), 0);
         assert!(records.is_poisoned(), "the lock was not recovered");
     }
 
@@ -835,7 +835,7 @@ mod tests {
         // the mint is needed before the payment is looked at: no record, and
         // nothing was signed
         assert!(m.record("aa").is_none());
-        assert_eq!(m.issued_units(), Amount::ZERO);
+        assert_eq!(m.issued_units(), 0);
 
         // a poisoned rotor lock fails the pass the same way
         let m = Mint::open("poison-rotor");
@@ -859,7 +859,7 @@ mod tests {
             other => panic!("{other}"),
         }
         assert!(m.record("aa").is_none());
-        assert_eq!(m.issued_units(), Amount::ZERO);
+        assert_eq!(m.issued_units(), 0);
     }
 
     #[test]
@@ -969,7 +969,7 @@ mod tests {
         let exact = m.record("exact").unwrap();
         assert_eq!(exact.read_prepaid_units, 1);
         assert_eq!(exact.credit_cents, 0);
-        assert_eq!(m.issued_units(), Amount::from_units(5));
+        assert_eq!(m.issued_units(), 5);
         let held = m.record("held").unwrap();
         assert_eq!(held.read_prepaid_units, 1);
         let rules = held.rules.as_ref().unwrap();

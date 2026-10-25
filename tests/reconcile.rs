@@ -200,7 +200,7 @@ impl World {
 
     /// PSP units issued so far.
     fn issued(&self) -> u64 {
-        self.logic.audit_totals().unwrap().0.units
+        u64::try_from(self.logic.audit_totals().unwrap().0).unwrap()
     }
 
     /// Issue one note and look at the clock, so the first issue is recorded and
@@ -886,14 +886,8 @@ impl Running {
     }
 
     fn issued(&self) -> u64 {
-        self.state
-            .logic
-            .lock()
-            .unwrap()
-            .audit_totals()
-            .unwrap()
-            .0
-            .units
+        let issued = self.state.logic.lock().unwrap().audit_totals().unwrap().0;
+        u64::try_from(issued).unwrap()
     }
 
     fn serve(&self, body: &[u8]) -> Option<Served> {
@@ -998,7 +992,7 @@ fn over_air_an_accepted_request_gets_its_notes_and_a_refused_one_gets_nothing() 
             })
             .expect("genuine");
     }
-    assert_eq!(logic.audit_totals().unwrap().0.units, 3);
+    assert_eq!(logic.audit_totals().unwrap().0, 3);
 }
 
 /// Poison a mutex the way a panicking holder does.
@@ -1146,7 +1140,7 @@ async fn audit_reports_every_reconciliation_figure_with_fees_and_a_duplicate() {
         .json()
         .await
         .unwrap();
-    assert_eq!(report["issued"], 18, "{report}");
+    assert_eq!(report["issued"], "18", "{report}");
     assert_eq!(
         report["reconciliation"],
         serde_json::json!({

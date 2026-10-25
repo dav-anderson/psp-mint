@@ -332,7 +332,7 @@ async fn rotation_keeps_previous_notes_for_one_period_then_they_are_lost() {
     // (b's output, and fresh's output signed by the previous set); a (burned),
     // b and fresh (rolled) redeemed.
     let audit: AuditResponse = m.get("/audit").await;
-    assert_eq!((audit.issued.units, audit.redeemed.units), (5, 3));
+    assert_eq!((audit.issued, audit.redeemed), (5, 3));
 }
 
 #[tokio::test]

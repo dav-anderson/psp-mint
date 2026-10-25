@@ -19,6 +19,6 @@ async fn health_and_audit_name_the_network() {
     assert_eq!(health["status"], "starting");
     let audit = json(format!("{base}/audit")).await;
     assert_eq!(audit["network"], "regtest");
-    assert_eq!(audit["issued"], 0);
-    assert_eq!(audit["outstanding"], 0);
+    assert_eq!(audit["issued"], "0");
+    assert_eq!(audit["outstanding"], "0");
 }

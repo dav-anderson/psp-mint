@@ -394,7 +394,11 @@ pub fn melt_recording_gens(
                 rejected(mint_types::MintInputError::InvalidAmountTier(input.amount))
             })?);
         }
-        total += input.amount;
+        total = total.checked_add(input.amount).ok_or_else(|| {
+            rejected(mint_types::MintInputError::Internal(
+                "the total of the melt does not fit an amount".into(),
+            ))
+        })?;
     }
     let nonces: Vec<Nonce> = inputs.iter().map(|i| i.note.nonce).collect();
     log.record(&nonces, memo)
@@ -718,13 +722,17 @@ struct LimitFor {
 type RotState = (Arc<AppState>, SharedRotating);
 
 /// The totals of the `/audit` body: the units issued, redeemed and still
-/// outstanding over every generation. The handler adds `paid`, `burned` and
-/// `reissued` to the JSON.
+/// outstanding over every generation, `u128`, written as decimal strings (a
+/// JSON number cannot hold one). The handler adds `paid`, `burned` and
+/// `reissued` to the JSON, which are numbers.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct AuditResponse {
-    pub issued: Amount,
-    pub redeemed: Amount,
-    pub outstanding: Amount,
+    #[serde(with = "crate::rotation::decimal")]
+    pub issued: u128,
+    #[serde(with = "crate::rotation::decimal")]
+    pub redeemed: u128,
+    #[serde(with = "crate::rotation::decimal")]
+    pub outstanding: u128,
 }
 
 /// The keys call: the public key for each denomination now in force.
@@ -770,15 +778,21 @@ async fn audit_handler(
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
     let rotor = rotor_of(&rot, &mut logic)?;
     let int = |e| failure(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}"));
+    let overflow = |which: &str| {
+        failure(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("the {which} totals of the generations add up to more than a u128"),
+        )
+    };
     let (mut i, mut d) = logic.audit_totals().map_err(int)?;
     if let Some((_, p)) = &rotor.previous {
         let (pi, pd) = p.audit_totals().map_err(int)?;
-        i += pi;
-        d += pd;
+        i = i.checked_add(pi).ok_or_else(|| overflow("issued"))?;
+        d = d.checked_add(pd).ok_or_else(|| overflow("redeemed"))?;
     }
     let (ri, rd) = rotor.retired_totals();
-    i += Amount::from_units(ri);
-    d += Amount::from_units(rd);
+    i = i.checked_add(ri).ok_or_else(|| overflow("issued"))?;
+    d = d.checked_add(rd).ok_or_else(|| overflow("redeemed"))?;
     // Lock order: the mint, the rotor, then the rollovers (as a rollover does).
     let (paid, burned, reissued) = {
         let store = rot.rollovers.lock().map_err(|_| poisoned())?;
@@ -787,7 +801,7 @@ async fn audit_handler(
     let mut body = serde_json::to_value(AuditResponse {
         issued: i,
         redeemed: d,
-        outstanding: Amount::from_units(i.units.saturating_sub(d.units)),
+        outstanding: i.saturating_sub(d),
     })
     .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     body["paid"] = serde_json::json!(paid);

@@ -1484,7 +1484,7 @@ mod tests {
         }
     }
 
-    fn total(logic: &MintLogic) -> Amount {
+    fn total(logic: &MintLogic) -> u128 {
         logic.audit_totals().unwrap().0
     }
 
@@ -1505,7 +1505,7 @@ mod tests {
         assert_eq!(rec.status, Status::Locked);
         assert!(!rec.issued);
         assert!(!rec.late);
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         assert_eq!(price.asked, 1);
 
         // later runs keep the stored price and do not ask again
@@ -1550,7 +1550,7 @@ mod tests {
         assert!(rec.issued);
         assert_eq!(rec.locked_price_cents, Some(BTC_10K));
         assert_eq!(rec.over_under_bps, Some(0));
-        assert_eq!(total(&logic), Amount::from_units(5));
+        assert_eq!(total(&logic), 5);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1617,7 +1617,7 @@ mod tests {
             run(&logic, &mut records, &r, &mut price),
             Settlement::AlreadySettled(Status::Issued)
         );
-        assert_eq!(total(&logic), Amount::from_units(5));
+        assert_eq!(total(&logic), 5);
         assert_eq!(price.asked, 1);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
@@ -1653,7 +1653,7 @@ mod tests {
             run(&logic, &mut records, &none, &mut price),
             Settlement::AlreadySettled(Status::Rejected)
         );
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1712,7 +1712,7 @@ mod tests {
         assert_eq!(rec.payer_did.as_deref(), Some(DID_HEX));
         assert_eq!(rec.requested_units, 5);
         assert_eq!(rec.value_sats, 4_300);
-        assert_eq!(total(&logic), Amount::from_units(4));
+        assert_eq!(total(&logic), 4);
         // the dropped 1-unit output was not used up
         let decoded = payload::decode(&hex::decode(PAYLOAD_HEX).unwrap()).unwrap();
         assert!(
@@ -1750,7 +1750,7 @@ mod tests {
         assert_eq!(rec.payer_did.as_deref(), Some(DID_HEX));
         assert_eq!(rec.credit_cents, 0);
         assert!(rec.reason.is_some());
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         // it is open on the payer's account (inside its window, counted in
         // /audit's open payments with the bitcoin held for it), not looked at
         // again, and not retried
@@ -1786,7 +1786,7 @@ mod tests {
             ruled(&logic, &mut records, &r, &mut price, &under(strict())),
             Settlement::PaidUnsettled(_)
         ));
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1806,7 +1806,7 @@ mod tests {
         // nothing is owed: no window was opened
         assert!(!rec.is_open());
         assert_eq!(rec.open_until, None);
-        assert_eq!(total(&logic), Amount::from_units(5));
+        assert_eq!(total(&logic), 5);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1831,7 +1831,7 @@ mod tests {
         assert!(rec.open_until.is_some());
         let open = records.reconciliation().open;
         assert_eq!((open.payments, open.credit_cents), (1, 10));
-        assert_eq!(total(&logic), Amount::from_units(5));
+        assert_eq!(total(&logic), 5);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1856,18 +1856,18 @@ mod tests {
             ),
             "the failed write is a records I/O error"
         );
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         assert_eq!(records.get("aa").unwrap().status, Status::Locked);
         // the retry settles it, once
         unblock_records_writes(&dir);
         let issue = issued(run(&logic, &mut records, &settled, &mut price));
         assert_eq!(issue.results.len(), 1);
-        assert_eq!(total(&logic), Amount::from_units(4));
+        assert_eq!(total(&logic), 4);
         assert_eq!(
             run(&logic, &mut records, &settled, &mut price),
             Settlement::AlreadySettled(Status::Issued)
         );
-        assert_eq!(total(&logic), Amount::from_units(4));
+        assert_eq!(total(&logic), 4);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1888,7 +1888,7 @@ mod tests {
             "the failed write is a records I/O error"
         );
         assert_eq!(records.get("aa").unwrap().status, Status::Locked);
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         // still waiting to settle, so the next scan picks it up again
         assert_eq!(records.unsettled(), vec!["aa".to_string()]);
         unblock_records_writes(&dir);
@@ -1925,7 +1925,7 @@ mod tests {
             run(&logic, &mut records, &r, &mut price),
             Settlement::AlreadySettled(Status::PaidUnsettled)
         );
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1948,7 +1948,7 @@ mod tests {
             run(&logic, &mut records, &settled, &mut price),
             Settlement::AlreadySettled(Status::Issued)
         );
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1980,7 +1980,7 @@ mod tests {
         // 3 units requested ($0.30), $0.50 paid: (5 - 3) / 3 = +6666.67 bps, truncated
         assert_eq!(rec.over_under_bps, Some(6666));
         assert!(!logic.is_blind_nonce_used(&point(3)).unwrap());
-        assert_eq!(total(&logic), Amount::from_units(5));
+        assert_eq!(total(&logic), 5);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2267,7 +2267,7 @@ mod tests {
         );
         assert!(!records.get("cc").unwrap().late);
         assert!(matches!(go(&mut records, 3), Settlement::Issued(_)));
-        assert_eq!(total(&logic), Amount::from_units(5));
+        assert_eq!(total(&logic), 5);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2343,7 +2343,7 @@ mod tests {
         assert_eq!(rec.status, Status::Issued);
         assert_eq!(rec.skipped_units, 0);
         assert_eq!(rec.credit_cents, 0);
-        assert_eq!(total(&logic), Amount::from_units(65));
+        assert_eq!(total(&logic), 65);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
 
@@ -2361,7 +2361,7 @@ mod tests {
         let rec = records.get("aa").unwrap();
         assert!(!rec.is_open());
         assert_eq!(rec.open_until, None);
-        assert_eq!(total(&logic), Amount::from_units(65));
+        assert_eq!(total(&logic), 65);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2377,7 +2377,7 @@ mod tests {
         assert_eq!(issue.results.len(), 1);
         assert_eq!(issue.skipped_units, 1);
         assert!(!issue.within_tolerance);
-        assert_eq!(total(&logic), Amount::from_units(64));
+        assert_eq!(total(&logic), 64);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
         // and on the 5-unit request, where no drop fits, it is held
@@ -2388,7 +2388,7 @@ mod tests {
             run(&logic, &mut records, &r, &mut price),
             Settlement::PaidUnsettled(_)
         ));
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         drop(logic);
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2719,7 +2719,7 @@ mod tests {
         assert!(dup.delivery.is_none() && dup.rules.is_none() && dup.open_until.is_none());
         assert_eq!(dup.value_sats, 65_000);
         assert!(!dup.issued);
-        assert_eq!(total(&logic), Amount::ZERO);
+        assert_eq!(total(&logic), 0);
         // it never matches a reconciliation lookup: only the first does
         let did_hex = "07".repeat(33);
         let purchase = records
@@ -2762,7 +2762,7 @@ mod tests {
         let mut price = Price::at(BTC_10K);
         let first = received("aa", 6, 4_300, Some(PAYLOAD_HEX));
         issued(run(&logic, &mut records, &first, &mut price));
-        assert_eq!(total(&logic), Amount::from_units(4));
+        assert_eq!(total(&logic), 4);
         // the same payment again signs nothing more
         assert_eq!(
             run(&logic, &mut records, &first, &mut price),
@@ -2777,7 +2777,7 @@ mod tests {
             run(&logic, &mut records, &second, &mut price),
             Settlement::Rejected(Rejection::DuplicatePayment)
         );
-        assert_eq!(total(&logic), Amount::from_units(4));
+        assert_eq!(total(&logic), 4);
         let dup = records.get("bb").unwrap();
         assert_eq!(dup.status, Status::Rejected);
         assert_eq!(dup.duplicate_of.as_deref(), Some("aa"));

@@ -2,6 +2,18 @@
 
 psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.7.0 (2026-10-25): u128 issued and redeemed totals; /audit totals as decimal strings (ROADMAP item 31, P1-02 and P1-03)
+
+Breaking: `/audit` `issued`, `redeemed` and `outstanding` are strings, `AuditResponse` has `u128` fields, and old data does not open (a sled database with 8-byte totals or a `retired.json` with number totals makes `serve` refuse to start). Start on a new data folder.
+
+- **Fixed: a total that reached `u64::MAX` stopped the mint (P1-02).** The `issued` and `redeemed` totals were `u64` and the audit added the live sets and the retired totals with unchecked `Amount` adds (a panic under the mint locks in a debug build, a wrap in a release build). They are now `u128`: mint-core 0.3.0 stores them as 16 bytes big-endian and adds with checked adds, and the audit and the retired totals sum in `u128` with checked adds under the same lock order (mint, rotor, rollovers). An addition that overflows `u128` is a `500` with a message and writes nothing.
+- **Changed: `/audit` `issued`, `redeemed` and `outstanding` are decimal strings.** `paid`, `burned`, `reissued` and the reconciliation figures stay JSON numbers (spi reads `reissued` as a number). `AuditResponse` has `u128` fields with a string serde. The `outstanding` subtraction is as it was.
+- **Changed: `retired.json` totals are decimal strings** (`Retired` holds `u128`, added with checked adds, and sums are made before the state is changed so an overflow leaves it as it was). A `retired.json` with number totals is not read: `serve` refuses to start and names the file.
+- **Changed: the redeem side is one transaction.** `Store::claim_redeem` (mint-core 0.3.0) marks the nonce and adds the redeemed total in one sled transaction, as `claim_issue` does; `/melt`, a rollover and a spend burn through it. The data of 0.6.2 and earlier does not open (8-byte totals): there is no migration, a clean break. No wire change.
+- **Changed: `Amount` has no `+`.** `/melt` sums in `u128` and refuses a total that does not fit a `u64` before it burns anything (`Amount::checked_add`).
+- Pins: mint-core, mint-types and bdhke `v0.3.0`; sp-wire `v0.5.2`.
+- Tests: 1 added (`audit_totals_are_decimal_strings_past_u64`, over the real `/audit` route); the other `/audit` tests read `issued`, `redeemed` and `outstanding` as strings or `u128`.
+
 ## 0.6.2 (2026-10-24): a burn proof serves only its own request; no output is signed twice (ROADMAP item 31, P2-01 and P1-07)
 
 - **Fixed: a burn proof could be used by any request (P2-01).** At a retirement the mint saved the nonces of notes an unfinished request held that were spent in the retiring set, in one flat list, so a request accepted before the rotation could still finish. Any later rollover or spend naming one of those nonces, with a keyset that was retired or unknown and any amount, skipped the check of the note and was signed. Now a proof is kept under the hash of the request that held the note; only a resumed rollover or spend (its hash is pending), for a note it holds itself, with a proof taken for that request, skips a note of a deleted set. Any other request meets the refusal it would meet anyway (`keyset_retired`, `unknown_keyset`, and for a resumed one `burn_not_proven`). The proofs of a request are written in the same `retired.json` write as the retired ID, before anything is deleted, and dropped when the request finishes (`Rotor::forget_proofs`, called by the server under the same locks). `Rotor::burn_proven` takes the request ID.

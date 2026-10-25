@@ -128,9 +128,9 @@ async fn a_note_can_be_burned_once_over_http() {
         .json()
         .await
         .unwrap();
-    assert_eq!(audit.issued, amount);
-    assert_eq!(audit.redeemed, amount);
-    assert_eq!(audit.outstanding, Amount::ZERO);
+    assert_eq!(audit.issued, u128::from(amount.units));
+    assert_eq!(audit.redeemed, u128::from(amount.units));
+    assert_eq!(audit.outstanding, 0);
 
     // the same request again is a double spend
     let again = http
@@ -147,7 +147,54 @@ async fn a_note_can_be_burned_once_over_http() {
         .json()
         .await
         .unwrap();
-    assert_eq!(audit.redeemed, amount);
+    assert_eq!(audit.redeemed, u128::from(amount.units));
+}
+
+/// `/audit` as a client reads it: the totals are decimal strings (past `u64`
+/// they cannot be JSON numbers), `paid` is still a number.
+#[tokio::test]
+async fn audit_totals_are_decimal_strings_past_u64() {
+    // Fails with the 0.6.2 audit: u64 totals stop issuing at u64::MAX, and the
+    // totals were JSON numbers.
+    let (base, mint) = start("audit-strings").await;
+    let state = &mint.state;
+    let amount = Amount::from_units(4);
+    let (note, keypair) = issued_note(state, amount);
+    for _ in 0..3 {
+        let output = MintOutput {
+            amount: Amount::from_units(1 << 63),
+            blind_nonce: BlindNonce(Keypair::new(SECP256K1, &mut OsRng).public_key()),
+        };
+        let logic = state.logic.lock().unwrap();
+        let key = secp256k1::SecretKey::new(&mut OsRng);
+        logic.issue_with_key(&key, &output).unwrap();
+    }
+    let memo = "audit strings";
+    let request = ks(
+        state,
+        MeltRequest {
+            inputs: vec![melt_input(note, &keypair, amount, memo)],
+            memo: memo.to_string(),
+        },
+    );
+    let melt = reqwest::Client::new()
+        .post(format!("{base}/melt"))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    assert!(melt.status().is_success());
+
+    let audit: serde_json::Value = reqwest::get(format!("{base}/audit"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(audit["issued"], "27670116110564327428", "{audit}");
+    assert_eq!(audit["redeemed"], "4", "{audit}");
+    assert_eq!(audit["outstanding"], "27670116110564327424", "{audit}");
+    assert!(audit["paid"].is_u64(), "{audit}");
 }
 
 #[tokio::test]
@@ -178,7 +225,7 @@ async fn a_burn_is_bound_to_its_memo() {
         .json()
         .await
         .unwrap();
-    assert_eq!(audit.redeemed, Amount::ZERO);
+    assert_eq!(audit.redeemed, 0);
     assert_eq!(
         burns(&base, vec![note.nonce]).await,
         vec![Burn {

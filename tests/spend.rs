@@ -141,7 +141,13 @@ impl Mint {
     /// Issued, redeemed, outstanding and paid, in PSP units.
     async fn totals(&self) -> [u64; 4] {
         let a = self.audit().await;
-        ["issued", "redeemed", "outstanding", "paid"].map(|k| a[k].as_u64().expect(k))
+        let total = |k: &str| a[k].as_str().expect(k).parse().expect(k);
+        [
+            total("issued"),
+            total("redeemed"),
+            total("outstanding"),
+            a["paid"].as_u64().expect("paid"),
+        ]
     }
 
     /// Of what was paid, the units burned and the units reissued, as `/audit`

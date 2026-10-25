@@ -198,17 +198,7 @@ fn a_pass_settles_delivers_and_forfeits_and_saves_the_checkpoint() {
         assert_eq!(records.get("tx2").unwrap().read_prepaid_units, 1);
         assert!(records.get("tx3").is_none());
     }
-    assert_eq!(
-        m.state
-            .logic
-            .lock()
-            .unwrap()
-            .audit_totals()
-            .unwrap()
-            .0
-            .units,
-        5
-    );
+    assert_eq!(m.state.logic.lock().unwrap().audit_totals().unwrap().0, 5);
     // the checkpoint was saved, once every payment was processed
     assert_eq!(
         Checkpoint::load(&m.dir).unwrap(),
@@ -280,15 +270,5 @@ fn a_pass_that_fails_changes_nothing_and_leaves_the_checkpoint_alone() {
     assert_eq!(Checkpoint::load(&m.dir).unwrap(), None);
     assert!(m.records.lock().unwrap().is_empty());
     assert_eq!(std::fs::read(m.records_path()).ok(), records_before);
-    assert_eq!(
-        m.state
-            .logic
-            .lock()
-            .unwrap()
-            .audit_totals()
-            .unwrap()
-            .0
-            .units,
-        0
-    );
+    assert_eq!(m.state.logic.lock().unwrap().audit_totals().unwrap().0, 0);
 }

@@ -225,8 +225,30 @@ struct Retired {
     /// (`Rotor::forget_proofs`). A file written before this shape (a flat list
     /// of nonces) does not parse, and `serve` stops naming the file.
     burn_proofs: BTreeMap<String, std::collections::BTreeSet<String>>,
-    issued: u64,
-    redeemed: u64,
+    /// The issued and redeemed totals of the deleted generations, in units, as
+    /// decimal strings (a `u128` is more than a JSON number can hold). A file
+    /// with these as numbers (written before 0.7.0) does not open, and `serve`
+    /// stops naming the file.
+    #[serde(with = "decimal")]
+    issued: u128,
+    #[serde(with = "decimal")]
+    redeemed: u128,
+}
+
+/// A `u128` written to JSON as a decimal string.
+pub(crate) mod decimal {
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u128, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(D::Error::custom)
+    }
 }
 
 fn load_retired(base: &Path) -> Result<Retired, Box<dyn Error>> {
@@ -398,6 +420,18 @@ impl Rotor {
         Ok(())
     }
 
+    /// The retired totals with a generation's `issued` and `redeemed` added,
+    /// each add checked: an overflow stops the retirement with nothing changed.
+    fn retired_sums(&self, issued: u128, redeemed: u128) -> Result<(u128, u128), Box<dyn Error>> {
+        let issued = (self.retired.issued)
+            .checked_add(issued)
+            .ok_or("the issued total of the deleted generations would overflow")?;
+        let redeemed = (self.retired.redeemed)
+            .checked_add(redeemed)
+            .ok_or("the redeemed total of the deleted generations would overflow")?;
+        Ok((issued, redeemed))
+    }
+
     /// Add a generation's totals to `retired.json` (once), then delete it.
     fn retire(&mut self, epoch: u64) -> Result<(), Box<dyn Error>> {
         if !self.retired.epochs.contains(&epoch) {
@@ -405,11 +439,12 @@ impl Rotor {
             self.take_proofs(&logic)?;
             let (i, d) = logic.audit_totals().map_err(|e| e.to_string())?;
             drop(logic);
+            let (issued, redeemed) = self.retired_sums(i, d)?;
             self.retired.epochs.push(epoch);
             self.retired.ids.push(keys.id);
             self.trim_retired();
-            self.retired.issued = self.retired.issued.saturating_add(i.units);
-            self.retired.redeemed = self.retired.redeemed.saturating_add(d.units);
+            self.retired.issued = issued;
+            self.retired.redeemed = redeemed;
             save_json(&self.base.join(RETIRED_FILE), &self.retired)?;
         }
         delete_gen(&self.base, epoch)
@@ -419,11 +454,12 @@ impl Rotor {
         if !self.retired.epochs.contains(&keys.epoch) {
             self.take_proofs(&logic)?;
             let (i, d) = logic.audit_totals().map_err(|e| e.to_string())?;
+            let (issued, redeemed) = self.retired_sums(i, d)?;
             self.retired.epochs.push(keys.epoch);
             self.retired.ids.push(keys.id.clone());
             self.trim_retired();
-            self.retired.issued = self.retired.issued.saturating_add(i.units);
-            self.retired.redeemed = self.retired.redeemed.saturating_add(d.units);
+            self.retired.issued = issued;
+            self.retired.redeemed = redeemed;
             save_json(&self.base.join(RETIRED_FILE), &self.retired)?;
         }
         drop(logic);
@@ -437,7 +473,7 @@ impl Rotor {
         let now = self.now();
         if self.first_issue.is_none() {
             let issued = current.audit_totals().map_err(|e| e.to_string())?.0;
-            if issued.units > 0 || self.previous.is_some() || self.current.epoch > 0 {
+            if issued > 0 || self.previous.is_some() || self.current.epoch > 0 {
                 save_json(
                     &self.base.join(FIRST_ISSUE_FILE),
                     &FirstIssue { first_issue: now },
@@ -527,7 +563,7 @@ impl Rotor {
     }
 
     /// Issued and redeemed of the retired generations.
-    pub fn retired_totals(&self) -> (u64, u64) {
+    pub fn retired_totals(&self) -> (u128, u128) {
         (self.retired.issued, self.retired.redeemed)
     }
 

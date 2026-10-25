@@ -104,8 +104,8 @@ fn a_snapshot_restores_to_a_mint_with_the_same_audit_and_the_same_spent_notes() 
         assert!(burned.status().is_success(), "{:?}", burned.text());
         audit(base)
     });
-    assert_eq!(before["issued"], serde_json::json!(Amount::from_units(6)));
-    assert_eq!(before["redeemed"], serde_json::json!(four));
+    assert_eq!(before["issued"], "6");
+    assert_eq!(before["redeemed"], "4");
 
     // What `serve` does: every store dropped, then the copy.
     drop(mint);
