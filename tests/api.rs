@@ -12,13 +12,13 @@ use mint_core::state::AppState;
 use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
 };
-use psp_mint::server::{AuditResponse, Burn, BurnsRequest, BurnsResponse, Limits, fatal};
+use psp_mint::server::{AuditResponse, Burn, Limits, fatal};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1};
 use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
 use sp_wire::melt::{MeltRequest, MeltResponse};
 
-use common::PspMint;
+use common::{PspMint, burns};
 
 /// The mint's clock: after it, a mint that has issued would be an hour from its
 /// first rotation.
@@ -186,21 +186,6 @@ async fn a_burn_is_bound_to_its_memo() {
             memo: None
         }]
     );
-}
-
-async fn burns(base: &str, nonces: Vec<Nonce>) -> Vec<Burn> {
-    let response: BurnsResponse = reqwest::Client::new()
-        .post(format!("{base}/burns"))
-        .json(&BurnsRequest { nonces })
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    response.burns
 }
 
 #[tokio::test]

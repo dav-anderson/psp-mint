@@ -13,12 +13,25 @@
 //! empty log.
 //!
 //! The memo is recorded before the burn, with the mint lock held, for every note
-//! that is not yet spent. So a note that is spent was spent by the burn whose
-//! memo is on record, because every burn goes through `/melt` (the PSP mounts no
-//! other way to spend a note) and the lock lets only one run at a time. A burn
-//! that fails after recording leaves a record for a note that is not spent, which
-//! is never reported and is overwritten by the next burn of that note. A note that
-//! is spent with no record (spent before this log existed) reports no memo.
+//! of a `/melt` that has passed every check (keysets, proofs, spend signatures,
+//! no duplicates, unspent, the amount's key). A melt that is refused records
+//! nothing, so a `400` from `/melt` means nothing was burned and nothing was
+//! recorded. The record goes before the burn, not after, so that a crash between
+//! the two leaves a record for notes that are not spent (harmless, and
+//! overwritten by the retry), and never notes that are spent with no record (the
+//! retry would take them for notes spent by someone else).
+//!
+//! Two other calls burn notes without this log: a rollover (kind 5) and a spend
+//! (kind 14). Each of them clears the record of every input that is unspent
+//! (`MeltLog::clear`, under the mint lock, before it burns anything), so that a
+//! note they burn never shows a memo that an earlier `/melt` left on it. A note
+//! that is spent keeps its record: it may be an exchange's real burn.
+//!
+//! So a note that is spent, with a memo on record, was spent by the `/melt`
+//! that recorded the memo: the lock lets one burn run at a time, and every burn
+//! (`/melt`, a rollover, a spend) either records its memo or clears the record
+//! first. A note that is spent with no record (spent by a rollover or a spend, or
+//! before this log existed) reports no memo.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -55,6 +68,9 @@ impl From<io::Error> for MeltLogError {
 fn key(nonce: &Nonce) -> String {
     hex::encode(nonce.0.serialize())
 }
+
+/// The file's name in the network's data folder.
+pub const FILE: &str = "melt_memos.json";
 
 pub struct MeltLog {
     path: PathBuf,
@@ -100,6 +116,24 @@ impl MeltLog {
         self.write(&next)?;
         self.rows = next;
         Ok(())
+    }
+
+    /// Forget the memo of each of these notes, and write the whole file. A note
+    /// with no record is skipped, and nothing is written when none has one.
+    /// Returns how many records went. Nothing is cleared if the write fails.
+    pub fn clear(&mut self, nonces: &[Nonce]) -> Result<usize, MeltLogError> {
+        let mut next = self.rows.clone();
+        let before = next.len();
+        for nonce in nonces {
+            next.remove(&key(nonce));
+        }
+        let gone = before - next.len();
+        if gone == 0 {
+            return Ok(0);
+        }
+        self.write(&next)?;
+        self.rows = next;
+        Ok(gone)
     }
 
     fn write(&self, rows: &BTreeMap<String, String>) -> Result<(), MeltLogError> {

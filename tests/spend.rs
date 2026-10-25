@@ -21,7 +21,9 @@ use psp_mint::rotation::{
     BurnPolicy, PspSpendRequest, PspSpendResponse, REVENUE_DIR, ROLLOVERS_FILE, Rollovers,
     RotationResponse,
 };
-use psp_mint::server::{KeysetsResponse, Limits, PspMeltRequest, SharedRotating};
+use psp_mint::server::{
+    Burn, KeysetsResponse, Limits, PspMeltRequest, SharedMelts, SharedRotating,
+};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, PublicKey, SECP256K1, SecretKey};
 use serde_json::Value;
@@ -53,6 +55,7 @@ struct Mint {
     base: String,
     state: Arc<AppState>,
     rot: SharedRotating,
+    melts: SharedMelts,
     /// The wallet side of the mint's AIR listener. Holds the turn on the shared
     /// AIR server until the mint drops.
     air: common::Air,
@@ -71,6 +74,7 @@ async fn start_with(dir: &Path, clock: u64, limits: Limits) -> Mint {
         base,
         state: Arc::clone(&mint.state),
         rot: Arc::clone(&mint.rot),
+        melts: Arc::clone(&mint.melts),
         air,
     }
 }
@@ -365,6 +369,28 @@ async fn a_spend_with_change_reissues_the_payment_and_signs_the_change() {
     assert_eq!((code, again), (200, body));
     assert_eq!(m.totals().await, [12, 6, 6, 2]);
     assert_eq!(revenue_file(&m.dir, &built.req.hash()), file);
+}
+
+#[tokio::test]
+async fn a_spend_clears_the_stale_memo_of_a_note_it_burns() {
+    // Fails if a spend leaves the memo of an earlier `/melt` on an unspent note it
+    // burns: the note is then reported burned under that memo (P1-01).
+    let m = start(&scratch("memo"), T).await;
+    let note = m.issue(2);
+    let cur = m.current().await;
+    m.melts
+        .lock()
+        .unwrap()
+        .record(&[note.0.nonce], "stale")
+        .unwrap();
+    let built = build(&[(&note, 2, &cur)], &cur, &[1], 1, "pay");
+    let (code, body) = m.spend(&built.req).await;
+    assert_eq!(code, 200, "{body}");
+    let burn = Burn {
+        spent: true,
+        memo: None,
+    };
+    assert_eq!(common::burns(&m.base, vec![note.0.nonce]).await, [burn]);
 }
 
 #[tokio::test]

@@ -18,7 +18,9 @@ use mint_types::{
     Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, melt_sighash, transaction_sighash,
 };
 use psp_mint::rotation::{RolloverRequest, RolloverResponse, Rollovers, RotationResponse, Rotor};
-use psp_mint::server::{AuditResponse, KeysetsResponse, PspMeltRequest, SharedRotating};
+use psp_mint::server::{
+    AuditResponse, Burn, KeysetsResponse, PspMeltRequest, SharedMelts, SharedRotating,
+};
 use rand::rngs::OsRng;
 use secp256k1::{Keypair, SECP256K1, SecretKey};
 use sp_wire::keys::{CheckStateRequest, CheckStateResponse};
@@ -43,6 +45,7 @@ struct Mint {
     base: String,
     state: Arc<AppState>,
     rot: SharedRotating,
+    melts: SharedMelts,
     /// The wallet side of the mint's AIR listener. Holds the turn on the shared
     /// AIR server until the mint drops.
     air: common::Air,
@@ -60,6 +63,7 @@ async fn start_with(dir: &Path, clock: u64, limits: psp_mint::server::Limits) ->
         base,
         state: Arc::clone(&mint.state),
         rot: Arc::clone(&mint.rot),
+        melts: Arc::clone(&mint.melts),
         air,
     }
 }
@@ -472,6 +476,67 @@ async fn one_melt_may_mix_the_current_and_previous_sets() {
     )
     .unwrap();
     assert_eq!(cs.spent, vec![true, true]);
+}
+
+#[tokio::test]
+async fn a_refused_melt_records_no_memo() {
+    // Fails if `/melt` records its memo before it has checked the notes: a refused
+    // melt then leaves its memo on notes that are still unspent (the stale memo of
+    // P1-01). Read from the log itself, since `/burns` shows no memo for an
+    // unspent note.
+    let (one, two) = (Amount::from_units(1), Amount::from_units(2));
+    let m = start(&scratch("memo-refused"), T).await;
+    let old = m.issue(one);
+    m.records_first_issue().await;
+    m.set_clock(T + H);
+    m.records_first_issue().await;
+    let new = m.issue(one);
+    let ids: KeysetsResponse = m.get("/keysets").await;
+    let (prev, cur) = (ids.previous.clone().unwrap(), ids.current);
+    // A note worth 1 claimed as 2: refused on the current keyset...
+    let (code, body) = m.post("/melt", &melt(&[new], two, "claim", &[&cur])).await;
+    assert_eq!(code, 400, "{body}");
+    // ...and in a melt of a previous-keyset note and that same current one.
+    let (code, body) = m
+        .post("/melt", &melt(&[old, new], two, "claim", &[&prev, &cur]))
+        .await;
+    assert_eq!(code, 400, "{body}");
+    let log = m.melts.lock().unwrap();
+    assert_eq!((log.get(&old.0.nonce), log.get(&new.0.nonce)), (None, None));
+}
+
+#[tokio::test]
+async fn a_rollover_clears_the_stale_memo_of_a_note_and_keeps_a_real_burns() {
+    // Fails if a rollover leaves the memo of an earlier `/melt` on an unspent note
+    // it burns (the note is then reported burned under that memo), or clears the
+    // memo of a note that was already spent by a melt.
+    let one = Amount::from_units(1);
+    let m = start(&scratch("memo-rollover"), T).await;
+    let (stale, real) = (m.issue(one), m.issue(one));
+    m.records_first_issue().await;
+    let id = m.get::<KeysetsResponse>("/keysets").await.current;
+    // What a refused melt, or a crash between a melt's record and its burn, left.
+    m.melts
+        .lock()
+        .unwrap()
+        .record(&[stale.0.nonce], "stale")
+        .unwrap();
+    assert_eq!(
+        m.post("/melt", &melt(&[real], one, "real", &[&id])).await.0,
+        200
+    );
+    let (req, ..) = rollover(&stale, one, &id, &id);
+    assert_eq!(m.post("/rollover", &req).await.0, 200);
+    let (req, ..) = rollover(&real, one, &id, &id);
+    assert_eq!(m.post("/rollover", &req).await.0, 400, "already spent");
+    let spent = |memo: Option<&str>| Burn {
+        spent: true,
+        memo: memo.map(String::from),
+    };
+    assert_eq!(
+        common::burns(&m.base, vec![stale.0.nonce, real.0.nonce]).await,
+        [spent(None), spent(Some("real"))]
+    );
 }
 
 /// A rollover burned before its keyset retired, its answer lost, retried after

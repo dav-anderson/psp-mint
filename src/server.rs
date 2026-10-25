@@ -73,11 +73,16 @@ use crate::rotation::{
 pub use sp_wire::psp::{Burn, BurnsRequest, BurnsResponse, KeysetsResponse, PspMeltRequest};
 
 /// Key rotation, when the mint has it: the previous generation and the
-/// rollover answers. Always locked while holding the mint lock, so they
-/// cannot deadlock with each other or the burn memos.
+/// rollover answers, and the burn memos that a rollover and a spend clear. Always
+/// locked while holding the mint lock, in this order: the mint, the burn memos,
+/// the rotor, the rollovers. So they cannot deadlock with each other.
 pub struct Rotating {
     pub rotor: Mutex<Rotor>,
     pub rollovers: Mutex<Rollovers>,
+    /// The burn memos, opened from the data folder beside the rollovers file. An
+    /// unreadable file is kept as the reason, so that `new` can stay infallible:
+    /// `serve` asks for the log at start-up (`melts`) and stops there.
+    melts: Result<SharedMelts, String>,
     /// The network's data folder (where the rollovers file is). Read without a
     /// lock: a spend looks for the SPI's wallet balance figure there before it
     /// takes any.
@@ -88,15 +93,27 @@ pub type SharedRotating = Arc<Rotating>;
 impl Rotating {
     pub fn new(rotor: Rotor, rollovers: Rollovers) -> SharedRotating {
         let dir = rollovers.dir();
+        let melts = MeltLog::open(&dir.join(crate::melts::FILE))
+            .map(|log| Arc::new(Mutex::new(log)))
+            .map_err(|e| e.to_string());
         Arc::new(Rotating {
             rotor: Mutex::new(rotor),
             rollovers: Mutex::new(rollovers),
+            melts,
             dir,
         })
     }
+
+    /// The burn memos, the one log that `/melt`, a rollover and a spend share (the
+    /// rollover and the spend call arrive over AIR, which has no other way to
+    /// reach it). The reason, if the file could not be read.
+    pub fn melts(&self) -> Result<&SharedMelts, String> {
+        self.melts.as_ref().map_err(String::clone)
+    }
 }
 
-/// The burn memos, shared by the handlers. Lock order: the mint first, then this.
+/// The burn memos, shared by the handlers. Lock order: the mint first, then this,
+/// then the rotor and the rollovers.
 pub type SharedMelts = Arc<Mutex<MeltLog>>;
 
 /// Wrap a mint for the API and the scanner to share.
@@ -310,14 +327,16 @@ pub enum MeltFailure {
 /// Burn `inputs` bound to `memo`, and keep the memo of the burn, over the
 /// current generation and, when the mint rotates, the previous one.
 ///
-/// The memo is written, and synced, for every input that is not yet spent,
-/// before the mint burns anything. The caller holds the mint lock across the
-/// whole call, so no other burn can come between the record and the burn.
-///
-/// A melt whose notes are all current is mint-core's `melt`. One with notes of
-/// the previous set is checked whole first (each note against its own set and
-/// spent list, every spend signature over the one `melt_sighash`), then each
-/// note is burned in its own set.
+/// Every check is made first, for every input, with nothing written: the keyset
+/// (`on_previous` says which generation each input is on), the note's proof, its
+/// spend signature over the one `melt_sighash`, no duplicate, unspent in its
+/// generation, and the key of its amount. A failed check is
+/// `MeltFailure::Rejected`: nothing was recorded and nothing was burned. Then the
+/// memo is written, and synced, for every input; then the mint burns them. After
+/// the checks a failure can only be a fault of the store, `MeltFailure::Internal`
+/// (a note that is spent, a fault of the memo file, or of the mint's store). The
+/// caller holds the mint lock across the whole call, so no other burn can come
+/// between the checks, the record and the burn.
 pub fn melt_recording_gens(
     logic: &MintLogic,
     previous: Option<(
@@ -331,64 +350,64 @@ pub fn melt_recording_gens(
     on_previous: &[bool],
 ) -> Result<Amount, MeltFailure> {
     let internal = |e: String| MeltFailure::Internal(e);
+    let rejected = |e: mint_types::MintInputError| MeltFailure::Rejected(e.to_string());
+    if inputs.is_empty() {
+        // The refusal mint-core's `melt` gives, kept as it was.
+        return Err(rejected(mint_types::MintInputError::Internal(
+            "melt requires at least one input".into(),
+        )));
+    }
     // Each input is on the generation its keyset names.
-    let in_prev: Vec<bool> = on_previous.to_vec();
     let gen_of = |k: usize| {
-        if in_prev[k] {
+        if on_previous[k] {
             previous.expect("checked").2
         } else {
             logic
         }
     };
-    let mut unspent = Vec::with_capacity(inputs.len());
-    for (k, input) in inputs.iter().enumerate() {
-        let nonce = input.note.nonce;
-        if !gen_of(k)
-            .is_spent(nonce)
-            .map_err(|e| internal(e.to_string()))?
-        {
-            unspent.push(nonce);
-        }
-    }
-    if !in_prev.iter().any(|p| *p) {
-        log.record(&unspent, memo)
-            .map_err(|e| internal(e.to_string()))?;
-        return logic
-            .melt(inputs, memo.as_bytes())
-            .map_err(|e| MeltFailure::Rejected(e.to_string()));
-    }
-    let (ckeys, pkeys, _) = previous.expect("some input is on it");
     let sighash = mint_types::melt_sighash(inputs, memo.as_bytes());
     let mut seen = std::collections::HashSet::new();
     let mut total = Amount::ZERO;
+    // The key of each input's amount, for a melt with a note on the previous
+    // generation (the burn below uses it). A melt of current notes only is
+    // mint-core's `melt`, which looks the key up itself.
+    let mixed = on_previous.iter().any(|p| *p);
+    let mut keys: Vec<&secp256k1::SecretKey> = Vec::with_capacity(inputs.len());
     for (k, input) in inputs.iter().enumerate() {
         let g = gen_of(k);
-        g.verify_note(input)
-            .map_err(|e| MeltFailure::Rejected(e.to_string()))?;
+        g.verify_note(input).map_err(rejected)?;
         g.verify_spend_authorization(input, sighash)
-            .map_err(|e| MeltFailure::Rejected(e.to_string()))?;
-        if !seen.insert(input.note.nonce) || !unspent.contains(&input.note.nonce) {
-            return Err(MeltFailure::Rejected(
-                mint_types::MintInputError::SpentCoin.to_string(),
-            ));
+            .map_err(rejected)?;
+        let spent = g
+            .is_spent(input.note.nonce)
+            .map_err(|e| internal(e.to_string()))?;
+        if !seen.insert(input.note.nonce) || spent {
+            return Err(rejected(mint_types::MintInputError::SpentCoin));
+        }
+        if mixed && let Some((current_keys, previous_keys, _)) = previous {
+            let set = if on_previous[k] {
+                previous_keys
+            } else {
+                current_keys
+            };
+            keys.push(set.sk.get(&input.amount).ok_or_else(|| {
+                rejected(mint_types::MintInputError::InvalidAmountTier(input.amount))
+            })?);
         }
         total += input.amount;
     }
-    log.record(&unspent, memo)
+    let nonces: Vec<Nonce> = inputs.iter().map(|i| i.note.nonce).collect();
+    log.record(&nonces, memo)
         .map_err(|e| internal(e.to_string()))?;
+    if !mixed {
+        return logic
+            .melt(inputs, memo.as_bytes())
+            .map_err(|e| internal(e.to_string()));
+    }
     for (k, input) in inputs.iter().enumerate() {
-        let (g, keys) = if in_prev[k] {
-            (gen_of(k), pkeys)
-        } else {
-            (logic, ckeys)
-        };
-        let sk = keys.sk.get(&input.amount).ok_or_else(|| {
-            MeltFailure::Rejected(
-                mint_types::MintInputError::InvalidAmountTier(input.amount).to_string(),
-            )
-        })?;
-        g.redeem_with_key(sk, input, sighash)
-            .map_err(|e| MeltFailure::Rejected(e.to_string()))?;
+        gen_of(k)
+            .redeem_with_key(keys[k], input, sighash)
+            .map_err(|e| internal(e.to_string()))?;
     }
     Ok(total)
 }
@@ -447,6 +466,13 @@ fn poisoned() -> ApiFailure {
     failure(
         StatusCode::INTERNAL_SERVER_ERROR,
         "the mint lock is poisoned",
+    )
+}
+
+fn poisoned_memos() -> ApiFailure {
+    failure(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the burn memos lock is poisoned",
     )
 }
 
@@ -861,7 +887,9 @@ where
 /// (`server.*_max_request_bytes`, the same ones `/melt` and `/burns` have).
 /// `records` is the settlement records, shared with the scan thread: kind 15
 /// reconciles payments in them. Lock order: the records, then the mint, then the
-/// rotor.
+/// burn memos (`Rotating::melts`), then the rotor, then the rollovers. A rollover
+/// and a spend clear the memos of the notes they are about to burn (kinds 5 and
+/// 14), as `/melt` records them (see `melts`).
 pub fn air_served_with(
     state: &AppState,
     rot: &SharedRotating,
@@ -1017,10 +1045,50 @@ fn reconcile_served(
     }
 }
 
+/// Before a rollover or a spend burns anything: forget the burn memo of every
+/// one of these notes that is unspent now, the same notes `/melt` records. A
+/// rollover and a spend burn without recording a memo, so a memo that an earlier
+/// `/melt` left on a note (a refused melt, or a crash between its record and its
+/// burn) would otherwise be reported for the note once they spend it, as if an
+/// exchange had. The caller holds the mint lock, the burn memos and the rotor,
+/// and keeps the mint lock through the burn: a note that is unspent here and
+/// spent afterwards was burned by that call. A note that is already spent keeps
+/// its memo (an exchange's real burn needs it to be retried). A crash after the
+/// clear and before the burn leaves an unspent note with no memo, which is
+/// harmless.
+fn forget_memos(
+    logic: &MintLogic,
+    rotor: &Rotor,
+    log: &mut MeltLog,
+    nonces: impl Iterator<Item = Nonce>,
+) -> Result<(), ApiFailure> {
+    let prev = rotor.previous.as_ref().map(|(_, l)| l);
+    let mut unspent = Vec::new();
+    for nonce in nonces {
+        if !spent_in(logic, prev, nonce)
+            .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        {
+            unspent.push(nonce);
+        }
+    }
+    log.clear(&unspent)
+        .map(|_| ())
+        .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
+/// The burn memos of this mint, which a rollover and a spend share with `/melt`.
+/// The caller locks them after the mint and before the rotor and the rollovers
+/// (see `Rotating`).
+fn memos_of(rot: &SharedRotating) -> Result<&SharedMelts, ApiFailure> {
+    rot.melts()
+        .map_err(|e| failure(StatusCode::INTERNAL_SERVER_ERROR, e))
+}
+
 /// The rollover call: move notes of the previous (or current) keyset to fresh
 /// notes of the same amounts on the current keyset. The answer is stored by
 /// request hash before any note is marked spent, so a resend returns the same
-/// stored answer and a crash in the middle is finished by the next resend.
+/// stored answer and a crash in the middle is finished by the next resend. The
+/// burn memos of the notes that are unspent are cleared first (`forget_memos`).
 fn rollover_response(
     state: &AppState,
     rot: &SharedRotating,
@@ -1028,7 +1096,19 @@ fn rollover_response(
     max_notes: usize,
 ) -> Result<crate::rotation::RolloverResponse, ApiFailure> {
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let melts = memos_of(rot)?;
+    let mut log = melts.lock().map_err(|_| poisoned_memos())?;
     let rotor = rotor_of(rot, &mut logic)?;
+    // A request over the ceiling is refused below, before it burns anything.
+    if req.inputs.len() <= max_notes {
+        forget_memos(
+            &logic,
+            &rotor,
+            &mut log,
+            req.inputs.iter().map(|i| i.note.nonce),
+        )?;
+    }
+    drop(log);
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
     match crate::rotation::rollover(&logic, &rotor, &mut store, req, max_notes) {
         Ok(a) => Ok(a),
@@ -1049,7 +1129,8 @@ fn rollover_response(
 /// The spend call (kind 14): notes in, change out, an amount paid and burned.
 /// The answer is stored by request hash before the reply is made, so a resend
 /// returns the same stored answer and a crash in the middle is finished by the
-/// next resend (see `rotation::spend`).
+/// next resend (see `rotation::spend`). The burn memos of the notes that are
+/// unspent are cleared first (`forget_memos`), as a rollover's are.
 fn spend_response(
     state: &AppState,
     rot: &SharedRotating,
@@ -1070,7 +1151,16 @@ fn spend_response(
         None
     };
     let mut logic = state.logic.lock().map_err(|_| poisoned())?;
+    let melts = memos_of(rot)?;
+    let mut log = melts.lock().map_err(|_| poisoned_memos())?;
     let rotor = rotor_of(rot, &mut logic)?;
+    forget_memos(
+        &logic,
+        &rotor,
+        &mut log,
+        req.inputs.iter().map(|i| i.note.nonce),
+    )?;
+    drop(log);
     let mut store = rot.rollovers.lock().map_err(|_| poisoned())?;
     crate::rotation::spend(&logic, &rotor, &mut store, req, max_items, burn, figure)
         .map_err(spend_failure)
@@ -1098,7 +1188,8 @@ fn spend_failure(e: SpendError) -> ApiFailure {
 /// keysets, rotation, rollover, check-state, spend, reconcile) are not routes:
 /// they are answered over AIR (`air_served_with`). The ceilings are the ones a
 /// reload changes: each request on `/melt` and `/burns` is held to the ceiling
-/// in `limits` when it arrives.
+/// in `limits` when it arrives. `melts` is `rot`'s own log (`Rotating::melts`);
+/// any other is refused with a panic at start-up.
 pub fn router_live(
     state: Arc<AppState>,
     health: Arc<Health>,
@@ -1107,6 +1198,12 @@ pub fn router_live(
     rot: SharedRotating,
     records: PathBuf,
 ) -> Router {
+    // A rollover and a spend (answered over AIR from `rot`) clear the memos that
+    // `/melt` records, so the two must be one log, not two copies of one file.
+    assert!(
+        rot.melts().is_ok_and(|own| Arc::ptr_eq(own, &melts)),
+        "router_live: `melts` must be the burn memos of `rot` (`Rotating::melts`)"
+    );
     let audit_network = health.network().to_string();
     let audit_records = Arc::new(records);
     let health_routes = Router::new()

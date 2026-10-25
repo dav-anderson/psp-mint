@@ -22,7 +22,7 @@
 //!
 //! [`PspMint`] is the mint as `psp-mint serve` builds it (`Settings::open_mint`
 //! and `serve`): a `Rotor` and its `Rollovers` behind a `Rotating`, the settlement
-//! records shared with the listener, the burn memos, and a `Health` with a
+//! records shared with the listener, the burn memos (`Rotating::melts`), and a `Health` with a
 //! network. Every integration test that needs a mint builds it here, so none of
 //! them tests a shape production does not run.
 
@@ -35,7 +35,6 @@ use std::thread::{self, JoinHandle};
 
 use mint_core::state::AppState;
 use psp_mint::air_listener::{self, Serve, Settings};
-use psp_mint::melts::MeltLog;
 use psp_mint::records::{Records, SharedRecords};
 use psp_mint::rotation::{Rollovers, Rotor};
 use psp_mint::server::{self, Health, Limits, Rotating, SharedMelts, SharedRotating};
@@ -324,6 +323,22 @@ pub struct PspMint {
     pub limits: Limits,
 }
 
+/// What `/burns` says of these notes, in order, from the mint's HTTP API at `base`.
+pub async fn burns(base: &str, nonces: Vec<mint_types::Nonce>) -> Vec<server::Burn> {
+    let response: server::BurnsResponse = reqwest::Client::new()
+        .post(format!("{base}/burns"))
+        .json(&server::BurnsRequest { nonces })
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    response.burns
+}
+
 /// A folder of its own for one test mint, empty.
 pub fn mint_dir(name: &str) -> PathBuf {
     static N: AtomicU64 = AtomicU64::new(0);
@@ -367,14 +382,13 @@ impl PspMint {
         let records: SharedRecords = Arc::new(Mutex::new(
             Records::open(&dir.join("settlements.json")).unwrap(),
         ));
+        let melts = Arc::clone(rot.melts().unwrap());
         PspMint {
             dir: dir.to_path_buf(),
             state: server::app_state(logic),
             rot,
             records,
-            melts: Arc::new(Mutex::new(
-                MeltLog::open(&dir.join("melt_memos.json")).unwrap(),
-            )),
+            melts,
             health: Health::for_network(100, NETWORK),
             limits,
         }

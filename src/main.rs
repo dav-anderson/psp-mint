@@ -12,7 +12,6 @@ use mint_core::state::AppState;
 use mint_types::Amount;
 use psp_mint::config::{self, Config};
 use psp_mint::delivery::Deliverer;
-use psp_mint::melts::MeltLog;
 use psp_mint::network::{self, Network};
 use psp_mint::price::Lazy;
 use psp_mint::records::{Records, SharedRecords};
@@ -344,9 +343,9 @@ impl Process {
             settings.config.health_stale_after_secs(),
             settings.config.network.name(),
         );
-        let melts: server::SharedMelts = Arc::new(Mutex::new(MeltLog::open(
-            &settings.data_dir.join("melt_memos.json"),
-        )?));
+        // The burn memos are opened with the rotation (a rollover and a spend over
+        // AIR clear them, `/melt` records them); an unreadable file stops serve here.
+        let melts: server::SharedMelts = Arc::clone(rot.melts()?);
 
         // The AIR listener answers wallets' requests, on a thread of its own.
         let air_thread = start_air_listener(
