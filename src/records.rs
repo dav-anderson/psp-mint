@@ -12,9 +12,10 @@
 //! written to its claim key (`delivery`) and what became of the claim. The
 //! claim window belongs to the record only from the moment the owed record is
 //! stored on AIR (`landed_at`, `open_until`; [`Records::land`]). A file from
-//! psp-mint 0.7.x, or from an earlier build of 0.8.0 (a bare object from txid to
-//! record, or a `pruned` list of bare txids), does not read and the mint does not
-//! start on it; it is not migrated (see the CHANGELOG).
+//! psp-mint 0.7.x, or from 0.8.0 or an earlier build of it (a bare object from
+//! txid to record, a `pruned` list of bare txids, or `pruned.totals` without
+//! `abandoned`), does not read and the mint does not start on it; it is not
+//! migrated (see the CHANGELOG).
 //!
 //! **Retention.** The file is rewritten whole on every change, so it must not
 //! grow without limit. [`Records::prune`] removes, `settle.retention_days` after
@@ -263,13 +264,18 @@ pub struct Claims {
     /// Claimed: the notes were signed and the answer stored.
     pub claimed: Tally,
     /// Unclaimed and not expired: owed and claimable, or claimed and being
-    /// finished.
+    /// finished. Not a payment whose owed record the mint gave up on: that is
+    /// `abandoned`.
     pub unclaimed: Tally,
     /// Their claim window closed unclaimed; the mint keeps the payment.
     pub expired: Tally,
     /// Kept with nothing owed: no readable payload, or nothing left after the
     /// prepaid costs. Apart from `expired`.
     pub kept: Tally,
+    /// Owed, but the owed record could never be written (its cell holds another
+    /// record, or its claim DID cannot be sealed to): the payer cannot claim it.
+    /// The mint keeps the payment. Apart from `unclaimed`, which is claimable only.
+    pub abandoned: Tally,
     /// Cents kept by rounding the units owed down, over every owed payment.
     pub subunit_kept_cents: u64,
     /// PSP units of the prepaid reads, over the claimed payments. Revenue.
@@ -314,6 +320,12 @@ impl Claims {
                     &mut self.claimed
                 } else if record.expired_at.is_some() {
                     &mut self.expired
+                } else if record
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|d| d.abandoned.is_some() && !d.delivered)
+                {
+                    &mut self.abandoned
                 } else {
                     &mut self.unclaimed
                 }
@@ -333,6 +345,7 @@ impl Claims {
             unclaimed: self.unclaimed.plus(other.unclaimed),
             expired: self.expired.plus(other.expired),
             kept: self.kept.plus(other.kept),
+            abandoned: self.abandoned.plus(other.abandoned),
             subunit_kept_cents: self
                 .subunit_kept_cents
                 .saturating_add(other.subunit_kept_cents),
@@ -1242,7 +1255,7 @@ mod tests {
         r.put("gave-up", abandoned(0, 6_000_000)).unwrap();
         let totals = |r: &Records| {
             let c = r.claims();
-            (c.kept, c.unclaimed, c.subunit_kept_cents)
+            (c.kept, c.abandoned, c.unclaimed, c.subunit_kept_cents)
         };
         let before = (
             Tally {
@@ -1255,6 +1268,7 @@ mod tests {
                 sats: 5_000,
                 units: 5,
             },
+            Tally::default(),
             4,
         );
         assert_eq!(totals(&r), before);

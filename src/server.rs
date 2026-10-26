@@ -24,8 +24,9 @@
 //! - `GET /audit`: issued, redeemed and outstanding totals, `paid` (the PSP units
 //!   burned as payments by PSP spends, kept apart from every other burn), `network`,
 //!   and `claims`, read from the settlement records: the owed payments that
-//!   were claimed, those still unclaimed and those that expired, each as payments,
-//!   sats and units, the payments kept with nothing owed, the sub-unit amount kept
+//!   were claimed, those still unclaimed (claimable), those that expired and those
+//!   abandoned (the owed record could never be written), each as payments, sats
+//!   and units, the payments kept with nothing owed, the sub-unit amount kept
 //!   by rounding and the prepaid costs (see `records::Claims`).
 //! - `GET /health`: `200` while the scanner is keeping up and the mint lock is
 //!   sound, `503` otherwise, with the time of the last successful scan.
@@ -263,8 +264,10 @@ async fn health_handler(
 
 /// Add `"claims"` to a JSON object reply (`/audit`): the owed payments that were
 /// claimed, those still open (owed and not claimed, whether or not the record is
-/// stored on AIR yet) and those that expired (the window closed unclaimed; the mint
-/// keeps the BTC), each as payments, sats and units, with the payments kept at the
+/// stored on AIR yet), those that expired (the window closed unclaimed; the mint
+/// keeps the BTC) and those abandoned (the owed record could never be written, so
+/// the payer cannot claim; the mint keeps the BTC), each as payments, sats and
+/// units, with the payments kept at the
 /// lock, the sub-unit amount kept by rounding and the prepaid costs. The totals
 /// include the payments pruned from the file (`settle.retention_days`), so they do
 /// not shrink. Kept apart from the issued, redeemed and outstanding totals. The records file is read when the report is asked for, so
@@ -1223,7 +1226,7 @@ fn spend_failure(e: SpendError) -> ApiFailure {
 
 /// The API: `/melt`, `/burns`, `/audit` and `/health`. `/audit` spans both live
 /// key sets and the deleted ones, and carries `claims` (the payments claimed,
-/// unclaimed and expired, the sub-unit amount kept and the prepaid costs), read from the settlement
+/// unclaimed, expired and abandoned, the sub-unit amount kept and the prepaid costs), read from the settlement
 /// records file at `records` when it is asked for. The wallet-facing calls (keys,
 /// keysets, rotation, rollover, check-state, spend, claim) are not routes:
 /// they are answered over AIR (`air_served_with`). The ceilings are the ones a

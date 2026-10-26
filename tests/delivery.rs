@@ -414,8 +414,9 @@ fn an_abandoned_payment_is_pruned_after_the_retention_and_not_owed_again() {
             .abandoned_at,
         Some(LAND)
     );
-    let before = e.records().claims().unclaimed;
+    let before = e.records().claims().abandoned;
     assert_eq!((before.payments, before.sats, before.units), (1, 700, 7));
+    assert_eq!(e.records().claims().unclaimed.payments, 0);
 
     // 90 days less a second after it was given up on: still there
     let early = e
@@ -430,8 +431,9 @@ fn an_abandoned_payment_is_pruned_after_the_retention_and_not_owed_again() {
     assert_eq!(on_time.removed, 1);
     assert!(e.records().get("tx1").is_none());
     assert!(e.records().was_pruned("tx1"));
-    let after = e.records().claims().unclaimed;
+    let after = e.records().claims().abandoned;
     assert_eq!((after.payments, after.sats, after.units), (1, 700, 7));
+    assert_eq!(e.records().claims().unclaimed.payments, 0);
     // the scan lists it again: nothing is made
     assert_eq!(e.owe("tx1", 700, &payer), Settlement::Pruned);
     assert!(e.records().get("tx1").is_none());

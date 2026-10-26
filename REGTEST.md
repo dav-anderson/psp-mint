@@ -178,7 +178,7 @@ curl -s http://127.0.0.1:3000/audit
 curl -s http://127.0.0.1:3000/health
 ```
 
-(The mint's keys are not on HTTP: a wallet asks for them over AIR.) `/audit` shows `issued`, `redeemed` and `outstanding`, and a `claims` section with the payments claimed, still claimable (`unclaimed`) and expired, each with payments, sats and units, then the ones kept with nothing owed and the sub-unit amount kept. To watch a payment move through, send one (step 5), mine 1 block (step 6) and wait for a scan: the server prints `price locked at ... USD/BTC, N unit(s) owed once it has 3 confirmations (it has 1)`. Mine 2 more blocks and after the next scan it prints the owed record and writes it to the AIR server. A wallet then claims it over AIR, and `/audit` shows the issued total. Stop it with Ctrl-C.
+(The mint's keys are not on HTTP: a wallet asks for them over AIR.) `/audit` shows `issued`, `redeemed` and `outstanding`, and a `claims` section with the payments claimed, still claimable (`unclaimed`), expired and abandoned (the owed record could never be written), each with payments, sats and units, then the ones kept with nothing owed and the sub-unit amount kept. To watch a payment move through, send one (step 5), mine 1 block (step 6) and wait for a scan: the server prints `price locked at ... USD/BTC, N unit(s) owed once it has 3 confirmations (it has 1)`. Mine 2 more blocks and after the next scan it prints the owed record and writes it to the AIR server. A wallet then claims it over AIR, and `/audit` shows the issued total. Stop it with Ctrl-C.
 
 Scan failures (for example the node being down) are printed and retried on the next interval. Payments that are already settled are not printed again.
 

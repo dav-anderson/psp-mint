@@ -1,12 +1,15 @@
-//! `/audit` shows the claimed, unclaimed and expired payments apart from the
+//! `/audit` shows the claimed, unclaimed, expired and abandoned payments apart from the
 //! issued, redeemed and outstanding totals, as `serve` builds the router (`router_live`,
 //! with the mint's settlement records). Over a real server on a local port.
 
 mod common;
 
-use psp_mint::records::{Claimed, Record, Records, Status};
+use psp_mint::records::{Claimed, Delivery, Record, Records, Status};
 use psp_mint::server::Limits;
-use sp_wire::psp::{ClaimResponse, KeysetsResponse};
+use sp_wire::air_request::delivery::{
+    ClaimTerms, EXPIRY_NOTICE, Outcome, Owed, SEND_PURCHASE_CLAIM,
+};
+use sp_wire::psp::{CLAIM_WINDOW_SECS, ClaimResponse, KeysetsResponse};
 
 /// The claim window, 30 days, written out.
 const WINDOW: u64 = 2_592_000;
@@ -140,4 +143,72 @@ async fn audit_totals_do_not_shrink_when_claimed_and_expired_payments_are_pruned
     // and the file a restart reads gives the same figures
     let reopened = Records::open(&m.records_path()).unwrap();
     assert_eq!(serde_json::to_value(reopened.claims()).unwrap(), after);
+}
+
+/// An owed payment of 50,000 sats and 400 units whose owed record the mint gave
+/// up on at `at`: the cell of its claim key holds another record, so the record
+/// can never be written and the payer cannot claim.
+fn abandoned(at: u64) -> Record {
+    let mut r = Record::locked(10_000_000, false, 50_000);
+    r.status = Status::Owed;
+    r.value_units = 400;
+    r.due_units = 400;
+    r.delivery = Some(Delivery {
+        claim_did: "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into(),
+        index: 0,
+        outcome: Outcome::Owed(Owed {
+            txid: "aa".repeat(32),
+            paid_sats: 50_000,
+            value_units: 400,
+            terms: ClaimTerms {
+                send: SEND_PURCHASE_CLAIM.to_string(),
+                kind: 15,
+                due_units: 400,
+                read_prepaid_units: 0,
+                write_prepaid_units: 0,
+                window_secs: CLAIM_WINDOW_SECS,
+                max_attempts: 2,
+                on_expiry: EXPIRY_NOTICE.to_string(),
+            },
+        }),
+        sealed: None,
+        delivered: false,
+        abandoned: Some("the cell holds another record".into()),
+        abandoned_at: Some(at),
+    });
+    r
+}
+
+/// An abandoned payment is counted under `abandoned`, with its sats and units,
+/// and not under `unclaimed`; the same figures stand after retention removes it.
+/// Fails if `Claims::add` counts it as unclaimed, or if the pruned aggregate puts
+/// its share anywhere else.
+#[tokio::test]
+async fn an_abandoned_payment_is_counted_apart_from_unclaimed_and_stays_so_after_pruning() {
+    const RETENTION: u64 = 7_776_000;
+    const HORIZON: u64 = 18_144_000;
+    let m = common::PspMint::open("audit-abandoned", 1_800_000_000, Limits::default());
+    m.records
+        .lock()
+        .unwrap()
+        .put("gave-up", abandoned(1_000))
+        .unwrap();
+    let base = m.http().await;
+    let none = serde_json::json!({"payments": 0, "sats": 0, "units": 0});
+    let one = serde_json::json!({"payments": 1, "sats": 50_000, "units": 400});
+    let report = audit(&base).await;
+    assert_eq!(report["claims"]["abandoned"], one, "{report}");
+    assert_eq!(report["claims"]["unclaimed"], none, "{report}");
+    // 90 days = 7,776,000 s after it was given up on, it is removed from the file
+    let pruned = m
+        .records
+        .lock()
+        .unwrap()
+        .prune(1_000 + RETENTION, RETENTION, HORIZON)
+        .unwrap();
+    assert_eq!(pruned.removed, 1);
+    assert_eq!(m.records.lock().unwrap().len(), 0);
+    let report = audit(&base).await;
+    assert_eq!(report["claims"]["abandoned"], one, "{report}");
+    assert_eq!(report["claims"]["unclaimed"], none, "{report}");
 }

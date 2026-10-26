@@ -2,6 +2,10 @@
 
 psp-mint 0.1.2 builds on `sp-wire` 0.2.0 (wire version 2, AIR 2.0.3) and mint-core 0.1.3. Nothing was recorded per version before this file; the section below is everything the README said about what was built and when.
 
+## 0.8.1 (2026-10-26): a fifth `/audit` claims tally, `abandoned`
+
+Additive JSON: `/audit` `claims` gets `abandoned` {`payments`, `sats`, `units`}. An owed payment whose owed record the mint gave up on (`delivery.abandoned` set, not delivered: its cell holds another record, or its claim DID cannot be sealed to) is counted there with its `due_units`, and `unclaimed` now means claimable only. It covers `Claims::add`, `Claims::plus` and the pruned aggregate (`Pruned.totals`), so a pruned abandoned payment stays in `abandoned`. No new setting. A `settlements.json` written by 0.8.0 holds a `pruned.totals` without the new field and does not read; 0.8.0 was not released, there is no migration, start on a new data folder. Pins unchanged (sp-wire `v0.6.0`). The test `an_abandoned_payment_is_counted_apart_from_unclaimed_and_stays_so_after_pruning` is added (`tests/audit_claims.rs`); two existing tests (`kept_and_abandoned_payments_are_pruned_exactly_at_the_retention`, `an_abandoned_payment_is_pruned_after_the_retention_and_not_owed_again`) now read the abandoned payment under `abandoned`, not `unclaimed`.
+
 ## 0.8.0 (2026-10-25): the purchase claim (PSP claim rework, pass 1)
 
 Breaking, a clean break: wire version 4. A purchase no longer carries notes. The payment carries only a throwaway claim key sealed to the mint's DID; the mint decides what it is owed and the wallet claims exactly that once. The wallet (ecash-wallet), spi and aso still build the old design and must change (pass 2).
