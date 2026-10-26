@@ -415,8 +415,8 @@ fn config_refuses_range_settings_all_at_once() {
         &["config"],
         &[
             ("PSP_SCAN_INTERVAL_SECS", "0"),
-            ("PSP_RECONCILIATION_WINDOW_DAYS", "0"),
-            ("PSP_RECONCILIATION_ROUND_UP_FROM", "11"),
+            ("PSP_CLAIM_MAX_ATTEMPTS", "1001"),
+            ("PSP_CONFIRMATION_TIERS", "50000:5,10000:6"),
         ],
     );
     assert_eq!(ran.code, Some(1));
@@ -425,8 +425,8 @@ fn config_refuses_range_settings_all_at_once() {
         ran.stderr,
         "error: the settings are not valid:\n\
          \x20 scan.interval_secs = 0 is out of range: it must be from 1 to 86400 (seconds)\n\
-         \x20 settle.reconciliation_window_days = 0 is out of range: it must be from 1 to 365 (days)\n\
-         \x20 reconciliation.round_up_from = 11 is out of range: it must be from 1 to 10 (cents; 10 never rounds up)\n"
+         \x20 claim.max_attempts = 1001 is out of range: it must be from 1 to 1000 (attempts; at least one claim must be allowed)\n\
+         \x20 settle.confirmation_tiers entry 10000:6: the thresholds must ascend, and 10000 is not above 50000\n"
     );
     assert!(s.written().is_empty());
 }
@@ -437,22 +437,22 @@ fn config_refuses_a_fee_over_the_most_a_fee_may_be() {
     // 2^62 is the most; one more is refused, and 2^62 itself is not
     let over = s.run_with(
         &["config"],
-        &[("PSP_RECONCILIATION_FEE", "4611686018427387905")],
+        &[("PSP_CLAIM_WRITE_FEE", "4611686018427387905")],
     );
     assert_eq!(over.code, Some(1));
     assert_eq!(
         over.stderr,
         "error: the settings are not valid:\n\
-         \x20 reconciliation.fee = 4611686018427387905 is out of range: it must be from 0 to 4611686018427387904 (whole PSP units; 0 takes no fee)\n"
+         \x20 claim.write_fee = 4611686018427387905 is out of range: it must be from 0 to 4611686018427387904 (whole PSP units; 0 takes no fee)\n"
     );
     let at = s.run_with(
         &["config"],
-        &[("PSP_RECONCILIATION_FEE", "4611686018427387904")],
+        &[("PSP_CLAIM_WRITE_FEE", "4611686018427387904")],
     );
     assert_eq!(at.code, Some(0), "{}", at.stderr);
     assert!(
         at.stdout.contains(
-            "  reconciliation.fee = 4611686018427387904 PSP units (env PSP_RECONCILIATION_FEE)"
+            "  claim.write_fee = 4611686018427387904 PSP units (env PSP_CLAIM_WRITE_FEE)"
         ),
         "{}",
         at.stdout

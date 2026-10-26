@@ -443,7 +443,7 @@ async fn only_melt_burns_audit_and_health_are_http_routes() {
         "/rollover",
         "/check-state",
         "/spend",
-        "/reconcile",
+        "/claim",
     ] {
         for method in [reqwest::Method::GET, reqwest::Method::POST] {
             let response = http

@@ -10,6 +10,11 @@ pub struct Received {
     pub confirmations: u32,
     pub value_sats: u64,
     pub payload: Option<Vec<u8>>,
+    /// Unix seconds: the time of the block the payment is in (`blocktime` of
+    /// `gettransaction`). `None` for a payment that is not in a block, which is
+    /// not settled anyway. It dates the payment for the prune horizon
+    /// ([`crate::records::Pruned::cutoff`]).
+    pub block_time: Option<u64>,
 }
 
 pub fn op_return_data(script: &[u8]) -> Option<Vec<u8>> {
@@ -72,11 +77,13 @@ pub fn from_transaction(tx: &Value) -> Option<Received> {
         .filter_map(|script| op_return_data(&script))
         .collect();
     let payload = if data.len() == 1 { data.pop() } else { None };
+    let block_time = tx.get("blocktime").and_then(Value::as_u64);
     Some(Received {
         txid,
         confirmations,
         value_sats,
         payload,
+        block_time,
     })
 }
 
@@ -147,9 +154,9 @@ pub struct Since {
 /// `listsinceblock`, plus `pending`: the payments already on record that are not
 /// settled yet, which are looked at again each scan whatever block they are in.
 ///
-/// `target_confirmations` is `settle.min_confirmations`: bitcoind then returns,
-/// as the next checkpoint, the block that many deep, so a payment is listed
-/// again on every scan until it is that deep, and a reorg inside that window is
+/// `target_confirmations` is the highest confirmation tier (`Terms::highest`):
+/// bitcoind then returns, as the next checkpoint, the block that many deep, so a
+/// payment is listed again on every scan until it is that deep, and a reorg inside that window is
 /// seen. Transactions bitcoind reports as removed by a reorg are looked at again
 /// too. Every payment is read with `gettransaction`, which gives its current
 /// confirmations (0 for one that a reorg took out), so nothing is settled on a
@@ -311,6 +318,7 @@ mod since_tests {
                     Ok(json!({
                         "txid": id,
                         "confirmations": self.confs(h),
+                        "blocktime": 1_800_000_000u64,
                         "details": [{"category": "receive", "amount": 0.001}],
                         "decoded": {"vout": []},
                     }))
@@ -440,8 +448,9 @@ mod tests {
     use super::*;
     use crate::payload;
 
-    const PAYLOAD_HEX: &str = "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179802000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
-    const CHAIN_SCRIPT_HEX: &str = "6a4c75210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179802000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
+    const PAYLOAD_HEX: &str = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
+    const CHAIN_SCRIPT_HEX: &str =
+        "6a210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
 
     fn tx(confirmations: i64, vout_hexes: &[&str]) -> Value {
         let vout: Vec<Value> = vout_hexes
@@ -449,12 +458,17 @@ mod tests {
             .enumerate()
             .map(|(n, h)| json!({ "n": n, "scriptPubKey": { "hex": h } }))
             .collect();
-        json!({
+        let mut tx = json!({
             "txid": "ab",
             "confirmations": confirmations,
             "details": [{ "category": "receive", "amount": 0.001 }],
             "decoded": { "vout": vout },
-        })
+        });
+        // bitcoind gives `blocktime` only for a transaction that is in a block
+        if confirmations > 0 {
+            tx["blocktime"] = json!(1_799_990_000u64);
+        }
+        tx
     }
 
     #[test]
@@ -494,6 +508,7 @@ mod tests {
         assert_eq!(r.txid, "ab");
         assert_eq!(r.confirmations, 6);
         assert_eq!(r.value_sats, 100_000);
+        assert_eq!(r.block_time, Some(1_799_990_000));
         assert_eq!(hex::encode(r.payload.expect("payload")), PAYLOAD_HEX);
     }
 
@@ -502,6 +517,7 @@ mod tests {
         let r = from_transaction(&tx(0, &["0014aabb"])).expect("parsed");
         assert_eq!(r.confirmations, 0);
         assert_eq!(r.payload, None);
+        assert_eq!(r.block_time, None, "not in a block: no block time");
     }
 
     #[test]

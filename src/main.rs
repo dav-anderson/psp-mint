@@ -9,7 +9,6 @@ use std::thread;
 use std::time::Duration;
 
 use mint_core::state::AppState;
-use mint_types::Amount;
 use psp_mint::config::{self, Config};
 use psp_mint::delivery::Deliverer;
 use psp_mint::network::{self, Network};
@@ -143,7 +142,6 @@ impl Settings {
         fs::create_dir_all(&self.data_dir)?;
         let (rotor, logic) = rotation::Rotor::open(
             &self.data_dir,
-            Amount::from_units(self.config.max_denomination_units),
             self.config.rotation_activation_hours,
             self.config.rotation_period_hours,
         )?;
@@ -174,7 +172,7 @@ impl Settings {
     }
 
     fn records(&self) -> Result<Records, Box<dyn Error>> {
-        Ok(Records::open(&self.data_dir.join("settlements.json"))?)
+        Ok(Records::open(&self.data_dir.join(psp_mint::records::FILE))?)
     }
 
     /// Scan the wallet once and move every payment as far as it can go
@@ -208,7 +206,6 @@ impl Settings {
         let pass = service::Pass {
             data_dir: &self.data_dir,
             wallet: &cfg.wallet,
-            min_confirmations: cfg.min_confirmations,
             policy: &policy,
             did,
             quiet,
@@ -226,9 +223,14 @@ fn run_once(settings: &Settings) -> Result<(), Box<dyn Error>> {
     let did = settings.did_key()?;
     let mut deliverer = settings.deliverer(&did);
     let cycle = settings.cycle(&settings.config, &state, &rot, &records, &did, false);
-    // Delivery is tried even when the scan failed: what was issued before is owed.
-    service::deliver(&mut deliverer, &records, false);
-    service::forfeit(&records, server::now_secs());
+    // Delivery is tried even when the scan failed: what is owed is owed its record.
+    service::deliver(&mut deliverer, &records, false, server::now_secs());
+    service::expire(
+        &records,
+        server::now_secs(),
+        settings.config.retention_secs(),
+        settings.config.horizon_secs(),
+    );
     cycle
 }
 
@@ -329,13 +331,23 @@ impl Process {
         let (logic, rot) = settings.open_mint()?;
         let state = server::app_state(logic);
         // One set of records, shared by the scan thread and the AIR listener (the
-        // reconciliation requests of kind 15 settle against it). Lock order, everywhere:
+        // claims of kind 15 are taken against it). Lock order, everywhere:
         // records, then the mint, then the rotor.
         let records: SharedRecords = Arc::new(Mutex::new(settings.records()?));
+        // Claims that were accepted and not finished (a crash, a failed write) are
+        // finished before the AIR listener serves and before the scan, and serve does
+        // not start if one cannot be (the error names the payment). The key sets were
+        // rotated at open. A recovered claim is signed with the current set, and every
+        // set has a key for every power of two, so an accepted claim always has a key
+        // for each of its outputs.
+        let finished = service::recover(&state.logic, &rot, &records, server::now_secs())?;
+        if finished > 0 {
+            println!("psp-mint: finished {finished} accepted claim(s) from before the stop");
+        }
         let did = settings.did_key()?;
         let air = settings.config.air_listener(&settings.data_dir);
         let deliverer = settings.deliverer(&did);
-        let records_path = settings.data_dir.join("settlements.json");
+        let records_path = settings.data_dir.join(psp_mint::records::FILE);
 
         // How long without a successful pass before `/health` fails:
         // `scan.health_intervals` intervals plus `scan.health_grace_secs`.
@@ -388,8 +400,13 @@ impl Process {
                     }
                     // After every scan, whether or not it worked: records that could not
                     // be written earlier are tried again here, with a backoff of their own.
-                    service::deliver(&mut deliverer, &records, true);
-                    service::forfeit(&records, server::now_secs());
+                    service::deliver(&mut deliverer, &records, true, server::now_secs());
+                    service::expire(
+                        &records,
+                        server::now_secs(),
+                        cfg.retention_secs(),
+                        cfg.horizon_secs(),
+                    );
                     // And the PSP reissued to the SPI's wallet that a spend could not
                     // write to `revenue/` when it was made.
                     if let Ok(mut store) = rot.rollovers.lock()
@@ -715,10 +732,14 @@ fn start_air_listener(
     let thread = thread::Builder::new()
         .name("air-listener".into())
         .spawn(move || {
+            let desk = server::ClaimDesk {
+                records,
+                psp: sp_wire::air_request::addr::key_to_did(&did.public_key()),
+            };
             let serve = move |kind, body: &[u8]| {
                 // The ceilings and burn rule in force when the request comes.
                 let now = limits.get();
-                server::air_served_with(&state, &rot, &records, &health, &now, kind, body)
+                server::air_served_with(&state, &rot, &desk, &health, &now, kind, body)
             };
             match psp_mint::air_listener::run_blocking(&air, &did, &serve, stopped) {
                 Ok(()) => println!("AIR listener: stopped"),
@@ -754,9 +775,10 @@ psp-mint [--mainnet | --regtest | --signet | --testnet] [command]
 
   serve                                    The AIR listener (needs air.server
                                            and air.host), the local HTTP API,
-                                           the wallet scan and the delivery of
-                                           each purchase's signatures over
-                                           AIR, in one process. Signals:
+                                           the wallet scan, the owed records
+                                           written to the AIR server and the
+                                           purchase claims answered, in one
+                                           process. Signals:
                                            HUP reads the settings again, USR1
                                            copies the data folder, TERM and INT
                                            stop it.

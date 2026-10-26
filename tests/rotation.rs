@@ -202,7 +202,7 @@ async fn rotation_keeps_previous_notes_for_one_period_then_they_are_lost() {
     let one = Amount::from_units(1);
     // The keys of generation 0 (epoch 0), opened on their own first: the mint
     // started next in the same folder serves these same keys.
-    let keys0 = Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, T)
+    let keys0 = Rotor::open_at(&dir, 1, 1, T)
         .unwrap()
         .1
         .public_keys()
@@ -695,8 +695,8 @@ async fn a_burn_proof_left_on_file_serves_no_other_request() {
 async fn a_burn_proof_is_kept_for_its_own_request_and_dropped_when_it_finishes() {
     // Fails if retirement saves the proof where any request can use it (P2-01):
     // after the stuck request is finished, a new rollover or spend naming the
-    // proven note with a keyset the mint does not know is signed at the largest
-    // denomination without burning anything.
+    // proven note with a keyset the mint does not know is signed without
+    // burning anything.
     let (m, dir, n, req) = stuck_rollover("proof-forged", true, false).await;
     m.set_clock(T + 2 * H);
     let current = m.get::<RotationResponse>("/rotation").await.current.id;

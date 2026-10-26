@@ -1,37 +1,44 @@
 //! One scan pass as `psp-mint` runs it: the wallet is scanned (`service::cycle`),
-//! what is owed is delivered over AIR (`service::deliver`) and the windows that
-//! closed are forfeited (`service::forfeit`). The wallet is a stand-in for
+//! what is owed is delivered over AIR (`service::deliver`) and the claim windows
+//! that closed are expired (`service::expire`). The wallet is a stand-in for
 //! bitcoind (`scan::Node`) and the price is a closure; the mint, its records and
 //! the AIR server (the shared local one, see `common`) are the real ones, and the
 //! payer's side is the code the wallet runs.
 
 mod common;
 
-use mint_types::{Amount, BlindNonce, MintOutput};
 use psp_mint::delivery::Deliverer;
+use psp_mint::records::Status;
 use psp_mint::rpc::RpcError;
 use psp_mint::scan::{CHECKPOINT_FILE, Checkpoint, Node};
 use psp_mint::server::Limits;
 use psp_mint::service::{self, Pass};
-use psp_mint::settle::{Policy, ReconcileTerms, Terms};
-use rand::rngs::OsRng;
-use secp256k1::SECP256K1;
+use psp_mint::settle::{ClaimFees, Policy, Terms};
 use serde_json::{Value, json};
 use sp_wire::ServiceDid;
 use sp_wire::air_request::addr;
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::delivery::{self as wire, Outcome};
-use sp_wire::payload::{Payload, encode};
 use sp_wire::seal::{PublicKey, SecretKey};
 
-/// $10,000 per BTC: 1,000 sats is one PSP unit.
-const BTC_10K: u64 = 1_000_000;
+/// $100,000 per BTC: 100 sats are one PSP unit.
+const BTC_100K: u64 = 10_000_000;
 const NOW: u64 = 1_800_000_000;
+/// The time of the block every stand-in payment is in: a little before `NOW`.
+const BLOCK_TIME: u64 = 1_799_999_000;
+/// The default `settle.retention_days`, 90, in seconds.
+const RETENTION_SECS: u64 = 90 * 86_400;
+/// The default `settle.prune_horizon_days`, 210, in seconds.
+const HORIZON_SECS: u64 = 210 * 86_400;
 
-/// A transaction the wallet received: its txid, the sats and the OP_RETURN script.
+/// A transaction the wallet received: its txid, the sats, its confirmations and
+/// the OP_RETURN script.
 struct Tx {
     txid: &'static str,
     sats: u64,
+    confirmations: u32,
+    /// The time of the block it is in (`gettransaction`'s `blocktime`).
+    block_time: u64,
     script: Vec<u8>,
 }
 
@@ -68,7 +75,8 @@ impl Node for Wallet {
                 };
                 Ok(json!({
                     "txid": id,
-                    "confirmations": 6,
+                    "confirmations": tx.confirmations,
+                    "blocktime": tx.block_time,
                     "details": [{"category": "receive", "amount": tx.sats as f64 / 100_000_000.0}],
                     "decoded": {"vout": [{"scriptPubKey": {"hex": hex::encode(&tx.script)}}]},
                 }))
@@ -97,26 +105,6 @@ fn payer() -> Payer {
     Payer { key, did }
 }
 
-/// The payload a wallet builds for `units`, one output each, with the bytes the
-/// wallet sealed to the mint.
-fn purchase(payer: &Payer, units: &[u64]) -> Vec<u8> {
-    encode(&Payload {
-        did: *payer.did.as_bytes(),
-        outputs: units
-            .iter()
-            .map(|&u| MintOutput {
-                amount: Amount::from_units(u),
-                blind_nonce: BlindNonce(secp256k1::PublicKey::from_secret_key(
-                    SECP256K1,
-                    &secp256k1::SecretKey::new(&mut OsRng),
-                )),
-            })
-            .collect(),
-        keyset: None,
-    })
-    .unwrap()
-}
-
 /// What the payer does: read the cell it computes, once.
 fn read(server: &ServerRef, address: &PublicKey) -> Option<Vec<u8>> {
     block_on_new_runtime(|| async {
@@ -130,45 +118,49 @@ fn read(server: &ServerRef, address: &PublicKey) -> Option<Vec<u8>> {
 fn policy() -> Policy {
     Policy {
         terms: Terms::default(),
-        fees: ReconcileTerms {
-            fee_units: 2,
+        fees: ClaimFees {
+            max_attempts: 2,
             write_fee_units: 1,
             read_fee_units: 1,
-            ..ReconcileTerms::default()
         },
     }
 }
 
 #[test]
-fn a_pass_settles_delivers_and_forfeits_and_saves_the_checkpoint() {
+fn a_pass_settles_delivers_and_expires_and_saves_the_checkpoint() {
     let server = common::server();
     let m = common::PspMint::open("cycle", NOW, Limits::default());
     let did = SecretKey::new();
     let psp = addr::key_to_did(&did.public_key());
     let policy = policy();
 
-    // tx1: 6 units paid, less the first read (1), the 5 asked for. tx2: 12 units
-    // paid, less the first read, against 16 asked for: held. tx3: data nobody
-    // sealed to this mint.
+    // tx1: 700 sats at 6 confirmations is 7 units, less two reads (2) and the
+    // write (1): 4 owed. tx2: $200,000 is in the top tier of 6 and has 5: locked,
+    // owed nothing yet. tx3: data nobody sealed to this mint.
     let (first, second) = (payer(), payer());
-    let exact = purchase(&first, &[4, 1]);
-    let short = purchase(&second, &[16]);
-    let seal = |bytes: &[u8]| psp_mint::seal::encrypt(&did.public_key(), bytes).unwrap();
+    let seal =
+        |payer: &Payer| psp_mint::seal::encrypt(&did.public_key(), payer.did.as_bytes()).unwrap();
     let wallet = Wallet {
         txs: vec![
             Tx {
                 txid: "tx1",
-                sats: 6_000,
-                script: op_return(&seal(&exact)),
+                sats: 700,
+                confirmations: 6,
+                block_time: BLOCK_TIME,
+                script: op_return(&seal(&first)),
             },
             Tx {
                 txid: "tx2",
-                sats: 12_000,
-                script: op_return(&seal(&short)),
+                sats: 200_000_000,
+                confirmations: 5,
+                block_time: BLOCK_TIME,
+                script: op_return(&seal(&second)),
             },
             Tx {
                 txid: "tx3",
                 sats: 3_000,
+                confirmations: 6,
+                block_time: BLOCK_TIME,
                 script: op_return(&[7u8; 100]),
             },
         ],
@@ -178,27 +170,32 @@ fn a_pass_settles_delivers_and_forfeits_and_saves_the_checkpoint() {
     let pass = Pass {
         data_dir: &m.dir,
         wallet: "psp",
-        min_confirmations: 6,
         policy: &policy,
         did: &did,
         quiet: true,
     };
     service::cycle(&pass, &wallet, &m.state, &m.rot, &m.records, &mut || {
-        Ok(BTC_10K)
+        Ok(BTC_100K)
     })
     .unwrap();
 
-    // settled: the exact one issued its 5 units, the short one is held, and the
-    // one that was not for this mint left no record
     {
         let records = m.records.lock().unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records.get("tx1").unwrap().requested_units, 5);
-        assert_eq!(records.get("tx1").unwrap().read_prepaid_units, 1);
-        assert_eq!(records.get("tx2").unwrap().read_prepaid_units, 1);
+        let (tx1, tx2) = (records.get("tx1").unwrap(), records.get("tx2").unwrap());
+        assert_eq!(
+            (
+                tx1.due_units,
+                tx1.read_prepaid_units,
+                tx1.write_prepaid_units
+            ),
+            (4, 2, 1)
+        );
+        assert_eq!((tx2.status, tx2.tier_confirmations), (Status::Locked, 6));
         assert!(records.get("tx3").is_none());
     }
-    assert_eq!(m.state.logic.lock().unwrap().audit_totals().unwrap().0, 5);
+    // nothing is signed until the claim
+    assert_eq!(m.state.logic.lock().unwrap().audit_totals().unwrap().0, 0);
     // the checkpoint was saved, once every payment was processed
     assert_eq!(
         Checkpoint::load(&m.dir).unwrap(),
@@ -207,38 +204,35 @@ fn a_pass_settles_delivers_and_forfeits_and_saves_the_checkpoint() {
         })
     );
 
-    // delivered over AIR: both records are owed, and the payers read them
+    // delivered over AIR: the one owed record, which the payer reads
     let mut deliverer = Some(Deliverer::new((*server).clone(), 2, did));
-    service::deliver(&mut deliverer, &m.records, true);
+    service::deliver(&mut deliverer, &m.records, true, NOW);
     assert!(m.records.lock().unwrap().undelivered().is_empty());
-    let id = wire::purchase_id(&exact);
-    let sealed = read(&server, &wire::delivery_address(&psp, &first.did, &id))
-        .expect("the signatures are on the server");
-    let opened = wire::open_record(&first.key, &psp, &id, &sealed).unwrap();
-    let Outcome::Signed(signed) = opened.outcome else {
-        panic!("an exact purchase delivers its signatures");
-    };
-    assert_eq!(signed.signatures.len(), 2);
-    let id = wire::purchase_id(&short);
-    let sealed = read(&server, &wire::delivery_address(&psp, &second.did, &id))
-        .expect("the held record is on the server");
-    let opened = wire::open_record(&second.key, &psp, &id, &sealed).unwrap();
-    let Outcome::Held(held) = opened.outcome else {
-        panic!("a short purchase delivers a held record");
-    };
-    // 12 paid, less the first read (1), the fee (2), the write (1) and the
-    // follow-up's read (1)
-    assert_eq!(held.rules.as_ref().unwrap().due_units, 7);
+    let sealed = read(&server, &wire::owed_address(&psp, &first.did, 0))
+        .expect("the owed record is on the server");
+    let opened = wire::open_record(&first.key, &psp, 0, &sealed).unwrap();
+    let Outcome::Owed(owed) = opened.outcome;
+    assert_eq!(owed.terms.due_units, 4);
+    assert_eq!(
+        read(&server, &wire::owed_address(&psp, &second.did, 0)),
+        None
+    );
 
-    // inside the window nothing is forfeited; once it has closed the payment is
-    // forfeited and shown apart from the open ones
-    service::forfeit(&m.records, held.open_until - 1);
-    assert_eq!(m.records.lock().unwrap().reconciliation().open.payments, 1);
-    service::forfeit(&m.records, held.open_until);
-    let report = m.records.lock().unwrap().reconciliation();
-    assert_eq!((report.open.payments, report.forfeited.payments), (0, 1));
-    assert_eq!(report.forfeited.sats, 12_000);
-    assert_eq!(report.read_prepaid_units, 2);
+    // inside the window nothing expires; once it has closed the payment is
+    // expired and shown apart from the open ones
+    // (the window runs from the pass that stored the record, NOW, for 30 days)
+    assert_eq!(owed.terms.window_secs, 2_592_000);
+    let closes = NOW + 2_592_000;
+    assert_eq!(
+        m.records.lock().unwrap().get("tx1").unwrap().open_until,
+        Some(closes)
+    );
+    service::expire(&m.records, closes - 1, RETENTION_SECS, HORIZON_SECS);
+    assert_eq!(m.records.lock().unwrap().claims().unclaimed.payments, 1);
+    service::expire(&m.records, closes, RETENTION_SECS, HORIZON_SECS);
+    let claims = m.records.lock().unwrap().claims();
+    assert_eq!((claims.unclaimed.payments, claims.expired.payments), (0, 1));
+    assert_eq!((claims.expired.sats, claims.expired.units), (700, 4));
 }
 
 #[test]
@@ -253,7 +247,6 @@ fn a_pass_that_fails_changes_nothing_and_leaves_the_checkpoint_alone() {
     let pass = Pass {
         data_dir: &m.dir,
         wallet: "psp",
-        min_confirmations: 6,
         policy: &policy,
         did: &did,
         quiet: true,
@@ -261,7 +254,7 @@ fn a_pass_that_fails_changes_nothing_and_leaves_the_checkpoint_alone() {
     let records_before = std::fs::read(m.records_path()).ok();
 
     let e = service::cycle(&pass, &wallet, &m.state, &m.rot, &m.records, &mut || {
-        Ok(BTC_10K)
+        Ok(BTC_100K)
     })
     .unwrap_err();
     assert_eq!(e.to_string(), "rpc error -28: loading block index");
@@ -271,4 +264,115 @@ fn a_pass_that_fails_changes_nothing_and_leaves_the_checkpoint_alone() {
     assert!(m.records.lock().unwrap().is_empty());
     assert_eq!(std::fs::read(m.records_path()).ok(), records_before);
     assert_eq!(m.state.logic.lock().unwrap().audit_totals().unwrap().0, 0);
+}
+
+/// A payment pruned from the records is not owed again when the scan lists it,
+/// and once its block is older than the cutoff (`settle.prune_horizon_days`, 210)
+/// it is ignored without a price being asked or a record being made; a payment
+/// from after the cutoff settles normally; and raising the horizon to 400 does
+/// not bring the cutoff back, so the old payment stays ignored. Fails without the
+/// pruned list or the cutoff, or if a raised horizon revives the payment.
+#[test]
+fn a_pruned_payment_is_not_owed_again_and_one_older_than_the_cutoff_is_ignored() {
+    const CLOSES: u64 = NOW + 2_592_000;
+    let m = common::PspMint::open("cycle-horizon", NOW, Limits::default());
+    let did = SecretKey::new();
+    let policy = policy();
+    let (first, second) = (payer(), payer());
+    let seal =
+        |payer: &Payer| psp_mint::seal::encrypt(&did.public_key(), payer.did.as_bytes()).unwrap();
+    let mut wallet = Wallet {
+        txs: vec![Tx {
+            txid: "tx1",
+            sats: 700,
+            confirmations: 6,
+            block_time: BLOCK_TIME,
+            script: op_return(&seal(&first)),
+        }],
+        down: false,
+    };
+    let pass = Pass {
+        data_dir: &m.dir,
+        wallet: "psp",
+        policy: &policy,
+        did: &did,
+        quiet: true,
+    };
+    // One pass; returns how many times the price was asked.
+    let run = |wallet: &Wallet| {
+        let mut asked = 0;
+        service::cycle(&pass, wallet, &m.state, &m.rot, &m.records, &mut || {
+            asked += 1;
+            Ok(BTC_100K)
+        })
+        .unwrap();
+        asked
+    };
+
+    assert_eq!(run(&wallet), 1);
+    m.records.lock().unwrap().land("tx1", NOW).unwrap();
+    service::expire(&m.records, CLOSES, RETENTION_SECS, HORIZON_SECS);
+    service::expire(
+        &m.records,
+        CLOSES + RETENTION_SECS,
+        RETENTION_SECS,
+        HORIZON_SECS,
+    );
+    assert!(m.records.lock().unwrap().is_empty());
+    assert!(m.records.lock().unwrap().was_pruned("tx1"));
+
+    // listed again: settled once already, nothing is made, no price is asked
+    assert_eq!(run(&wallet), 0);
+    assert!(m.records.lock().unwrap().is_empty());
+    // and the /audit figures are still there
+    let claims = m.records.lock().unwrap().claims();
+    assert_eq!((claims.expired.payments, claims.expired.sats), (1, 700));
+
+    // the cutoff reaches the payment's block: at it, the marker stays
+    service::expire(
+        &m.records,
+        BLOCK_TIME + HORIZON_SECS,
+        RETENTION_SECS,
+        HORIZON_SECS,
+    );
+    assert!(m.records.lock().unwrap().was_pruned("tx1"));
+    assert_eq!(m.records.lock().unwrap().cutoff(), 1_799_999_000);
+    // one second on, the marker is dropped, and the payment is ignored by its age
+    service::expire(
+        &m.records,
+        BLOCK_TIME + HORIZON_SECS + 1,
+        RETENTION_SECS,
+        HORIZON_SECS,
+    );
+    assert!(!m.records.lock().unwrap().was_pruned("tx1"));
+    assert_eq!(m.records.lock().unwrap().cutoff(), 1_799_999_001);
+    assert_eq!(run(&wallet), 0);
+    assert!(m.records.lock().unwrap().is_empty());
+
+    // a payment from after the cutoff settles normally
+    wallet.txs.push(Tx {
+        txid: "tx4",
+        sats: 700,
+        confirmations: 6,
+        block_time: BLOCK_TIME + HORIZON_SECS,
+        script: op_return(&seal(&second)),
+    });
+    assert_eq!(run(&wallet), 1);
+    {
+        let records = m.records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records.get("tx4").unwrap().status, Status::Owed);
+        assert!(records.get("tx1").is_none());
+    }
+
+    // the horizon is raised to 400 days: the cutoff does not move back
+    service::expire(
+        &m.records,
+        BLOCK_TIME + HORIZON_SECS + 1,
+        RETENTION_SECS,
+        400 * 86_400,
+    );
+    assert_eq!(m.records.lock().unwrap().cutoff(), 1_799_999_001);
+    assert_eq!(run(&wallet), 0);
+    assert_eq!(m.records.lock().unwrap().len(), 1);
 }

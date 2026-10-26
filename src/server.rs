@@ -3,8 +3,9 @@
 //!
 //! Wallets reach the PSP over AIR and only over AIR (`air_served_with` is what the
 //! listener calls: mint info, keys, keysets, rotation, rollover, check-state,
-//! spend and reconcile, which settles an open payment against the shared
-//! settlement records and answers only an accepted request). What is left on HTTP is local to the SPI and the operator:
+//! spend and the purchase claim, which claims an owed payment against the shared
+//! settlement records and answers only an accepted claim). What is left on HTTP
+//! is local to the SPI and the operator:
 //! the ESP mint's `/melt` and `/burns`, `/audit` and `/health`. The audit and
 //! the melt handlers are this mint's own, over the PSP's own `MintLogic`
 //! (`mint_core::state::AppState`) in the same process. One process owns the
@@ -22,10 +23,10 @@
 //!   from a note that was burned by someone else.
 //! - `GET /audit`: issued, redeemed and outstanding totals, `paid` (the PSP units
 //!   burned as payments by PSP spends, kept apart from every other burn), `network`,
-//!   and `reconciliation`, read from the settlement records: the payments
-//!   held open and the payments forfeited, each with a count, the sats of the
-//!   ones that got no notes and the USD cents of credit on the ones that did, and
-//!   what reconciliation has settled, cost and kept (see `records::Reconciliation`).
+//!   and `claims`, read from the settlement records: the owed payments that
+//!   were claimed, those still unclaimed and those that expired, each as payments,
+//!   sats and units, the payments kept with nothing owed, the sub-unit amount kept
+//!   by rounding and the prepaid costs (see `records::Claims`).
 //! - `GET /health`: `200` while the scanner is keeping up and the mint lock is
 //!   sound, `503` otherwise, with the time of the last successful scan.
 //!
@@ -260,17 +261,16 @@ async fn health_handler(
     (code, Json(body))
 }
 
-/// Add `"reconciliation"` to a JSON object reply (`/audit`): the payments held
-/// open (inside their window) and the payments forfeited (the window closed
-/// unsettled; the mint keeps the BTC), kept apart from the issued, redeemed and
-/// outstanding totals, with the fees and the rounding counted. The records file
-/// is read when the report is asked for, so it is as current as the last write. A
-/// file that cannot be read leaves the section out and says so on the log.
-async fn add_reconciliation(
-    State(path): State<Arc<PathBuf>>,
-    request: Request,
-    next: Next,
-) -> Response {
+/// Add `"claims"` to a JSON object reply (`/audit`): the owed payments that were
+/// claimed, those still open (owed and not claimed, whether or not the record is
+/// stored on AIR yet) and those that expired (the window closed unclaimed; the mint
+/// keeps the BTC), each as payments, sats and units, with the payments kept at the
+/// lock, the sub-unit amount kept by rounding and the prepaid costs. The totals
+/// include the payments pruned from the file (`settle.retention_days`), so they do
+/// not shrink. Kept apart from the issued, redeemed and outstanding totals. The records file is read when the report is asked for, so
+/// it is as current as the last write. A file that cannot be read leaves the
+/// section out and says so on the log.
+async fn add_claims(State(path): State<Arc<PathBuf>>, request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     if !response.status().is_success() {
         return response;
@@ -283,11 +283,11 @@ async fn add_reconciliation(
         Ok(serde_json::Value::Object(mut map)) => {
             match Records::open(&path) {
                 Ok(records) => {
-                    if let Ok(section) = serde_json::to_value(records.reconciliation()) {
-                        map.insert("reconciliation".into(), section);
+                    if let Ok(section) = serde_json::to_value(records.claims()) {
+                        map.insert("claims".into(), section);
                     }
                 }
-                Err(e) => eprintln!("/audit: the reconciliation section was left out: {e}"),
+                Err(e) => eprintln!("/audit: the claims section was left out: {e}"),
             }
             let text = serde_json::Value::Object(map).to_string();
             parts.headers.remove(header::CONTENT_LENGTH);
@@ -891,6 +891,17 @@ where
     }
 }
 
+/// What kind 15 needs besides the mint and the rotor: the settlement records,
+/// shared with the scan thread, and this mint's DID. The DID is the one the
+/// payments are sealed to and the AIR listener answers at; every claim's digest
+/// covers it (`ClaimRequest::digest`), so a claim signed for another PSP is
+/// refused with `bad_signature` before anything is looked up.
+#[derive(Clone)]
+pub struct ClaimDesk {
+    pub records: SharedRecords,
+    pub psp: sp_wire::ServiceDid,
+}
+
 /// What the AIR listener says to one kind of request: the JSON body of the
 /// call, or a signed "cannot answer now" where the call fails (the mint lock is
 /// poisoned, or a rotation step failed), or, for the calls with a body, a
@@ -899,23 +910,25 @@ where
 ///
 /// `body` is the request body (empty for the reads); `limits` are the ceilings
 /// (`server.*_max_request_bytes`, the same ones `/melt` and `/burns` have).
-/// `records` is the settlement records, shared with the scan thread: kind 15
-/// reconciles payments in them. Lock order: the records, then the mint, then the
+/// `desk` is what kind 15 needs besides the mint ([`ClaimDesk`]): the settlement
+/// records, shared with the scan thread, which kind 15 takes claims against, and
+/// this mint's DID, which every claim's signature covers. Lock order: the
+/// records, then the mint, then the
 /// burn memos (`Rotating::melts`), then the rotor, then the rollovers. A rollover
 /// and a spend clear the memos of the notes they are about to burn (kinds 5 and
 /// 14), as `/melt` records them (see `melts`).
 pub fn air_served_with(
     state: &AppState,
     rot: &SharedRotating,
-    records: &SharedRecords,
+    desk: &ClaimDesk,
     health: &Health,
     limits: &Limits,
     kind: u8,
     body: &[u8],
 ) -> Option<sp_wire::air_request::Served> {
     use sp_wire::air_request::{
-        KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_RECONCILE,
-        KIND_PSP_SPEND, KIND_ROLLOVER, KIND_ROTATION, Served,
+        KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_CLAIM, KIND_PSP_SPEND,
+        KIND_ROLLOVER, KIND_ROTATION, Served,
     };
     fn read<T: serde::Serialize>(what: &str, result: Result<T, ApiFailure>) -> Served {
         match result {
@@ -964,9 +977,9 @@ pub fn air_served_with(
                 )
             },
         ),
-        // The corrected request or the credit claim of an open payment. It shares
-        // the rollover's two ceilings too. Only an accepted request is answered.
-        KIND_PSP_RECONCILE => reconcile_served(state, rot, records, limits, body),
+        // The one claim of an owed payment. It shares the rollover's two ceilings
+        // too. Only an accepted claim is answered.
+        KIND_PSP_CLAIM => claim_served(state, rot, desk, limits, body),
         KIND_CHECK_STATE => post_served(
             "check-state",
             limits.check_state_bytes,
@@ -977,56 +990,56 @@ pub fn air_served_with(
     })
 }
 
-/// The reconciliation call (kind 15): the corrected request or the credit claim
-/// of an open payment. **Only an accepted request is answered.** Every other
-/// outcome is `Served::Ignored`: nothing is written to the reply cell, and the
-/// code and reason are only logged here. That includes a transient failure of the
-/// mint (a poisoned lock, a failed save), which the wallet meets by sending the
-/// identical request again.
+/// The purchase claim call (kind 15): the one claim of an owed payment.
+/// **Only an accepted claim is answered.** Every other outcome is `Served::Ignored`:
+/// nothing is written to the reply cell, and the code and reason are only logged
+/// here. That includes a transient failure of the mint (a poisoned lock, a failed
+/// save), which the wallet meets by sending the identical claim again.
 ///
-/// Checked without any lock: the size, the shape and the signature of the
-/// reply key (not counted). Then the records, the mint and the rotor are locked,
-/// in that order, and `reconcile::reconcile` does the rest.
-fn reconcile_served(
+/// Checked without any lock: the size, the shape and the signature of the claim
+/// key (not counted), so a request without the key reads nothing. Then the
+/// records, the mint and the rotor are locked, in that order, and `claim::claim`
+/// does the rest.
+fn claim_served(
     state: &AppState,
     rot: &SharedRotating,
-    records: &SharedRecords,
+    desk: &ClaimDesk,
     limits: &Limits,
     body: &[u8],
 ) -> sp_wire::air_request::Served {
     use sp_wire::air_request::Served;
     let ignored = |code: &str, why: &str, counted: bool| {
         println!(
-            "AIR: reconciliation ignored ({code}{}): {why}",
+            "AIR: claim ignored ({code}{}): {why}",
             if counted { ", counted" } else { "" }
         );
         Served::Ignored(format!("{code}: {why}"))
     };
-    let early = |e: crate::reconcile::Ignore| ignored(&e.code, &e.why, e.counted);
+    let early = |e: crate::claim::Ignore| ignored(&e.code, &e.why, e.counted);
     if body.len() > limits.rollover_bytes {
-        return early(crate::reconcile::Ignore {
+        return early(crate::claim::Ignore {
             code: sp_wire::codes::REQUEST_TOO_LARGE.to_string(),
             why: format!("{} bytes, at most {}", body.len(), limits.rollover_bytes),
             counted: false,
         });
     }
-    let req: sp_wire::psp::ReconcileRequest = match serde_json::from_slice(body) {
+    let req: sp_wire::psp::ClaimRequest = match serde_json::from_slice(body) {
         Ok(req) => req,
         Err(e) => {
             return ignored(
                 sp_wire::codes::MALFORMED_REQUEST,
-                &format!("the request could not be read: {e}"),
+                &format!("the claim could not be read: {e}"),
                 false,
             );
         }
     };
-    if let Err(e) = crate::reconcile::check_shape(&req, limits.rollover_notes) {
+    if let Err(e) = crate::claim::check_shape(&req, limits.rollover_notes) {
         return early(e);
     }
-    if let Err(e) = crate::reconcile::verify_signature(&req) {
+    if let Err(e) = crate::claim::verify_signature(&req, &desk.psp) {
         return early(e);
     }
-    let Ok(mut store) = records.lock() else {
+    let Ok(mut store) = desk.records.lock() else {
         return ignored(
             sp_wire::codes::UNAVAILABLE,
             "the records lock is poisoned",
@@ -1046,7 +1059,7 @@ fn reconcile_served(
             return ignored(sp_wire::codes::UNAVAILABLE, &why.to_string(), false);
         }
     };
-    match crate::reconcile::reconcile(&mut store, &logic, &rotor, &req, now_secs()) {
+    match crate::claim::claim(&mut store, &logic, &rotor, &req, &desk.psp, now_secs()) {
         Ok(answer) => match serde_json::to_vec(&answer) {
             Ok(bytes) => Served::Body(bytes),
             Err(e) => ignored(
@@ -1209,10 +1222,10 @@ fn spend_failure(e: SpendError) -> ApiFailure {
 }
 
 /// The API: `/melt`, `/burns`, `/audit` and `/health`. `/audit` spans both live
-/// key sets and the deleted ones, and carries `reconciliation` (the payments held
-/// open and forfeited, the fees and the rounding), read from the settlement
+/// key sets and the deleted ones, and carries `claims` (the payments claimed,
+/// unclaimed and expired, the sub-unit amount kept and the prepaid costs), read from the settlement
 /// records file at `records` when it is asked for. The wallet-facing calls (keys,
-/// keysets, rotation, rollover, check-state, spend, reconcile) are not routes:
+/// keysets, rotation, rollover, check-state, spend, claim) are not routes:
 /// they are answered over AIR (`air_served_with`). The ceilings are the ones a
 /// reload changes: each request on `/melt` and `/burns` is held to the ceiling
 /// in `limits` when it arrives. `melts` is `rot`'s own log (`Rotating::melts`);
@@ -1250,10 +1263,7 @@ pub fn router_live(
         .route(
             "/audit",
             get(audit_handler)
-                .layer(middleware::from_fn_with_state(
-                    audit_records,
-                    add_reconciliation,
-                ))
+                .layer(middleware::from_fn_with_state(audit_records, add_claims))
                 .layer(middleware::from_fn_with_state(audit_network, add_network)),
         )
         .with_state((state, rot))

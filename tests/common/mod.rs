@@ -5,7 +5,7 @@
 //! outcome has.
 //!
 //! Wallets reach the PSP mint over AIR only (keys, keysets, rotation, rollover,
-//! check-state, spend and reconcile), so the tests of those calls call the AIR
+//! check-state, spend and the purchase claim), so the tests of those calls call the AIR
 //! listener, not an HTTP route. A reply is read as an HTTP answer would be: an
 //! answered request is `200` and its JSON; a signed refusal is
 //! `400` and its JSON (the PSP's refusals carry no `http_status`; a body over a
@@ -45,7 +45,7 @@ use sp_wire::air_request::addr;
 use sp_wire::air_request::ask::{AskConfig, AskError, InFlight, Verified, ask};
 use sp_wire::air_request::client::{self, ServerRef, block_on_new_runtime};
 use sp_wire::air_request::{
-    KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_RECONCILE, KIND_PSP_SPEND,
+    KIND_CHECK_STATE, KIND_KEYS, KIND_KEYSETS, KIND_MINT_INFO, KIND_PSP_CLAIM, KIND_PSP_SPEND,
     KIND_ROLLOVER, KIND_ROTATION, STATUS_UNAVAILABLE, VerifyError, local_server,
 };
 use sp_wire::seal::SecretKey as DidKey;
@@ -163,7 +163,7 @@ fn kind_of(route: &str) -> u8 {
         "/rotation" => KIND_ROTATION,
         "/rollover" => KIND_ROLLOVER,
         "/spend" => KIND_PSP_SPEND,
-        "/reconcile" => KIND_PSP_RECONCILE,
+        "/claim" => KIND_PSP_CLAIM,
         "/check-state" => KIND_CHECK_STATE,
         "/health" => KIND_MINT_INFO,
         other => panic!("{other} is not a call the PSP mint answers over AIR"),
@@ -184,28 +184,31 @@ fn scratch() -> PathBuf {
 
 impl Air {
     /// Take the turn on the shared server and start the listener for this mint,
-    /// under a new mint key and a slot counter of its own, as `psp-mint serve`
-    /// runs it: it settles reconciliation requests (kind 15) against `records`,
-    /// which the scan side shares, and answers mint info from `health`. The turn
-    /// is held until this drops.
+    /// under the mint's DID `key` and a slot counter of its own, as `psp-mint
+    /// serve` runs it: it takes claims (kind 15) against `records`, which the scan
+    /// side shares, checks every claim's signature over the DID of `key`, and
+    /// answers mint info from `health`. The turn is held until this drops.
     pub fn start(
         state: &Arc<AppState>,
         rot: &SharedRotating,
         records: &SharedRecords,
+        key: &DidKey,
         health: &Arc<Health>,
         limits: Limits,
     ) -> Air {
         let server = server();
-        let key = DidKey::new();
         let did = addr::key_to_did(&key.public_key());
         let state = Arc::clone(state);
         let rot = Arc::clone(rot);
-        let records = Arc::clone(records);
+        let desk = server::ClaimDesk {
+            records: Arc::clone(records),
+            psp: did,
+        };
         let health = Arc::clone(health);
         let serve: Arc<Serve> = Arc::new(move |kind: u8, body: &[u8]| {
-            server::air_served_with(&state, &rot, &records, &health, &limits, kind, body)
+            server::air_served_with(&state, &rot, &desk, &health, &limits, kind, body)
         });
-        let listener = start_serving(&server, &key, scratch(), serve);
+        let listener = start_serving(&server, key, scratch(), serve);
         let config = |reply_wait_secs, attempts| AskConfig {
             server: server.server.clone(),
             mint: did,
@@ -232,7 +235,7 @@ impl Air {
         self.ask_with(&self.cfg, kind, body)
     }
 
-    /// A request the mint is not meant to answer (a refused reconciliation):
+    /// A request the mint is not meant to answer (a refused claim):
     /// waits a few seconds for a reply once and returns what the asker meets, an
     /// error. A reply, if there were one, would be returned as `Ok`.
     pub fn ask_unanswered(&self, kind: u8, body: &[u8]) -> Result<Verified, AskError> {
@@ -315,6 +318,12 @@ pub fn rollovers_file(set: Value) -> String {
 /// A PSP mint wired as `psp-mint serve` wires it.
 pub struct PspMint {
     pub dir: PathBuf,
+    /// The mint's DID key, loaded from (or made in) the data folder as `serve`
+    /// does (`seal::load_or_generate`): the same one when the folder is opened
+    /// again.
+    pub did_key: DidKey,
+    /// Its DID: what every claim's signature covers.
+    pub did: ServiceDid,
     pub state: Arc<AppState>,
     pub rot: SharedRotating,
     pub records: SharedRecords,
@@ -370,21 +379,19 @@ impl PspMint {
         clock: u64,
         limits: Limits,
     ) -> PspMint {
-        let (rotor, logic) = Rotor::open_at(
-            dir,
-            mint_types::Amount::from_units(1024),
-            activation_hours,
-            period_hours,
-            clock,
-        )
-        .unwrap();
+        let (rotor, logic) = Rotor::open_at(dir, activation_hours, period_hours, clock).unwrap();
         let rot: SharedRotating = Rotating::new(rotor, Rollovers::open(dir).unwrap());
         let records: SharedRecords = Arc::new(Mutex::new(
             Records::open(&dir.join("settlements.json")).unwrap(),
         ));
         let melts = Arc::clone(rot.melts().unwrap());
+        std::fs::create_dir_all(dir).unwrap();
+        let did_key = psp_mint::seal::load_or_generate(&dir.join(psp_mint::seal::KEY_FILENAME))
+            .expect("the mint's DID key");
         PspMint {
             dir: dir.to_path_buf(),
+            did: addr::key_to_did(&did_key.public_key()),
+            did_key,
             state: server::app_state(logic),
             rot,
             records,
@@ -429,6 +436,7 @@ impl PspMint {
             &self.state,
             &self.rot,
             &self.records,
+            &self.did_key,
             &self.health,
             self.limits,
         )

@@ -1,34 +1,54 @@
-//! Delivering a purchase to its payer: one record per purchase, on the SPI's AIR
-//! server, at an address only the payer and this mint can compute
-//! (`sp_wire::air_request::delivery`; REQUEST-DESIGN.md section 18). It carries
-//! the signatures, or the rejection, and the keysets to unblind with.
+//! Delivering the owed record of a purchase to its payer: one record per payment
+//! that reached its confirmation tier, on the SPI's AIR server, at an address only
+//! the holder of the claim key and this mint can compute
+//! (`sp_wire::air_request::delivery`; REQUEST-DESIGN.md section 18). It says what
+//! the payment is owed and the terms of the one claim (`claim`).
 //!
-//! **What is kept and when.** When a purchase is issued or rejected, `settle`
-//! stores what the payer is owed in the purchase's record (`records::Delivery`:
-//! the reply DID, the purchase id and the outcome, with `delivered` false). That
-//! is the only copy of the signatures: the scan log prints only counts and
-//! units. This module writes it.
+//! **What is kept and when.** When a payment reaches its tier, `settle` stores the
+//! owed record in the payment's record (`records::Delivery`: the claim DID, the
+//! index and the outcome, with `delivered` false). This module writes it.
+//!
+//! **Order.** The records of one claim key are cells 0, 1, 2 and so on, and a
+//! wallet reads them in that order and stops at the first empty cell. So in each
+//! pass only the lowest-index record of each claim key that is not stored is
+//! written (`Records::next_to_deliver`): a later index is never written while an
+//! earlier one of the same claim key is not stored, which includes an earlier one
+//! whose write failed and is waiting out its retry. A record that was given up on
+//! (`abandoned`: its cell holds a different record) does not hold the later ones
+//! back: a wallet reads past a cell it cannot open, and stops only at an empty
+//! one. Records of different claim keys do not wait for each other.
 //!
 //! **Retry.** [`Deliverer::pass_shared`] runs after every scan (and so also on every
-//! pass of `serve`, whether or not the scan worked) and writes every record that
-//! is not stored yet. A write that fails is tried again after a wait that doubles
+//! pass of `serve`, whether or not the scan worked) and writes the records that
+//! are next to be stored. A write that fails is tried again after a wait that doubles
 //! from [`FIRST_RETRY_SECS`] to [`LONGEST_RETRY_SECS`]; the waits are kept in
 //! memory, so a restart tries everything at once. What is retried is stored: the
-//! sealed record is made once, on the first attempt, and saved in the purchase's
+//! sealed record is made once, on the first attempt, and saved in the payment's
 //! record *before* it is written, so every retry (and every restart) writes the
 //! same bytes. The AIR server answers a write to a taken cell with what it holds,
 //! so a write that got through but was not acknowledged is found on the next try
 //! to have stored exactly these bytes, and counts as delivered. Exactly one record
-//! is ever stored per purchase: the cell is write-once.
+//! is ever stored per cell: the cell is write-once.
 //!
-//! **Delivery never blocks or undoes issuance.** Nothing here can fail a scan: a
-//! pass reports what it could not do and leaves the purchase as it was.
+//! **The claim window starts at the write.** The record states only the length of
+//! the window (`window_secs`), and the mint's deadline, `open_until`, is the time
+//! the record was first found stored plus that length (`Records::land`, in the same
+//! write that marks it delivered). An AIR server that is down for a long time, or
+//! an earlier record of the same claim key that cannot be written, therefore uses
+//! up none of the payer's window; and the write is retried for as long as it takes,
+//! since a record that is not stored cannot expire. The clock for the deadline is
+//! wall-clock Unix seconds, passed in (`pass_shared`'s `wall_now`); the retry waits
+//! run on `Instant`.
 //!
-//! **What cannot be delivered.** A reply DID that is not a key (the payload is
-//! the payer's to fill in) cannot be sealed to; that delivery is marked
-//! `abandoned` with the reason, and not tried again. So is one whose address holds
-//! a different record, which is reported and left alone, never overwritten. A
-//! payment whose payload cannot be read has no reply DID and no delivery at all.
+//! **Delivery never blocks or undoes settlement.** Nothing here can fail a scan: a
+//! pass reports what it could not do and leaves the payment as it was.
+//!
+//! **What cannot be delivered.** A claim DID that is not a key cannot be sealed to
+//! (`settle` keeps such a payment without a record, so this is a damaged file);
+//! that delivery is marked `abandoned` with the reason and the time
+//! (`abandoned_at`, from which `settle.retention_days` counts), and not tried
+//! again. So is one whose address holds a different record, which is reported
+//! and left alone, never overwritten.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
@@ -93,17 +113,19 @@ impl Deliverer {
         }
     }
 
-    /// Write every record that is not stored yet and whose wait is over, at time
-    /// `now`, in the records the AIR listener shares. Never fails: what went wrong
+    /// Write the records that are next to be stored (the lowest index of each claim
+    /// key that is not stored yet) and whose wait is over, at time `now`, in the
+    /// records the AIR listener shares. `wall_now` is Unix seconds: the time a
+    /// record found stored opens its claim window at. Never fails: what went wrong
     /// is printed and counted. The records lock is held to prepare the records (a
     /// local file) and again to mark them stored, and **not while they are written
-    /// to the AIR server**, so a reconciliation request never waits for the
+    /// to the AIR server**, so a claim never waits for the
     /// network.
-    pub fn pass_shared(&mut self, records: &Mutex<Records>, now: Instant) -> Report {
+    pub fn pass_shared(&mut self, records: &Mutex<Records>, now: Instant, wall_now: u64) -> Report {
         let Some(mut guard) = lock(records) else {
             return Report::default();
         };
-        let (jobs, mut report) = self.plan(&mut guard, now);
+        let (jobs, mut report) = self.plan(&mut guard, now, wall_now);
         drop(guard);
         if jobs.is_empty() {
             return report;
@@ -114,23 +136,23 @@ impl Deliverer {
         let Some(mut guard) = lock(records) else {
             return report;
         };
-        self.apply(&mut guard, &jobs, outcomes, now, &mut report);
+        self.apply(&mut guard, &jobs, outcomes, now, wall_now, &mut report);
         report
     }
 
     /// The records to write now, sealed and saved (so every retry writes the same
     /// bytes), with what was left alone or given up on. Touches the records file
     /// only.
-    fn plan(&mut self, records: &mut Records, now: Instant) -> (Vec<Job>, Report) {
+    fn plan(&mut self, records: &mut Records, now: Instant, wall_now: u64) -> (Vec<Job>, Report) {
         let mut report = Report::default();
         let psp = addr::key_to_did(&self.key.public_key());
         let mut jobs: Vec<Job> = Vec::new();
-        for (txid, delivery) in records.undelivered() {
+        for (txid, delivery) in records.next_to_deliver() {
             if self.waits.get(&txid).is_some_and(|w| w.next > now) {
                 report.waiting += 1;
                 continue;
             }
-            match self.prepare(records, &psp, &txid, delivery) {
+            match self.prepare(records, &psp, &txid, delivery, wall_now) {
                 Prepared::Ready(cell, sealed) => jobs.push((txid, cell, sealed)),
                 Prepared::Abandoned => report.abandoned += 1,
                 Prepared::NotStored(why) => {
@@ -180,6 +202,7 @@ impl Deliverer {
         jobs: &[Job],
         outcomes: Outcomes,
         now: Instant,
+        wall_now: u64,
         report: &mut Report,
     ) {
         match outcomes {
@@ -195,11 +218,11 @@ impl Deliverer {
                     match result {
                         Ok(Written::Created) => {
                             println!("delivery {txid}: record written");
-                            self.stored(records, &txid, report);
+                            self.stored(records, &txid, wall_now, report);
                         }
                         Ok(Written::AlreadyStored) => {
                             println!("delivery {txid}: record was already stored");
-                            self.stored(records, &txid, report);
+                            self.stored(records, &txid, wall_now, report);
                         }
                         Ok(Written::Different) => {
                             eprintln!(
@@ -210,6 +233,7 @@ impl Deliverer {
                                 records,
                                 &txid,
                                 "the delivery address holds a different record",
+                                wall_now,
                             );
                             report.abandoned += 1;
                         }
@@ -224,7 +248,7 @@ impl Deliverer {
         }
     }
 
-    /// The sealed record of one purchase, made and saved if this is the first
+    /// The sealed record of one payment, made and saved if this is the first
     /// try. A delivery that cannot be made is abandoned; one that cannot be saved
     /// is not written (a restart would make other bytes).
     fn prepare(
@@ -233,28 +257,21 @@ impl Deliverer {
         psp: &ServiceDid,
         txid: &str,
         mut delivery: Delivery,
+        wall_now: u64,
     ) -> Prepared {
-        let reply = match ServiceDid::parse(&delivery.reply_did) {
-            Ok(reply) => reply,
+        let claim = match ServiceDid::parse(&delivery.claim_did) {
+            Ok(claim) => claim,
             Err(e) => {
-                return self.give_up(records, txid, delivery, format!("the reply DID: {e}"));
-            }
-        };
-        let purchase: [u8; 32] = match hex::decode(&delivery.purchase)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-        {
-            Some(purchase) => purchase,
-            None => {
                 return self.give_up(
                     records,
                     txid,
                     delivery,
-                    "the purchase id is not 32 bytes of hex".to_string(),
+                    format!("the claim DID: {e}"),
+                    wall_now,
                 );
             }
         };
-        let cell = wire::delivery_secret(psp, &reply, &purchase);
+        let cell = wire::owed_secret(psp, &claim, delivery.index);
         if let Some(text) = &delivery.sealed {
             return match hex::decode(text) {
                 Ok(sealed) => Prepared::Ready(cell, sealed),
@@ -263,19 +280,26 @@ impl Deliverer {
                     txid,
                     delivery,
                     "the saved record is not hex".into(),
+                    wall_now,
                 ),
             };
         }
         let built = match wire::build_record(
             &self.key,
-            &reply,
-            &purchase,
+            &claim,
+            delivery.index,
             &delivery.outcome,
             addr::now_secs(),
         ) {
             Ok(built) => built,
             Err(e) => {
-                return self.give_up(records, txid, delivery, format!("sealing the record: {e}"));
+                return self.give_up(
+                    records,
+                    txid,
+                    delivery,
+                    format!("sealing the record: {e}"),
+                    wall_now,
+                );
             }
         };
         delivery.sealed = Some(hex::encode(&built.sealed));
@@ -291,39 +315,41 @@ impl Deliverer {
         txid: &str,
         mut delivery: Delivery,
         why: String,
+        wall_now: u64,
     ) -> Prepared {
         eprintln!("delivery {txid}: cannot be delivered ({why}); not tried again");
         delivery.abandoned = Some(why);
+        delivery.abandoned_at = Some(wall_now);
         if let Err(e) = records.put_delivery(txid, delivery) {
             eprintln!("delivery {txid}: that could not be saved either: {e}");
         }
         Prepared::Abandoned
     }
 
-    fn abandon(&mut self, records: &mut Records, txid: &str, why: &str) {
+    fn abandon(&mut self, records: &mut Records, txid: &str, why: &str, wall_now: u64) {
         self.waits.remove(txid);
         if let Some(mut delivery) = records.get(txid).and_then(|r| r.delivery.clone()) {
             delivery.abandoned = Some(why.to_string());
+            delivery.abandoned_at = Some(wall_now);
             if let Err(e) = records.put_delivery(txid, delivery) {
                 eprintln!("delivery {txid}: that could not be saved: {e}");
             }
         }
     }
 
-    /// The record is stored: say so in the purchase's record. If that cannot be
-    /// saved it is written again next time, and found already stored.
-    fn stored(&mut self, records: &mut Records, txid: &str, report: &mut Report) {
+    /// The record is stored: say so in the payment's record, and open its claim
+    /// window at `wall_now`, in one write (`Records::land`). If that cannot be
+    /// saved it is written again next time, and found already stored; the window
+    /// then opens at that time.
+    fn stored(&mut self, records: &mut Records, txid: &str, wall_now: u64, report: &mut Report) {
         self.waits.remove(txid);
-        if let Some(mut delivery) = records.get(txid).and_then(|r| r.delivery.clone()) {
-            delivery.delivered = true;
-            if let Err(e) = records.put_delivery(txid, delivery) {
-                eprintln!(
-                    "delivery {txid}: stored, but that could not be saved ({e}); it will be \
-                     found stored on the next pass"
-                );
-                report.failed += 1;
-                return;
-            }
+        if let Err(e) = records.land(txid, wall_now) {
+            eprintln!(
+                "delivery {txid}: stored, but that could not be saved ({e}); it will be \
+                 found stored on the next pass"
+            );
+            report.failed += 1;
+            return;
         }
         report.delivered += 1;
     }
@@ -340,7 +366,7 @@ impl Deliverer {
     }
 }
 
-/// A record to write: the purchase's txid, its cell and the sealed bytes.
+/// A record to write: the payment's txid, its cell and the sealed bytes.
 type Job = (String, SecretKey, Vec<u8>);
 
 /// What writing a pass to the AIR server found, by txid; an error when the
@@ -402,7 +428,7 @@ mod tests {
         };
         let mut deliverer = Deliverer::new(server, 1, SecretKey::new());
         assert_eq!(
-            deliverer.pass_shared(&records, Instant::now()),
+            deliverer.pass_shared(&records, Instant::now(), 0),
             Report::default()
         );
         assert!(records.is_poisoned(), "the lock was not recovered");

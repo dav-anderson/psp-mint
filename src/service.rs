@@ -7,15 +7,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use mint_core::MintLogic;
 use mint_core::state::AppState;
+use sp_wire::air_request::addr::now_secs;
 use sp_wire::seal::SecretKey;
 
+use crate::claim;
 use crate::delivery::Deliverer;
 use crate::price::{self, Aggregate, Config};
 use crate::records::Records;
 use crate::scan::{self, Node, Received};
 use crate::seal;
 use crate::server::Rotating;
-use crate::settle::{self, Policy, Rejection, SettleError, Settlement, Terms};
+use crate::settle::{self, Kept, Policy, SettleError, Settlement, Terms};
 
 pub fn cents_text(cents: u64) -> String {
     format!("{}.{:02}", cents / 100, cents % 100)
@@ -52,23 +54,31 @@ pub fn btc_usd_cents(config: Config) -> Result<u64, String> {
 }
 
 /// Move every payment as far as it can go, under the settlement `policy` (the
-/// terms and the reconciliation fees), in the records the AIR listener shares (it
-/// reconciles payments in them).
+/// terms and the claim fees), in the records the AIR listener shares (it takes
+/// claims against the owed records in them). `now` is Unix seconds: the time a
+/// claim finished by [`recover`] in this run is stored at.
 ///
 /// The mint is shared with the HTTP API behind `logic`, so it is locked once per
 /// payment and never while waiting on the network. The price is fetched before
 /// any lock is taken, and only for a payment that has no record yet, which is the
 /// one case where `settle_ruled` asks for it. `price` is called at most once per
-/// payment, and the caller makes it fetch at most once per cycle. A payment whose
-/// payload names the previous key set is signed by it (see `settle::settle_ruled`).
+/// payment, and the caller makes it fetch at most once per cycle. Nothing is
+/// signed here: a payment that reaches its tier is owed a record, and the notes
+/// are signed when it is claimed (`claim`).
 ///
 /// **Locks.** The records lock is taken for one payment at a time and never while
-/// the price is fetched, so a reconciliation request waits for at most one
-/// settlement (a few file writes), never for bitcoind or a price source. The
-/// order is fixed everywhere: the records, then the mint, then the rotor. A
-/// poisoned records lock fails the pass with `SettleError::RecordsPoisoned`, as a
-/// poisoned mint lock fails it with `SettleError::Mint`: a thread died in the
-/// middle of a settlement or a reconciliation, and `serve` is about to exit.
+/// the price is fetched, so a claim waits for at most one settlement (a few file
+/// writes), never for bitcoind or a price source. The order is fixed everywhere:
+/// the records, then the mint, then the rotor (also in [`recover`], which runs
+/// first). A poisoned records lock fails the pass with
+/// `SettleError::RecordsPoisoned`. The mint and the rotor are locked only by
+/// [`recover`], inside its loop over the claims to finish: a pass with a claim to
+/// recover and a poisoned mint or rotor lock fails with `SettleError::Mint`
+/// before any payment is settled, and a pass with none never takes either lock,
+/// so settling (which signs nothing) does not depend on them. In every case a
+/// thread died in the middle of a settlement or a claim, and `serve` is about to
+/// exit.
+#[allow(clippy::too_many_arguments)]
 pub fn run_once_shared(
     logic: &Mutex<MintLogic>,
     rotating: &Rotating,
@@ -77,18 +87,24 @@ pub fn run_once_shared(
     price: &mut dyn FnMut() -> Result<u64, String>,
     report: &mut dyn FnMut(&Received, &Settlement),
     policy: &Policy,
+    now: u64,
 ) -> Result<(), SettleError> {
+    // A claim that was accepted and not finished is finished before any payment
+    // is settled, whoever calls this.
+    recover(logic, rotating, records, now)?;
     for received in found {
         let needs_price = {
             let guard = lock_records(records)?;
             received.confirmations >= policy.terms.lock_confirmations
                 && guard.get(&received.txid).is_none()
+                && !guard.was_pruned(&received.txid)
+                && !guard.is_beyond_cutoff(received.block_time)
         };
         // No lock is held while the price is fetched.
         let fetched = if needs_price { Some(price()) } else { None };
         let settlement = {
             let mut guard = lock_records(records)?;
-            settle_one(logic, rotating, &mut guard, received, fetched, policy)?
+            settle_one(&mut guard, received, fetched, policy, now)?
         };
         report(received, &settlement);
     }
@@ -97,10 +113,10 @@ pub fn run_once_shared(
 
 /// The records lock. If a thread panicked holding it the lock is **poisoned**
 /// and this fails with `SettleError::RecordsPoisoned`, never recovering: a panic
-/// means a thread died in the middle of a settlement or a reconciliation, and the
+/// means a thread died in the middle of a settlement or a claim, and the
 /// watcher in `serve` exits the process for a supervisor to restart. Every caller
 /// treats it the same way: the scan pass fails (`run_once_shared`,
-/// `Settings::cycle`), and a delivery or forfeit pass logs and skips. The AIR
+/// `Settings::cycle`), and a delivery or expiry pass logs and skips. The AIR
 /// listener answers nothing (`unavailable`, ignored).
 pub fn lock_records(
     records: &Mutex<Records>,
@@ -108,30 +124,16 @@ pub fn lock_records(
     records.lock().map_err(|_| SettleError::RecordsPoisoned)
 }
 
-/// Settle one payment. The caller holds the records; the mint is locked first
-/// and the rotor second, as everywhere else.
+/// Settle one payment. The caller holds the records. Nothing here touches the
+/// mint or the rotor: the owed record carries no keysets and no clock.
 fn settle_one(
-    logic: &Mutex<MintLogic>,
-    rotating: &Rotating,
     records: &mut Records,
     received: &Received,
     fetched: Option<Result<u64, String>>,
     policy: &Policy,
+    now: u64,
 ) -> Result<Settlement, SettleError> {
-    let guard = logic
-        .lock()
-        .map_err(|_| SettleError::Mint("mint lock is poisoned".to_string()))?;
-    let rotor = rotating
-        .rotor
-        .lock()
-        .map_err(|_| SettleError::Mint("rotor lock is poisoned".to_string()))?;
-    let previous = rotor
-        .previous
-        .as_ref()
-        .map(|(keys, prev)| (keys.id.as_str(), prev));
     settle::settle_ruled(
-        &guard,
-        previous,
         records,
         received,
         &mut || {
@@ -140,7 +142,63 @@ fn settle_one(
                 .unwrap_or_else(|| Err("price was not fetched".to_string()))
         },
         policy,
+        now,
     )
+}
+
+/// Finish every claim that was accepted and has no answer: the mint saved the
+/// claim before signing and a crash, or a failed write, came before the answer
+/// was stored (`claim::finish`). Each is signed with the keyset that is
+/// **current** when this runs, and its answer is stored, so the wallet's identical
+/// resend gets it; the wallet need not send the claim again for the mint to finish
+/// it. Returns how many were finished.
+///
+/// Normally the current keyset is the one the claim was accepted for, and the
+/// signatures are the same as the first time. If the mint rotated in between, the
+/// answer names the new keyset (see `claim` for what that does to the issued
+/// totals). A rotation never waits for an unfinished claim.
+///
+/// Runs at startup, before the AIR listener, and at the start of every scan pass,
+/// before any new payment is settled. **Locks**, as everywhere: the records, then
+/// the mint, then the rotor, taken for one claim at a time.
+///
+/// Every claim is tried. The first error is returned after the last, and names
+/// the txid: the claim stays as it is and is tried again next time.
+pub fn recover(
+    logic: &Mutex<MintLogic>,
+    rotating: &Rotating,
+    records: &Mutex<Records>,
+    now: u64,
+) -> Result<usize, SettleError> {
+    let mut guard = lock_records(records)?;
+    let mut finished = 0;
+    let mut first_error = None;
+    for txid in guard.pending_claims() {
+        let mint = logic
+            .lock()
+            .map_err(|_| SettleError::Mint("mint lock is poisoned".to_string()))?;
+        let rotor = rotating
+            .rotor
+            .lock()
+            .map_err(|_| SettleError::Mint("rotor lock is poisoned".to_string()))?;
+        match claim::finish(&mut guard, &mint, &rotor, &txid, now) {
+            Ok(done) => {
+                finished += 1;
+                println!(
+                    "{txid}: finished an accepted claim ({} units signed by keyset {})",
+                    done.issued_units, done.keyset
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "{txid}: could not finish an accepted claim: {} ({})",
+                    e.why, e.code
+                );
+                first_error.get_or_insert(SettleError::Mint(format!("{txid}: {}", e.why)));
+            }
+        }
+    }
+    first_error.map_or(Ok(finished), Err)
 }
 
 /// What one scan pass takes from the settings.
@@ -149,8 +207,6 @@ pub struct Pass<'a> {
     pub data_dir: &'a Path,
     /// The wallet's name, for the log.
     pub wallet: &'a str,
-    /// `settle.min_confirmations`: how deep the checkpoint trails the tip.
-    pub min_confirmations: u32,
     /// The terms and fees every payment is settled under.
     pub policy: &'a Policy,
     /// The mint's DID key: payloads are sealed to its public half.
@@ -165,14 +221,13 @@ pub struct Pass<'a> {
 /// (`run_once_shared`), print what happened, and only then save the checkpoint.
 ///
 /// A payment whose data does not open with the DID key is not for this mint and
-/// is ignored, not rejected. A failed pass leaves the checkpoint where it was, so
+/// is ignored. A failed pass leaves the checkpoint where it was, so
 /// the same blocks are read again next time. The records are locked only to read
 /// what is unsettled and, one payment at a time, to settle it; never while the
 /// wallet is scanned or a price is fetched.
 ///
-/// The callers follow it with [`deliver`] and [`forfeit`], whether or not it
-/// worked: what was issued before is owed its record, and a window that closed
-/// stays closed.
+/// The callers follow it with [`deliver`] and [`expire`], whether or not it
+/// worked: what is owed is owed its record, and a window that closed stays closed.
 pub fn cycle(
     pass: &Pass,
     node: &dyn Node,
@@ -181,12 +236,16 @@ pub fn cycle(
     records: &Mutex<Records>,
     price: &mut dyn FnMut() -> Result<u64, String>,
 ) -> Result<(), Box<dyn Error>> {
+    // Claims the mint accepted and did not finish storing come first, before
+    // anything new is settled and before the key sets rotate; this does not need
+    // bitcoind, so a pass that cannot reach it still finishes them.
+    recover(&state.logic, rot, records, now_secs())?;
     let checkpoint = scan::Checkpoint::load(pass.data_dir)?;
     let unsettled = lock_records(records)?.unsettled();
     let since = scan::since(
         node,
         checkpoint.as_ref(),
-        pass.min_confirmations,
+        pass.policy.terms.highest(),
         &unsettled,
     )?;
     let (found, ignored) = seal::open_payloads(pass.did, since.received);
@@ -209,39 +268,64 @@ pub fn cycle(
             .map_err(|_| "the rotor lock is poisoned")?
             .refresh(&mut logic)?;
     }
-    let terms = pass.policy.terms;
-    run_once_shared(
+    let terms = &pass.policy.terms;
+    let mut beyond_horizon = 0usize;
+    let settled = run_once_shared(
         &state.logic,
         rot,
         records,
         &found,
         price,
         &mut |received, settlement| {
-            if pass.quiet && matches!(settlement, Settlement::AlreadySettled(_)) {
+            if matches!(settlement, Settlement::BeyondHorizon) {
+                // Counted and said once per pass, not once per payment.
+                beyond_horizon += 1;
                 return;
             }
-            for line in describe_with(received, settlement, &terms) {
+            if pass.quiet
+                && matches!(
+                    settlement,
+                    Settlement::AlreadySettled(_) | Settlement::Pruned
+                )
+            {
+                return;
+            }
+            for line in describe_with(received, settlement, terms) {
                 println!("{line}");
             }
         },
         pass.policy,
-    )?;
+        now_secs(),
+    );
+    if beyond_horizon > 0 {
+        println!(
+            "ignored {beyond_horizon} payment(s) with no record from before the prune cutoff \
+             (settle.prune_horizon_days): too old to settle"
+        );
+    }
+    settled?;
     // Only after every payment was processed: a failed pass reads the same
     // blocks again next time.
     since.next.save(pass.data_dir)?;
     Ok(())
 }
 
-/// Write the records of every purchase that is owed one and has none stored.
+/// Write the owed record of every payment that has one and has none stored.
 /// Never fails a scan: what could not be written is printed and tried again on the
 /// next pass. Without a deliverer (`air.server` and `air.host` not set) the
-/// purchases stay in the records, and `quiet` leaves out saying so.
-pub fn deliver(deliverer: &mut Option<Deliverer>, records: &Mutex<Records>, quiet: bool) {
+/// records stay in the payments' records, and `quiet` leaves out saying so.
+pub fn deliver(
+    deliverer: &mut Option<Deliverer>,
+    records: &Mutex<Records>,
+    quiet: bool,
+    wall_now: u64,
+) {
     match deliverer {
         Some(deliverer) => {
             // The records are locked to plan and to apply, not while the
-            // records are written to the AIR server.
-            deliverer.pass_shared(records, Instant::now());
+            // records are written to the AIR server. `wall_now` (Unix seconds)
+            // opens the claim window of a record that lands in this pass.
+            deliverer.pass_shared(records, Instant::now(), wall_now);
         }
         None => {
             let Ok(guard) = lock_records(records) else {
@@ -252,52 +336,73 @@ pub fn deliver(deliverer: &mut Option<Deliverer>, records: &Mutex<Records>, quie
             drop(guard);
             if waiting > 0 && !quiet {
                 println!(
-                    "{waiting} purchase(s) are waiting for their signatures to be delivered over \
-                     AIR; air.server and air.host are not set, so they stay in the records"
+                    "{waiting} owed record(s) are waiting to be written over AIR; air.server \
+                     and air.host are not set, so they stay in the records"
                 );
             }
         }
     }
 }
 
-/// Forfeit every payment whose reconciliation window closed at or before `now`
-/// with the payment still open: the mint keeps the BTC and owes nothing, and
-/// `/audit` shows it apart. Never fails a scan. A poisoned records lock is logged
-/// and skipped (the watcher in `serve` exits the process).
-pub fn forfeit(records: &Mutex<Records>, now: u64) {
+/// Close the claim window of every owed payment whose `open_until` (its record's
+/// landing plus the window) is at or before `now` and that was not claimed: the
+/// mint keeps the BTC and owes nothing, and `/audit` shows it apart as expired. A
+/// claim accepted before the window closed is not expired (it is finished), and a
+/// payment whose owed record is not stored on AIR has no window and does not
+/// expire. Expiry does not depend on the retention setting: with
+/// `settle.retention_days` 0 a payment still expires on time, and the expired
+/// record stays.
+///
+/// Then, in the same step, prune (`Records::prune`): the finished payments
+/// (claimed, expired, kept, or given up on) `retention_secs`
+/// (`settle.retention_days`) after they finished, and the markers older than
+/// `horizon_secs` (`settle.prune_horizon_days`), and say how many of each. 0 for
+/// either keeps everything it governs. Never fails a scan. A poisoned records lock
+/// is logged and skipped (the watcher in `serve` exits the process).
+pub fn expire(records: &Mutex<Records>, now: u64, retention_secs: u64, horizon_secs: u64) {
     let Ok(mut guard) = lock_records(records) else {
-        eprintln!("forfeit check skipped: the settlement records lock is poisoned");
+        eprintln!("expiry check skipped: the settlement records lock is poisoned");
         return;
     };
-    match guard.forfeit_expired(now) {
+    match guard.expire_unclaimed(now) {
         Ok(gone) => {
             for txid in gone {
                 println!(
-                    "forfeited {txid}: its reconciliation window closed with the payment \
-                     unsettled; the mint keeps the BTC"
+                    "expired {txid}: its claim window closed with the payment unclaimed; the \
+                     mint keeps the BTC"
                 );
             }
         }
-        Err(e) => eprintln!("forfeit check failed, will retry: {e}"),
+        Err(e) => eprintln!("expiry check failed, will retry: {e}"),
     }
-}
-
-/// Basis points as a percentage: 100 is "1%", 150 is "1.5%".
-pub fn percent_text(bps: u128) -> String {
-    let (whole, rest) = (bps / 100, bps % 100);
-    if rest == 0 {
-        format!("{whole}%")
-    } else if rest % 10 == 0 {
-        format!("{whole}.{}%", rest / 10)
-    } else {
-        format!("{whole}.{rest:02}%")
+    match guard.prune(now, retention_secs, horizon_secs) {
+        Ok(done) => {
+            if done.removed > 0 {
+                println!(
+                    "pruned {} finished payment(s) (claimed, expired, kept or given up on) {} \
+                     day(s) ago or more from the records",
+                    done.removed,
+                    retention_secs / 86_400
+                );
+            }
+            if done.markers_dropped > 0 || done.counters_dropped > 0 {
+                println!(
+                    "dropped {} pruned-payment marker(s) and {} claim-key counter(s) older than \
+                     the {}-day prune horizon",
+                    done.markers_dropped,
+                    done.counters_dropped,
+                    horizon_secs / 86_400
+                );
+            }
+        }
+        Err(e) => eprintln!("pruning the records failed, will retry: {e}"),
     }
 }
 
 /// The lines printed for a payment, with the numbers of the given settlement
 /// rules.
 pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms) -> Vec<String> {
-    let (lock, min) = (terms.lock_confirmations, terms.min_confirmations);
+    let lock = terms.lock_confirmations;
     let mut lines = vec![format!(
         "{} confirmations={} value_sats={}",
         received.txid, received.confirmations, received.value_sats
@@ -309,79 +414,34 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
         Settlement::Locked {
             confirmations,
             price_cents,
+            tier_confirmations,
+            due_units,
         } => lines.push(format!(
-            "  price locked at {} USD/BTC, waiting: {confirmations} of {min} confirmations",
+            "  price locked at {} USD/BTC, {due_units} unit(s) owed once it has \
+             {tier_confirmations} confirmations (it has {confirmations})",
             cents_text(*price_cents)
         )),
         Settlement::AlreadySettled(status) => lines.push(format!("  already settled ({status:?})")),
+        Settlement::Pruned => lines.push(
+            "  already settled and since pruned from the records; nothing more to do".to_string(),
+        ),
+        Settlement::BeyondHorizon => lines.push(
+            "  too old to settle: no record, and its block is before the prune cutoff".to_string(),
+        ),
         Settlement::PriceUnavailable(why) => lines.push(format!(
             "  waiting: no price this run ({why}); will retry next run"
         )),
-        Settlement::Rejected(Rejection::NoDataOutput) => {
-            lines.push("  rejected: no single data output".to_string())
+        Settlement::Kept(Kept::NoDataOutput) => {
+            lines.push("  kept, nothing owed: no single data output".to_string())
         }
-        Settlement::Rejected(why) => lines.push(format!("  rejected: {why:?}")),
-        Settlement::PaidUnsettled(held) => {
-            lines.push(format!("  over/under: {} bps", held.over_under_bps));
-            // The record is made, the BTC is held, and the payer's delivery
-            // record (over AIR) carries the rules for a corrected request.
-            lines.push(format!(
-                "  paid but unsettled: {} units requested, {} paid; no smaller request gets within {} of the amount paid, so nothing was signed and the BTC is held for reply key {}",
-                held.requested_units,
-                held.paid_units,
-                percent_text(terms.reconciliation_target_bps),
-                hex::encode(held.payer_did)
-            ));
-            let days = terms.reconciliation_window_secs.div_ceil(86_400);
-            lines.push(format!(
-                "  the payer is told over AIR and can send a corrected request (kind 15); if it is not settled within {days} day(s) the payment is forfeited and the mint keeps the BTC"
-            ));
-        }
-        Settlement::Issued(issue) => {
-            lines.push(format!("  over/under: {} bps", issue.over_under_bps));
-            if issue.within_tolerance && issue.over_under_bps != 0 {
-                lines.push(format!(
-                    "  within the price tolerance ({}): settled in full as if exact",
-                    percent_text(terms.price_tolerance_bps)
-                ));
-            }
-            if issue.skipped_units > 0 {
-                lines.push(format!(
-                    "  underpaid: the smallest outputs were dropped ({} units not signed); what is signed is within {} of the amount paid and the mint keeps the remainder",
-                    issue.skipped_units,
-                    percent_text(terms.reconciliation_target_bps)
-                ));
-            }
-            if issue.credit_cents > 0 {
-                // The credit is recorded; the payer claims it over AIR (kind 15)
-                // with a credit claim signed by the reply key.
-                lines.push(format!(
-                    "  overpaid by more than {}: credit {} USD recorded for reply key {}; the payer can claim it over AIR (kind 15)",
-                    percent_text(terms.reconciliation_target_bps),
-                    cents_text(issue.credit_cents),
-                    hex::encode(issue.payer_did)
-                ));
-            }
-            // Counts and amounts only. The signatures are not logged: they are
-            // stored in the purchase's record and written to the AIR server as
-            // its delivery record (see `delivery`).
-            let signed = issue.results.iter().filter(|r| r.is_ok()).count();
-            lines.push(format!(
-                "  signed {signed} output(s), {} unit(s)",
-                issue.signed_units
-            ));
-            let failed: Vec<String> = issue
-                .results
-                .iter()
-                .filter_map(|r| r.as_ref().err().map(|e| e.to_string()))
-                .collect();
-            if let Some(first) = failed.first() {
-                lines.push(format!(
-                    "  not issued: {} output(s), the first because: {first}",
-                    failed.len()
-                ));
-            }
-        }
+        Settlement::Kept(why) => lines.push(format!("  kept, nothing owed: {why}")),
+        Settlement::Owed(owed) => lines.push(format!(
+            "  owed {} unit(s) to claim key {} (record {}); once the record is stored over AIR \
+             the wallet can claim them, once (kind 15), within the claim window",
+            owed.due_units,
+            owed.claim_did.to_hex(),
+            owed.index
+        )),
     }
     lines
 }
@@ -389,20 +449,19 @@ pub fn describe_with(received: &Received, settlement: &Settlement, terms: &Terms
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::records::Status;
+    use crate::records::{PendingClaim, Status};
     use crate::rotation::{Rollovers, Rotor};
     use crate::server::SharedRotating;
-    use mint_types::Amount;
-    use sp_wire::air_request::delivery::Outcome;
+    use mint_types::{Amount, BlindNonce, MintOutput};
+    use secp256k1::{PublicKey, SECP256K1, SecretKey};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    // DID 0279be66..1798, then outputs 4 -> 3G and 1 -> 5G (5 units in all)
-    const PAYLOAD_HEX: &str = "210279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f8179802000000000000000402f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f90000000000000001022f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4";
-    /// $10,000 per BTC: a unit is $0.10, so 5,000 sats is exactly the 5 units
-    /// requested.
-    const BTC_10K: u64 = 1_000_000;
+    /// $100,000 per BTC: 100 sats are exactly 1 unit ($0.10), so 500 sats are the
+    /// 5 units the payments below are owed, and worth 50 cents (the base tier, 3).
+    const BTC_100K: u64 = 10_000_000;
+    const NOW: u64 = 1_800_000_000;
 
     /// The mint wired the way `Settings::open_mint` wires it: the rotor and its
     /// rollovers behind a `Rotating`, the mint behind its mutex, and the
@@ -425,33 +484,14 @@ mod tests {
                 )
             }));
             let _ = fs::remove_dir_all(&dir);
-            let (rotor, logic) = Rotor::open(&dir, Amount::from_units(1024), 0, 0).unwrap();
+            let (rotor, logic) = Rotor::open(&dir, 0, 0).unwrap();
             let rollovers = Rollovers::open(&dir).unwrap();
             Mint {
                 logic: Mutex::new(logic),
                 rot: Rotating::new(rotor, rollovers),
-                records: Mutex::new(Records::open(&dir.join("settlements.json")).unwrap()),
+                records: Mutex::new(Records::open(&dir.join(crate::records::FILE)).unwrap()),
                 dir,
             }
-        }
-
-        /// One cycle under `policy`.
-        fn run_under(
-            &self,
-            found: &[Received],
-            price: &mut dyn FnMut() -> Result<u64, String>,
-            report: &mut dyn FnMut(&Received, &Settlement),
-            policy: &Policy,
-        ) -> Result<(), SettleError> {
-            run_once_shared(
-                &self.logic,
-                &self.rot,
-                &self.records,
-                found,
-                price,
-                report,
-                policy,
-            )
         }
 
         /// One cycle under the default policy.
@@ -461,8 +501,17 @@ mod tests {
             price: &mut dyn FnMut() -> Result<u64, String>,
             report: &mut dyn FnMut(&Received, &Settlement),
         ) {
-            self.run_under(found, price, report, &Policy::default())
-                .unwrap();
+            run_once_shared(
+                &self.logic,
+                &self.rot,
+                &self.records,
+                found,
+                price,
+                report,
+                &Policy::default(),
+                NOW,
+            )
+            .unwrap();
         }
 
         fn record(&self, txid: &str) -> Option<crate::records::Record> {
@@ -480,12 +529,19 @@ mod tests {
         }
     }
 
+    /// A payment of 500 sats to the claim key `[7; 32]`.
     fn received(txid: &str, confirmations: u32) -> Received {
+        let key = SecretKey::from_slice(&[7; 32]).unwrap();
         Received {
             txid: txid.to_string(),
             confirmations,
-            value_sats: 5_000,
-            payload: Some(hex::decode(PAYLOAD_HEX).unwrap()),
+            value_sats: 500,
+            block_time: Some(NOW),
+            payload: Some(
+                PublicKey::from_secret_key(SECP256K1, &key)
+                    .serialize()
+                    .to_vec(),
+            ),
         }
     }
 
@@ -501,26 +557,26 @@ mod tests {
                 asked += 1;
                 // another thread (the HTTP API) could take the lock right now
                 seen_free.push(m.logic.try_lock().is_ok());
-                Ok(BTC_10K)
+                Ok(BTC_100K)
             },
             &mut |_, _| {},
         );
         assert_eq!(asked, 1);
         assert_eq!(seen_free, vec![true]);
-        assert_eq!(m.record("aa").unwrap().locked_price_cents, Some(BTC_10K));
+        assert_eq!(m.record("aa").unwrap().locked_price_cents, BTC_100K);
     }
 
     #[test]
     fn the_records_are_not_locked_while_the_price_is_fetched() {
-        // A reconciliation request (kind 15) takes the records lock: it must not
-        // wait for a price source.
+        // A claim (kind 15) takes the records lock: it must not wait for a price
+        // source.
         let m = Mint::open("records-free");
         let mut seen_free = Vec::new();
         m.run(
             &[received("aa", 1)],
             &mut || {
                 seen_free.push(m.records.try_lock().is_ok());
-                Ok(BTC_10K)
+                Ok(BTC_100K)
             },
             &mut |_, _| {},
         );
@@ -533,32 +589,32 @@ mod tests {
         let mut asked = 0;
         let mut price = || {
             asked += 1;
-            Ok(BTC_10K)
+            Ok(BTC_100K)
         };
         // not in a block yet: no price
         m.run(&[received("zero", 0)], &mut price, &mut |_, _| {});
         // first sight at 1 confirmation: price
         m.run(&[received("aa", 1)], &mut price, &mut |_, _| {});
-        // already locked: no price, then settled: no price
+        // already locked: no price, then owed: no price
+        m.run(&[received("aa", 2)], &mut price, &mut |_, _| {});
         m.run(&[received("aa", 3)], &mut price, &mut |_, _| {});
-        m.run(&[received("aa", 6)], &mut price, &mut |_, _| {});
         m.run(&[received("aa", 7)], &mut price, &mut |_, _| {});
         assert_eq!(asked, 1);
-        assert_eq!(m.record("aa").unwrap().status, Status::Issued);
+        assert_eq!(m.record("aa").unwrap().status, Status::Owed);
         assert!(m.record("zero").is_none());
     }
 
     #[test]
-    fn a_reorg_after_settlement_never_settles_twice_and_one_before_waits() {
+    fn a_reorg_after_the_owed_record_never_makes_a_second_one_and_one_before_waits() {
         let m = Mint::open("reorg");
-        let mut price = || Ok(BTC_10K);
-        let mut issued = 0;
+        let mut price = || Ok(BTC_100K);
+        let mut owed = 0;
         let mut count = |_: &Received, s: &Settlement| {
-            if matches!(s, Settlement::Issued(_)) {
-                issued += 1;
+            if matches!(s, Settlement::Owed(_)) {
+                owed += 1;
             }
         };
-        // locked at 1, then a reorg takes it back to 0 before it settles: it waits
+        // locked at 1, then a reorg takes it back to 0 before its tier: it waits
         m.run(&[received("aa", 1)], &mut price, &mut count);
         m.run(&[received("aa", 0)], &mut price, &mut count);
         assert_eq!(m.record("aa").unwrap().status, Status::Locked);
@@ -566,16 +622,16 @@ mod tests {
             m.records.lock().unwrap().unsettled(),
             vec!["aa".to_string()]
         );
-        // mined again and settled at 6
-        m.run(&[received("aa", 6)], &mut price, &mut count);
-        assert_eq!(m.record("aa").unwrap().status, Status::Issued);
+        // mined again and at its tier of 3
+        m.run(&[received("aa", 3)], &mut price, &mut count);
+        assert_eq!(m.record("aa").unwrap().status, Status::Owed);
         assert!(m.records.lock().unwrap().unsettled().is_empty());
-        // a later reorg and re-mining is seen again but never issues again
+        // a later reorg and re-mining is seen again but never owes again
         m.run(&[received("aa", 0)], &mut price, &mut count);
         m.run(&[received("aa", 6)], &mut price, &mut count);
-        assert_eq!(issued, 1);
-        assert_eq!(m.record("aa").unwrap().status, Status::Issued);
-        assert_eq!(m.issued_units(), 5);
+        assert_eq!(owed, 1);
+        // and nothing was signed: the notes are made when the record is claimed
+        assert_eq!(m.issued_units(), 0);
     }
 
     #[test]
@@ -595,12 +651,12 @@ mod tests {
         assert!(m.record("aa").is_none());
 
         let mut reports = Vec::new();
-        m.run(&found, &mut || Ok(BTC_10K), &mut |r, s| {
+        m.run(&found, &mut || Ok(BTC_100K), &mut |r, s| {
             reports.push((r.txid.clone(), describe_with(r, s, &terms)))
         });
         assert_eq!(
             reports[0].1[1],
-            "  price locked at 10000.00 USD/BTC, waiting: 1 of 6 confirmations"
+            "  price locked at 100000.00 USD/BTC, 5 unit(s) owed once it has 3 confirmations (it has 1)"
         );
         assert!(m.record("aa").is_some() && m.record("bb").is_some());
     }
@@ -613,8 +669,8 @@ mod tests {
         let m = Mint::open("sealed");
         let mint = SecretKey::new();
         let other = SecretKey::new();
-        let plain = hex::decode(PAYLOAD_HEX).unwrap();
-        // first seen with 6 confirmations, so it locks and settles in one run
+        let plain = received("x", 6).payload.unwrap();
+        // first seen with 6 confirmations, so it locks and is owed in one run
         let mut ours = received("ours", 6);
         ours.payload = Some(seal::encrypt(&mint.public_key(), &plain).unwrap());
         let mut theirs = received("theirs", 6);
@@ -629,140 +685,94 @@ mod tests {
             &found,
             &mut || {
                 asked += 1;
-                Ok(BTC_10K)
+                Ok(BTC_100K)
             },
             &mut |_, _| {},
         );
 
-        // only the payment sealed to this mint was priced, recorded and issued
+        // only the payment sealed to this mint was priced and recorded
         assert_eq!(asked, 1);
-        assert_eq!(m.record("ours").unwrap().status, Status::Issued);
+        assert_eq!(m.record("ours").unwrap().status, Status::Owed);
         assert!(m.record("theirs").is_none());
         assert!(m.record("cleartext").is_none());
-        assert_eq!(m.issued_units(), 5);
     }
 
     #[test]
-    fn the_scan_log_has_counts_and_amounts_and_no_signature() {
+    fn the_scan_log_names_the_claim_key_and_the_units_and_the_record_holds_the_rest() {
         let m = Mint::open("describe");
         let terms = Policy::default().terms;
         let r = received("aa", 6);
         let mut lines = Vec::new();
         m.run(
             std::slice::from_ref(&r),
-            &mut || Ok(BTC_10K),
+            &mut || Ok(BTC_100K),
             &mut |r, s| lines = describe_with(r, s, &terms),
         );
+        let claim = r.payload.as_ref().map(hex::encode).unwrap();
         assert_eq!(
             lines,
             [
-                "aa confirmations=6 value_sats=5000",
-                "  over/under: 0 bps",
-                "  signed 2 output(s), 5 unit(s)",
+                "aa confirmations=6 value_sats=500".to_string(),
+                format!(
+                    "  owed 5 unit(s) to claim key {claim} (record 0); once the record is stored over AIR the wallet can claim them, once (kind 15), within the claim window"
+                ),
             ]
         );
-        // what the payer is owed is in the record, and none of it is in the log
-        let record = m.record("aa").unwrap();
-        let Outcome::Signed(signed) = record.delivery.unwrap().outcome else {
-            panic!("an exact purchase is issued");
-        };
-        assert_eq!(signed.signatures.len(), 2);
-        for owed in &signed.signatures {
-            for line in &lines {
-                assert!(!line.contains(&owed.blind_nonce), "{line}");
-                assert!(!line.contains(&owed.signature), "{line}");
-            }
-        }
-    }
-    #[test]
-    fn log_amounts_are_printed_as_dollars_and_percent() {
-        assert_eq!(cents_text(8_167_355), "81673.55");
-        assert_eq!(cents_text(5), "0.05");
-        assert_eq!(cents_text(10_000_000), "100000.00");
-        assert_eq!(percent_text(100), "1%");
-        assert_eq!(percent_text(1000), "10%");
-        assert_eq!(percent_text(150), "1.5%");
-        assert_eq!(percent_text(125), "1.25%");
-        assert_eq!(percent_text(5), "0.05%");
     }
 
     #[test]
-    fn describe_uses_the_numbers_in_force() {
-        let terms = Terms {
-            lock_confirmations: 2,
-            min_confirmations: 3,
-            price_tolerance_bps: 50,
-            reconciliation_target_bps: 150,
-            reconciliation_window_secs: 86_400,
-        };
+    fn every_settlement_is_described() {
+        use crate::settle::{Kept, OwedNow};
+        let terms = Terms::default();
         let r = received("dd", 1);
-        let waiting = describe_with(&r, &Settlement::Waiting { confirmations: 1 }, &terms);
-        assert!(waiting[1].contains("1 of 2 confirmation"), "{waiting:?}");
-        let locked = describe_with(
-            &r,
-            &Settlement::Locked {
-                confirmations: 2,
-                price_cents: 10_000_000,
-            },
-            &terms,
+        let claim = sp_wire::ServiceDid::from_slice(r.payload.as_ref().unwrap()).unwrap();
+        let owed_line = format!(
+            "  owed 7 unit(s) to claim key {} (record 1); once the record is stored over AIR the wallet can claim them, once (kind 15), within the claim window",
+            hex::encode(r.payload.as_ref().unwrap())
         );
-        assert!(locked[1].contains("2 of 3 confirmations"), "{locked:?}");
-        let issue = settle::Issue {
-            keyset: "00".repeat(8),
-            results: vec![],
-            blind_nonces: vec![],
-            signed_units: 0,
-            skipped_units: 2,
-            credit_cents: 100,
-            over_under_bps: 0,
-            within_tolerance: false,
-            payer_did: [7; crate::payload::DID_LEN],
-        };
-        let lines = describe_with(&r, &Settlement::Issued(issue), &terms);
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("within 1.5% of the amount paid")),
-            "{lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("overpaid by more than 1.5%")),
-            "{lines:?}"
-        );
-        // a credit names the reply key and says how it is claimed (kind 15)
-        let credit = format!(
-            "  overpaid by more than 1.5%: credit 1.00 USD recorded for reply key {}; the payer can claim it over AIR (kind 15)",
-            "07".repeat(33)
-        );
-        assert!(lines.contains(&credit), "{lines:?}");
-        let held = settle::Unsettled {
-            payer_did: [7; crate::payload::DID_LEN],
-            requested_units: 100,
-            paid_units: 60,
-            value_sats: 60_000,
-            over_under_bps: -4000,
-        };
-        let lines = describe_with(&r, &Settlement::PaidUnsettled(held), &terms);
-        assert_eq!(lines[1], "  over/under: -4000 bps");
-        assert_eq!(
-            lines[2],
-            format!(
-                "  paid but unsettled: 100 units requested, 60 paid; no smaller request gets within 1.5% of the amount paid, so nothing was signed and the BTC is held for reply key {}",
-                "07".repeat(33)
-            )
-        );
-        // kind 15 is built: the payer can answer, and the window is the terms'
-        assert_eq!(
-            lines[3],
-            "  the payer is told over AIR and can send a corrected request (kind 15); if it is not settled within 1 day(s) the payment is forfeited and the mint keeps the BTC"
-        );
-        // and nothing says the exchange is not built
-        for line in &lines {
-            assert!(!line.contains("not built"), "{line}");
-            assert!(!line.contains("payer DID"), "{line}");
+        let cases: Vec<(Settlement, &str)> = vec![
+            (
+                Settlement::Waiting { confirmations: 0 },
+                "  waiting: 0 of 1 confirmation to lock the price",
+            ),
+            (
+                Settlement::AlreadySettled(Status::Kept),
+                "  already settled (Kept)",
+            ),
+            (
+                Settlement::Kept(Kept::NoDataOutput),
+                "  kept, nothing owed: no single data output",
+            ),
+            (
+                Settlement::Kept(Kept::NothingOwed {
+                    value_units: 3,
+                    costs: 4,
+                }),
+                "  kept, nothing owed: the payment buys 3 unit(s) at the locked price and the prepaid costs (4) leave nothing to claim",
+            ),
+            (
+                Settlement::Locked {
+                    confirmations: 2,
+                    price_cents: 10_000_000,
+                    tier_confirmations: 4,
+                    due_units: 120_000,
+                },
+                "  price locked at 100000.00 USD/BTC, 120000 unit(s) owed once it has 4 confirmations (it has 2)",
+            ),
+            (
+                Settlement::Owed(OwedNow {
+                    claim_did: claim,
+                    index: 1,
+                    due_units: 7,
+                }),
+                &owed_line,
+            ),
+        ];
+        for (settlement, line) in cases {
+            assert_eq!(describe_with(&r, &settlement, &terms)[1], line);
         }
+        assert_eq!(cents_text(8_167_355), "81673.55");
+        assert_eq!(cents_text(5), "0.05");
     }
 
     #[test]
@@ -790,24 +800,63 @@ mod tests {
             &m.rot,
             &records,
             &found,
-            &mut || Ok(BTC_10K),
+            &mut || Ok(BTC_100K),
             &mut |_, _| reported += 1,
             &Policy::default(),
+            NOW,
         )
         .unwrap_err();
         assert!(matches!(err, SettleError::RecordsPoisoned), "{err}");
         assert_eq!(reported, 0, "nothing was settled or reported");
-        assert_eq!(m.issued_units(), 0);
         assert!(records.is_poisoned(), "the lock was not recovered");
     }
 
+    /// "bb" is owed and has a claim accepted and not finished (what a crash
+    /// leaves), saved in full from the real types.
+    fn with_a_claim_to_recover(m: &Mint) {
+        m.run(&[received("bb", 6)], &mut || Ok(BTC_100K), &mut |_, _| {});
+        let mut record = m.record("bb").unwrap();
+        assert_eq!(record.status, Status::Owed);
+        let (epoch, keyset) = {
+            let rotor = m.rot.rotor.lock().unwrap();
+            (rotor.current.epoch, rotor.current.id.clone())
+        };
+        let blind = SecretKey::from_slice(&[9; 32]).unwrap();
+        record.claim_pending = Some(PendingClaim {
+            hash: "ab".repeat(32),
+            epoch,
+            keyset,
+            outputs: vec![MintOutput {
+                amount: Amount::from_units(4),
+                blind_nonce: BlindNonce(PublicKey::from_secret_key(SECP256K1, &blind)),
+            }],
+        });
+        m.records.lock().unwrap().put("bb", record).unwrap();
+    }
+
+    fn run_aa(m: &Mint, logic: &Mutex<MintLogic>, rot: &Rotating) -> Result<(), SettleError> {
+        run_once_shared(
+            logic,
+            rot,
+            &m.records,
+            &[received("aa", 6)],
+            &mut || Ok(BTC_100K),
+            &mut |_, _| {},
+            &Policy::default(),
+            NOW,
+        )
+    }
+
+    /// Fails if a pass takes the mint or the rotor lock without a claim to
+    /// recover (the last assert), or if a pass that cannot take them settles a
+    /// payment, finishes the claim, or signs anything (the first four).
     #[test]
-    fn a_poisoned_mint_or_rotor_lock_fails_the_pass_and_settles_nothing() {
+    fn a_poisoned_mint_or_rotor_lock_fails_a_pass_with_a_claim_to_recover() {
+        // the mint lock, poisoned
         let m = Mint::open("poison-mint");
+        with_a_claim_to_recover(&m);
         let logic = Arc::new(Mutex::new(
-            Rotor::open(&m.dir.join("other"), Amount::from_units(16), 0, 0)
-                .unwrap()
-                .1,
+            Rotor::open(&m.dir.join("other"), 0, 0).unwrap().1,
         ));
         let held = Arc::clone(&logic);
         let died = std::thread::spawn(move || {
@@ -816,29 +865,18 @@ mod tests {
         })
         .join();
         assert!(died.is_err());
-        let mut reported = 0;
-        let err = run_once_shared(
-            &logic,
-            &m.rot,
-            &m.records,
-            &[received("aa", 6)],
-            &mut || Ok(BTC_10K),
-            &mut |_, _| reported += 1,
-            &Policy::default(),
-        )
-        .unwrap_err();
-        match err {
+        match run_aa(&m, &logic, &m.rot).unwrap_err() {
             SettleError::Mint(why) => assert_eq!(why, "mint lock is poisoned"),
             other => panic!("{other}"),
         }
-        assert_eq!(reported, 0);
-        // the mint is needed before the payment is looked at: no record, and
-        // nothing was signed
         assert!(m.record("aa").is_none());
+        let pending = m.record("bb").unwrap();
+        assert!(pending.claim_pending.is_some() && pending.claimed.is_none());
         assert_eq!(m.issued_units(), 0);
 
-        // a poisoned rotor lock fails the pass the same way
+        // the rotor lock, poisoned, the same way
         let m = Mint::open("poison-rotor");
+        with_a_claim_to_recover(&m);
         let rot = Arc::clone(&m.rot);
         let died = std::thread::spawn(move || {
             let _guard = rot.rotor.lock().unwrap();
@@ -846,143 +884,72 @@ mod tests {
         })
         .join();
         assert!(died.is_err());
-        let err = m
-            .run_under(
-                &[received("aa", 6)],
-                &mut || Ok(BTC_10K),
-                &mut |_, _| {},
-                &Policy::default(),
-            )
-            .unwrap_err();
-        match err {
+        match run_aa(&m, &m.logic, &m.rot).unwrap_err() {
             SettleError::Mint(why) => assert_eq!(why, "rotor lock is poisoned"),
             other => panic!("{other}"),
         }
         assert!(m.record("aa").is_none());
+        let pending = m.record("bb").unwrap();
+        assert!(pending.claim_pending.is_some() && pending.claimed.is_none());
         assert_eq!(m.issued_units(), 0);
-    }
 
-    #[test]
-    fn a_payment_the_previous_keyset_names_is_signed_by_it_through_the_cycle() {
-        // The rotor's previous key set reaches settlement: the cycle hands it to
-        // `settle_ruled` as `previous`.
-        let dir = std::env::temp_dir().join(format!("psp-mint-svc-{}-rotated", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        let t = 10_000;
-        let (mut rotor, mut logic) =
-            Rotor::open_at(&dir, Amount::from_units(1024), 1, 1, t).unwrap();
-        rotor.first_issue = Some(t);
-        rotor
-            .clock
-            .store(t + 3600, std::sync::atomic::Ordering::SeqCst);
-        rotor.refresh(&mut logic).unwrap();
-        let previous_id = rotor.previous.as_ref().unwrap().0.id.clone();
-        let current_id = crate::rotation::keyset_id(logic.public_keys());
-        assert_ne!(previous_id, current_id);
-        let rot = Rotating::new(rotor, Rollovers::open(&dir).unwrap());
-        let logic = Mutex::new(logic);
-        let records = Mutex::new(Records::open(&dir.join("settlements.json")).unwrap());
-
-        let mut payload = crate::payload::decode(&hex::decode(PAYLOAD_HEX).unwrap()).unwrap();
-        payload.keyset = Some(previous_id.clone());
-        let mut r = received("aa", 6);
-        r.payload = Some(crate::payload::encode(&payload).unwrap());
-        let mut signed_by = None;
-        run_once_shared(
-            &logic,
-            &rot,
-            &records,
-            &[r],
-            &mut || Ok(BTC_10K),
-            &mut |_, s| {
-                if let Settlement::Issued(issue) = s {
-                    signed_by = Some(issue.keyset.clone());
-                }
-            },
-            &Policy::default(),
-        )
-        .unwrap();
-        assert_eq!(signed_by, Some(previous_id));
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// A payload for the reply key `07..07` asking for these `(units, seed)`
-    /// outputs, in the wire form `payload::decode` reads.
-    fn payload_bytes(outputs: &[(u64, u8)]) -> Vec<u8> {
-        use secp256k1::{PublicKey, SECP256K1, SecretKey};
-        let mut bytes = vec![33u8];
-        bytes.extend_from_slice(&[7u8; 33]);
-        bytes.push(outputs.len() as u8);
-        for &(units, seed) in outputs {
-            bytes.extend_from_slice(&units.to_be_bytes());
-            let key = SecretKey::from_slice(&[seed; 32]).unwrap();
-            bytes.extend_from_slice(&PublicKey::from_secret_key(SECP256K1, &key).serialize());
-        }
-        bytes
-    }
-
-    #[test]
-    fn fees_come_off_what_the_payment_buys_and_are_kept_in_the_records() {
-        // delivery.read_fee 1, reconciliation.fee 2, reconciliation.write_fee 3
-        // (PSP units, $0.10 each at this price)
-        let m = Mint::open("fees");
-        let policy = Policy {
-            fees: crate::settle::ReconcileTerms {
-                fee_units: 2,
-                write_fee_units: 3,
-                read_fee_units: 1,
-                ..Default::default()
-            },
-            ..Policy::default()
-        };
-        // 6,000 sats are 6 units; the first read costs 1, which leaves exactly
-        // the 5 units asked: issued in full, no credit
-        let mut exact = received("exact", 6);
-        exact.value_sats = 6_000;
-        // 12,000 sats are 12 units, less the read 11 against the one note of 16
-        // asked: held, with the rules for the corrected request
-        let mut held = received("held", 6);
-        held.value_sats = 12_000;
-        held.payload = Some(payload_bytes(&[(16, 3)]));
-        let mut kinds = Vec::new();
-        m.run_under(
-            &[exact, held],
-            &mut || Ok(BTC_10K),
-            &mut |r, s| {
-                let kind = match s {
-                    Settlement::Issued(_) => "issued",
-                    Settlement::PaidUnsettled(_) => "held",
-                    _ => "other",
-                };
-                kinds.push((r.txid.clone(), kind));
-            },
-            &policy,
-        )
-        .unwrap();
-        assert_eq!(
-            kinds,
-            vec![
-                ("exact".to_string(), "issued"),
-                ("held".to_string(), "held")
-            ]
+        // with no claim to recover the same poisoned mint lock does not matter:
+        // settling an owed record signs nothing
+        let m = Mint::open("poison-mint-idle");
+        let logic = Arc::new(Mutex::new(
+            Rotor::open(&m.dir.join("other"), 0, 0).unwrap().1,
+        ));
+        let held = Arc::clone(&logic);
+        assert!(
+            std::thread::spawn(move || {
+                let _guard = held.lock().unwrap();
+                panic!("a thread dies holding the mint");
+            })
+            .join()
+            .is_err()
         );
-        let exact = m.record("exact").unwrap();
-        assert_eq!(exact.read_prepaid_units, 1);
-        assert_eq!(exact.credit_cents, 0);
-        assert_eq!(m.issued_units(), 5);
-        let held = m.record("held").unwrap();
-        assert_eq!(held.read_prepaid_units, 1);
-        let rules = held.rules.as_ref().unwrap();
-        // 12 units paid, less the first read (1), the fee (2), the write (3) and
-        // the follow-up's read (1)
-        assert_eq!(rules.due_units, 5);
-        assert_eq!(rules.reconciliation_fee_units, 2);
-        assert_eq!(rules.write_prepaid_units, 3);
-        assert_eq!(rules.read_prepaid_units, 2);
-        // the first reads are revenue, counted in /audit's reconciliation
-        // section; the fee and the write are counted when a reconciliation settles
-        let report = m.records.lock().unwrap().reconciliation();
-        assert_eq!(report.read_prepaid_units, 2);
-        assert_eq!((report.fees_units, report.write_prepaid_units), (0, 0));
+        run_aa(&m, &logic, &m.rot).unwrap();
+        assert_eq!(m.record("aa").unwrap().status, Status::Owed);
+    }
+
+    /// Fails if the window is counted from the record's creation (`NOW`) and not
+    /// from the landing, if an unstored record can expire, or if the pass does not
+    /// prune a payment `retention` after it expired.
+    #[test]
+    fn the_expiry_pass_closes_a_window_that_passed_and_only_that_then_prunes() {
+        const WINDOW: u64 = 2_592_000;
+        const RETENTION: u64 = 90 * 86_400;
+        const HORIZON: u64 = 210 * 86_400;
+        let m = Mint::open("expire");
+        m.run(&[received("aa", 3)], &mut || Ok(BTC_100K), &mut |_, _| {});
+        // made at NOW, not stored on AIR yet: no window, nothing to close
+        assert_eq!(m.record("aa").unwrap().open_until, None);
+        expire(&m.records, NOW + 100 * 86_400, RETENTION, HORIZON);
+        assert!(m.record("aa").unwrap().expired_at.is_none());
+        // stored five days later
+        let landed = NOW + 5 * 86_400;
+        m.records.lock().unwrap().land("aa", landed).unwrap();
+        let until = m.record("aa").unwrap().open_until.unwrap();
+        assert_eq!(until, landed + WINDOW);
+        expire(&m.records, until - 1, RETENTION, HORIZON);
+        assert!(m.record("aa").unwrap().expired_at.is_none());
+        expire(&m.records, until, RETENTION, HORIZON);
+        assert_eq!(m.record("aa").unwrap().expired_at, Some(until));
+        let claims = m.records.lock().unwrap().claims();
+        let shown = (
+            claims.expired.payments,
+            claims.expired.sats,
+            claims.expired.units,
+        );
+        assert_eq!(shown, (1, 500, 5));
+        assert_eq!(claims.unclaimed.payments, 0);
+        // retention after it expired it is pruned, and the totals stay
+        expire(&m.records, until + RETENTION - 1, RETENTION, HORIZON);
+        assert!(m.record("aa").is_some());
+        expire(&m.records, until + RETENTION, RETENTION, HORIZON);
+        assert!(m.record("aa").is_none());
+        assert_eq!(m.records.lock().unwrap().claims(), claims);
+        // its marker stays until the payment's block (NOW) is before the cutoff
+        assert!(m.records.lock().unwrap().was_pruned("aa"));
     }
 }

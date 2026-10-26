@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mint_core::MintLogic;
 use mint_core::keygen;
 use mint_core::store::Store;
-use mint_types::{Amount, DEFAULT_DENOMINATION_BASE, MintConfig, gen_denominations};
+use mint_types::{Amount, MintConfig};
 use secp256k1::{PublicKey, SecretKey};
 use serde::{Deserialize, Serialize};
 
@@ -148,12 +148,18 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Open (or make) generation `epoch`.
-pub fn open_gen(
-    base: &Path,
-    epoch: u64,
-    max: Amount,
-) -> Result<(GenKeys, MintLogic), Box<dyn Error>> {
+/// The denominations of every keyset this mint makes: one key per power of two,
+/// 2^0 to 2^63 (64 keys), as fsp-mint's. A fact of the code, not a setting. The
+/// list is built directly, with no maximum: `gen_denominations` with a maximum of
+/// `u64::MAX` would never end, since its amount saturates at `u64::MAX` and stays
+/// at or below it.
+pub fn denominations() -> Vec<Amount> {
+    (0..64).map(|bit| Amount::from_units(1u64 << bit)).collect()
+}
+
+/// Open (or make) generation `epoch`. A generation made now has the 64 keys of
+/// [`denominations`]; an existing `mint_keys.json` is read as it is.
+pub fn open_gen(base: &Path, epoch: u64) -> Result<(GenKeys, MintLogic), Box<dyn Error>> {
     let dir = gen_dir(base, epoch);
     fs::create_dir_all(&dir)?;
     let path = dir.join(KEYS);
@@ -161,7 +167,7 @@ pub fn open_gen(
         serde_json::from_slice(&fs::read(&path)?)
             .map_err(|e| format!("{} is damaged: {e}", path.display()))?
     } else {
-        let cfg = keygen::generate(&gen_denominations(DEFAULT_DENOMINATION_BASE, max));
+        let cfg = keygen::generate(&denominations());
         write_new(&path, &serde_json::to_vec_pretty(&cfg)?)?;
         cfg
     };
@@ -290,7 +296,6 @@ pub fn load_first_issue(base: &Path) -> Result<Option<u64>, Box<dyn Error>> {
 /// current `MintLogic` (which stays in the shared `AppState`).
 pub struct Rotor {
     pub base: PathBuf,
-    max: Amount,
     pub activation_hours: u64,
     pub period_hours: u64,
     pub first_issue: Option<u64>,
@@ -309,17 +314,15 @@ impl Rotor {
     /// open the previous one if it is on disk, and delete any older one.
     pub fn open(
         base: &Path,
-        max: Amount,
         activation_hours: u64,
         period_hours: u64,
     ) -> Result<(Rotor, MintLogic), Box<dyn Error>> {
-        Self::open_at(base, max, activation_hours, period_hours, 0)
+        Self::open_at(base, activation_hours, period_hours, 0)
     }
 
     /// As `open`, with a fixed clock (`0` is the system clock).
     pub fn open_at(
         base: &Path,
-        max: Amount,
         activation_hours: u64,
         period_hours: u64,
         clock: u64,
@@ -328,7 +331,6 @@ impl Rotor {
         sweep_retiring(base)?;
         let mut r = Rotor {
             base: base.to_path_buf(),
-            max,
             activation_hours,
             period_hours,
             first_issue: load_first_issue(base)?,
@@ -358,10 +360,10 @@ impl Rotor {
                 }
             }
         }
-        let (keys, logic) = open_gen(base, newest, max)?;
+        let (keys, logic) = open_gen(base, newest)?;
         r.current = keys;
         if newest > 0 && exists(base, newest - 1) {
-            r.previous = Some(open_gen(base, newest - 1, max)?);
+            r.previous = Some(open_gen(base, newest - 1)?);
         }
         for old in 0..newest.saturating_sub(1) {
             if exists(base, old) {
@@ -435,7 +437,7 @@ impl Rotor {
     /// Add a generation's totals to `retired.json` (once), then delete it.
     fn retire(&mut self, epoch: u64) -> Result<(), Box<dyn Error>> {
         if !self.retired.epochs.contains(&epoch) {
-            let (keys, logic) = open_gen(&self.base, epoch, self.max)?;
+            let (keys, logic) = open_gen(&self.base, epoch)?;
             self.take_proofs(&logic)?;
             let (i, d) = logic.audit_totals().map_err(|e| e.to_string())?;
             drop(logic);
@@ -491,7 +493,7 @@ impl Rotor {
             } else {
                 self.current.epoch + 1
             };
-            let (keys, logic) = open_gen(&self.base, next, self.max)?;
+            let (keys, logic) = open_gen(&self.base, next)?;
             let old_logic = std::mem::replace(current, logic);
             let old_keys = std::mem::replace(&mut self.current, keys);
             if let Some((k, l)) = self.previous.take() {
@@ -1625,7 +1627,7 @@ mod tests {
         let d = scratch("sweep");
         fs::create_dir_all(d.join("retiring-gen-3/db")).unwrap();
         fs::write(d.join("retiring-gen-3/mint_keys.json"), b"{}").unwrap();
-        let (r, _cur) = Rotor::open(&d, Amount::from_units(16), 1, 1).unwrap();
+        let (r, _cur) = Rotor::open(&d, 1, 1).unwrap();
         assert!(!d.join("retiring-gen-3").exists(), "swept at open");
         assert_eq!(r.resolve("00").unwrap_err().code(), "unknown_keyset");
     }
@@ -1634,7 +1636,7 @@ mod tests {
     fn retired_ids_are_told_from_unknown_ones_and_trimmed_oldest_first() {
         let d = scratch("retired-list");
         let t = 10_000;
-        let (mut r, mut cur) = Rotor::open_at(&d, Amount::from_units(16), 1, 1, t).unwrap();
+        let (mut r, mut cur) = Rotor::open_at(&d, 1, 1, t).unwrap();
         r.first_issue = Some(t);
         let mut ids = vec![r.current.id.clone()];
         for k in 1..=4u64 {
@@ -1668,7 +1670,7 @@ mod tests {
     fn a_crash_after_the_id_is_listed_but_before_the_set_is_deleted_retires_it_once() {
         let d = scratch("retire-crash");
         let t = 10_000;
-        let (mut r, mut cur) = Rotor::open_at(&d, Amount::from_units(16), 1, 1, t).unwrap();
+        let (mut r, mut cur) = Rotor::open_at(&d, 1, 1, t).unwrap();
         r.first_issue = Some(t);
         let id0 = r.current.id.clone();
         r.clock.store(t + 3600, Ordering::SeqCst);
@@ -1681,7 +1683,7 @@ mod tests {
         listed.ids.push(id0.clone());
         save_json(&d.join(RETIRED_FILE), &listed).unwrap();
         save_json(&d.join(FIRST_ISSUE_FILE), &FirstIssue { first_issue: t }).unwrap();
-        let (r, _cur) = Rotor::open_at(&d, Amount::from_units(16), 1, 1, t + 7200).unwrap();
+        let (r, _cur) = Rotor::open_at(&d, 1, 1, t + 7200).unwrap();
         assert!(!d.join("mint_keys.json").exists(), "deleted at the restart");
         assert_eq!(
             load_retired(&d)
@@ -1721,7 +1723,7 @@ mod tests {
     fn the_key_file_is_private() {
         use std::os::unix::fs::PermissionsExt;
         let d = scratch("key-mode");
-        drop(Rotor::open(&d, Amount::from_units(16), 0, 0).unwrap());
+        drop(Rotor::open(&d, 0, 0).unwrap());
         let mode = fs::metadata(d.join(KEYS)).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         fs::remove_dir_all(&d).unwrap();
@@ -1751,19 +1753,39 @@ mod tests {
         assert_eq!(fresh.epoch_at(u64::MAX), 0);
     }
 
+    /// A new generation has exactly the 64 keys 1, 2, 4 ... 2^63. Fails if the key
+    /// set is capped below 2^63 (as `mint.max_denomination_units` capped it), or
+    /// has a gap, or an extra key.
+    #[test]
+    fn a_new_generation_has_exactly_the_keys_1_to_2_to_the_63() {
+        let d = scratch("sixty-four");
+        let (_, logic) = Rotor::open(&d, 1, 1).unwrap();
+        let units: Vec<u64> = logic.public_keys().keys().map(|a| a.units).collect();
+        assert_eq!(units.len(), 64);
+        assert_eq!((units[0], units[1], units[2]), (1, 2, 4));
+        assert_eq!(units[24], 16_777_216);
+        assert_eq!(units[40], 1_099_511_627_776);
+        assert_eq!(units[63], 9_223_372_036_854_775_808);
+        assert!(units.windows(2).all(|w| w[1] == 2 * w[0]));
+        assert_eq!(
+            denominations().iter().map(|a| a.units).collect::<Vec<_>>(),
+            units
+        );
+    }
+
     #[test]
     fn generation_zero_keeps_its_keys_across_restarts_and_old_ones_are_deleted() {
         let d = scratch("gens");
         // Generation 0 is made at the top of the data folder, and a restart finds
         // the same keys.
-        let (first, first_logic) = Rotor::open(&d, Amount::from_units(1024), 1, 1).unwrap();
+        let (first, first_logic) = Rotor::open(&d, 1, 1).unwrap();
         let keys0 = first_logic.public_keys().clone();
-        // 1, 2, 4 ... 1024: eleven denominations
-        assert_eq!(keys0.len(), 11);
+        // 1, 2, 4 ... 2^63: sixty-four denominations
+        assert_eq!(keys0.len(), 64);
         assert!(d.join(KEYS).exists() && d.join(DB).exists());
         drop(first);
         drop(first_logic);
-        let (mut r, mut cur) = Rotor::open(&d, Amount::from_units(1024), 1, 1).unwrap();
+        let (mut r, mut cur) = Rotor::open(&d, 1, 1).unwrap();
         assert_eq!(cur.public_keys(), &keys0, "generation 0 keeps its keys");
         assert_eq!(r.first_issue, None, "nothing issued: rotation not started");
         // First issuance, then the clock passes two periods.
@@ -1795,8 +1817,7 @@ mod tests {
         drop(r);
         drop(cur);
         // A restart finds the same generations and the same first issue.
-        let (r2, _) =
-            Rotor::open_at(&d, Amount::from_units(1024), 1, 1, 10_000 + 2 * 3600).unwrap();
+        let (r2, _) = Rotor::open_at(&d, 1, 1, 10_000 + 2 * 3600).unwrap();
         assert_eq!(r2.first_issue, first);
         assert_eq!(r2.current.epoch, 2);
         assert_eq!(r2.previous.as_ref().unwrap().0.epoch, 1);

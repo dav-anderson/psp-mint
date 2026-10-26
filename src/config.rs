@@ -13,7 +13,7 @@
 //!    names (which must exist);
 //! 3. the default.
 //!
-//! The file is TOML in sections (`[settle]`, `min_confirmations = 6`). A key the
+//! The file is TOML in sections (`[settle]`, `base_confirmations = 3`). A key the
 //! mint does not know is an error, so a misspelt setting never silently does
 //! nothing. So is a value of the wrong type or out of range: the mint lists
 //! every problem and does not start.
@@ -44,11 +44,12 @@ use crate::settle::{self, Terms};
 /// The name of the file looked for in the data directory.
 pub const FILE_NAME: &str = "psp-mint.toml";
 
-/// The shortest PSP rotation period the mint starts with (rotation on).
-/// BTC->PSP claims need time to settle (about an hour for 6 confirmations,
-/// longer in slow blocks) before a rotation; a shorter period would let the
-/// claim hold run into the next rotation. A hard limit, for PSP only.
-pub const MIN_PSP_ROTATION_PERIOD_HOURS: u64 = 24;
+/// The shortest PSP rotation period the mint starts with (rotation on): the
+/// claim window, in hours (720: 30 days). A claim must name the keyset that is
+/// current when it arrives, and a payer has the whole window to claim, so the
+/// keyset a payer claims with has to outlive the window. A hard limit, for PSP
+/// only. It is tied to `sp_wire::psp::CLAIM_WINDOW_SECS`.
+pub const MIN_PSP_ROTATION_PERIOD_HOURS: u64 = sp_wire::psp::CLAIM_WINDOW_SECS / 3600;
 /// The environment variable that names a config file elsewhere.
 pub const FILE_ENV: &str = "PSP_CONFIG";
 /// The default ceiling on one request body (1 MiB).
@@ -74,8 +75,8 @@ pub const MAX_REQUEST_BYTES_CAP: u64 = 15 * 1024 * 1024;
 pub const MIN_REQUEST_BYTES: u64 = 16 * 1024;
 /// The least `rollover.max_items` may be: 64, the most outputs one amount can
 /// need (a `u64` splits into at most 64 powers of two), so that a one-note spend
-/// always fits. The largest change one note can need is 62 outputs, for a
-/// denomination of 2^62, the most `mint.max_denomination_units` allows.
+/// always fits. The largest change one note can need is 63 outputs, for a note of
+/// 2^63, the largest denomination every keyset has.
 pub const MIN_ITEMS: u64 = 64;
 /// The most `rollover.max_items` may be: 25,000. A note and an output in JSON
 /// are 482 bytes together, so a request of that many is 12.05 MB, which fits
@@ -87,11 +88,9 @@ const _: () = {
     assert!(MAX_ITEMS_CAP * 482 < MAX_REQUEST_BYTES_CAP);
     // the widest one-note request is 8,090 bytes; the smallest ceiling is twice that
     assert!(MIN_REQUEST_BYTES >= 2 * 8_090);
-    // a note of the largest denomination (2^62) has change of at most 62 outputs
-    assert!(MIN_ITEMS >= 62);
+    // a note of the largest denomination (2^63) has change of at most 63 outputs
+    assert!(MIN_ITEMS >= 63);
 };
-/// The default largest denomination, in PSP units.
-pub const DEFAULT_MAX_DENOMINATION_UNITS: u64 = 16_777_216;
 /// The default time between scans in `serve`.
 pub const DEFAULT_SCAN_INTERVAL_SECS: u64 = 120;
 /// The default number of scan intervals without a successful scan before
@@ -106,8 +105,76 @@ pub use crate::network::Network;
 /// Why `scan.max_transactions` is refused now.
 pub const RETIRED_MAX_TRANSACTIONS: &str = "scan.max_transactions is retired: the scan now reads every block since its checkpoint (listsinceblock), so there is no window to size. Remove it";
 
-/// Why `settle.underpay_tolerance_bps` and `settle.credit_threshold_bps` are refused now.
-pub const RETIRED_TOLERANCES: &str = "is retired: one setting, settle.payment_reconciliation_target (a fraction; 0.10 is 10%), now covers a payment that is short and one that is over. Remove it";
+/// The settings psp-mint 0.8.0 removed with the tolerance, reconciliation target,
+/// credit and forfeit design, each with why and what to use instead. A removed
+/// key in `psp-mint.toml`, or its environment variable, is an error that stops the
+/// mint (it never silently does something else), and `psp-mint config` says the
+/// same. The renamed ones are not read under their old names.
+pub const REMOVED: &[(&str, &str, &str)] = &[
+    (
+        "settle.min_confirmations",
+        "PSP_MIN_CONFIRMATIONS",
+        "a payment now waits for the confirmation tier its locked USD value picks: set settle.base_confirmations and settle.confirmation_tiers",
+    ),
+    (
+        "settle.price_tolerance",
+        "PSP_PRICE_TOLERANCE",
+        "there is no tolerance: a payment is owed whole units at its locked price, and the remainder under one unit is kept",
+    ),
+    (
+        "settle.payment_reconciliation_target",
+        "PSP_PAYMENT_RECONCILIATION_TARGET",
+        "there is no reconciliation target: a payment is owed whole units at its locked price, and the remainder under one unit is kept",
+    ),
+    (
+        "settle.reconciliation_window_days",
+        "PSP_RECONCILIATION_WINDOW_DAYS",
+        "the claim window is fixed at 30 days (sp_wire::psp::CLAIM_WINDOW_SECS), not a setting",
+    ),
+    (
+        "reconciliation.fee",
+        "PSP_RECONCILIATION_FEE",
+        "there is no reconciliation and no fee on it; the prepaid costs are claim.write_fee and delivery.read_fee",
+    ),
+    (
+        "reconciliation.max_attempts",
+        "PSP_RECONCILIATION_MAX_ATTEMPTS",
+        "it is now claim.max_attempts",
+    ),
+    (
+        "reconciliation.write_fee",
+        "PSP_RECONCILIATION_WRITE_FEE",
+        "it is now claim.write_fee",
+    ),
+    (
+        "reconciliation.round_up_from",
+        "PSP_RECONCILIATION_ROUND_UP_FROM",
+        "there are no credits to round: units round down and the remainder is kept",
+    ),
+    (
+        "settle.underpay_tolerance_bps",
+        "PSP_UNDERPAY_TOLERANCE_BPS",
+        "it was retired earlier and the tolerance design is gone",
+    ),
+    (
+        "settle.credit_threshold_bps",
+        "PSP_CREDIT_THRESHOLD_BPS",
+        "it was retired earlier and the credit design is gone",
+    ),
+    (
+        "mint.max_denomination_units",
+        "PSP_MAX_DENOMINATION_UNITS",
+        "every keyset has one key per power of two, 1 to 2^63 (64 keys), as fsp-mint's: the notes no longer ride in the payment, so there is nothing to cap",
+    ),
+];
+
+/// Why a key (as in the file) was removed, if it was.
+fn removed_key(key: &str) -> Option<String> {
+    REMOVED
+        .iter()
+        .find(|(k, _, _)| *k == key)
+        .map(|(k, _, why)| format!("{k} was removed in psp-mint 0.8.0: {why}. Remove it"))
+}
 
 /// Why `air.enabled` is refused now.
 pub const GONE_AIR_ENABLED: &str = "air.enabled is gone: the AIR listener always runs, because AIR is the only way wallets reach this mint (there is no HTTP API for them). Remove air.enabled; serve needs air.server and air.host (PSP_AIR_SERVER, PSP_AIR_HOST)";
@@ -280,68 +347,52 @@ pub const SPECS: &[Spec] = &[
         what: "A payment's price is locked when it is first seen with this many confirmations.",
     },
     Spec {
-        key: "settle.min_confirmations",
-        env: "PSP_MIN_CONFIRMATIONS",
-        default: "6",
+        key: "settle.base_confirmations",
+        env: "PSP_BASE_CONFIRMATIONS",
+        default: "3",
         units: "confirmations",
         reload: true,
-        what: "A payment is settled, at its locked price, once it has this many confirmations.",
+        what: "The confirmations a payment worth less than the first tier of settle.confirmation_tiers must reach before the mint writes its owed record. It is at least settle.lock_confirmations (the mint refuses to start otherwise).",
     },
     Spec {
-        key: "settle.price_tolerance",
-        env: "PSP_PRICE_TOLERANCE",
-        default: "0.01",
-        units: "fraction, 0 to 1 (0.01 is 1%)",
+        key: "settle.confirmation_tiers",
+        env: "PSP_CONFIRMATION_TIERS",
+        default: "10000:4,50000:5,100000:6",
+        units: "whole USD:confirmations, comma-separated",
         reload: true,
-        what: "How far a payment may miss the requested amount, over or under, and still settle in full as if it were exact: every requested note is signed, and nothing is credited, dropped or kept. It covers the BTC price moving between the price lock (settle.lock_confirmations) and settlement (settle.min_confirmations), which no payer should be penalised or credited for. Widen it in a volatile market. It must not be more than settle.payment_reconciliation_target (the mint refuses to start otherwise), because that setting handles the payments outside it. See the README.",
+        what: "The deeper confirmations a larger payment waits for. Each entry is a whole-dollar threshold and the confirmations for a payment worth at least that much at its locked price, so the default waits for 4 from $10,000, 5 from $50,000 and 6 from $100,000, and settle.base_confirmations below the first. The thresholds ascend, the confirmations never go down (and never below settle.base_confirmations or settle.lock_confirmations), and none is over 1000; the mint refuses to start otherwise. The tier is chosen once, when the price is locked, and stored with the payment, so a change does not touch payments already locked. An empty value means no tiers. The scan trails the chain tip by the highest of them.",
     },
     Spec {
-        key: "settle.payment_reconciliation_target",
-        env: "PSP_PAYMENT_RECONCILIATION_TARGET",
-        default: "0.10",
-        units: "fraction, 0 to 1 (0.10 is 10%)",
+        key: "settle.retention_days",
+        env: "PSP_RETENTION_DAYS",
+        default: "90",
+        units: "days; 0 keeps every record",
         reload: true,
-        what: "For a payment outside settle.price_tolerance, which is genuinely wrong: how far it may miss the requested amount before the mint stops absorbing the difference and reconciles it. Over by no more than this: the mint keeps the excess; over by more: the excess is recorded as credit for the payer's DID. Short: the smallest requested outputs are dropped until the signed total is no more than was paid; if that is within this of the amount paid, those notes are signed and the mint keeps the remainder; otherwise nothing is signed and the payment is held as paid but unsettled. Tighter is fairer to payers but sends more payments to credit or reconciliation; looser settles more automatically but keeps or forgoes more value. See the README.",
+        what: "How long settlements.json keeps a payment after it is finished. The file is rewritten whole on every change, so by default it must not grow without limit: once a claimed payment's claimed time, an expired payment's expired time, a kept payment's kept time (kept with nothing owed) or an abandoned payment's given-up time (its owed record could never be written) is this many days old, the payment is removed from the file (once per scan, at the same step as expiry). Payments that are locked, open, landed and unclaimed, not stored on AIR yet, or being claimed are never removed. What the mint still needs of a removed payment is kept in a few dozen bytes: its txid and block time (so the scan can never owe it again), its place in its claim key's count of owed records (so an index is never reused) and its share of the /audit totals (so they never shrink); settle.prune_horizon_days says how long the first two are kept. A claim resent after its payment was removed is ignored as an unknown record. 0 = keep everything: nothing is ever removed, no marker is ever made, and settle.prune_horizon_days has nothing to cap; windows still close on time and expired payments stay in the file. Otherwise 30 to 3650 days; 90 by default.",
     },
     Spec {
-        key: "settle.reconciliation_window_days",
-        env: "PSP_RECONCILIATION_WINDOW_DAYS",
-        default: "14",
-        units: "days",
+        key: "settle.prune_horizon_days",
+        env: "PSP_PRUNE_HORIZON_DAYS",
+        default: "210",
+        units: "days; 0 keeps every marker",
         reload: true,
-        what: "How long a credit, a held payment (paid but unsettled) or a rejected purchase stays open, counted from when the mint settles the payment. The payer is told over AIR, and the window is in the record. When it closes with the payment still open, the mint forfeits it: it keeps the BTC, owes no credit, and /audit shows it apart. The payer's wallet deletes the purchase's key at the same time. An open payment is settled by a reconciliation request over AIR (kind 15, see reconciliation.fee) before the window closes. 1 to 365.",
+        what: "How long the mint remembers a payment it removed from settlements.json (see settle.retention_days), by the payment's block time. At each prune pass a cutoff moves forward to the larger of itself and now less this many days, and never back. A removed payment's txid, and a claim key's count of removed owed records, are dropped once their payment is older than the cutoff, and a payment with no record whose block time is before the cutoff is ignored by the scan (logged once per pass), so settlements.json is bounded by the payments of the last horizon, the live ones and a fixed-size total. Raising this setting does not bring back a marker that was already dropped. The cost: a payment first seen after the cutoff has passed it (the scan blind to it for longer than the horizon, or a rescan of very old blocks) is not settled. Where the markers go the owed index of an old claim key may be reused, which is harmless: a payer keeps the one-time claim key only until its first read plus 30 days. With settle.retention_days above 0 it must be at least 2 x settle.retention_days + 30 days (the mint refuses to start, or a reload that breaks it changes nothing, and the message names both keys), and at most 10000. 0 = never drop a marker and never move the cutoff. With settle.retention_days = 0 nothing is removed, so the horizon has nothing to cap and any value up to 10000 is accepted. 210 by default (2 x 90 + 30).",
     },
     Spec {
-        key: "reconciliation.fee",
-        env: "PSP_RECONCILIATION_FEE",
-        default: "0",
-        units: "PSP units",
-        reload: true,
-        what: "The fee taken when a reconciliation settles an open payment (kind 15): a corrected request for a held or rejected payment, or the claim of a credit. It comes out of what the request may carry, so the request's outputs add up to the payment's value less this fee (and less reconciliation.write_fee and delivery.read_fee), and the PSP keeps the difference; /audit shows it apart as fees_units. It is fixed for a payment when its window opens, in the rules the first delivery carries, so a later change does not touch payments that are already open. 0 or more whole PSP units; 0 (the default) takes no fee.",
-    },
-    Spec {
-        key: "reconciliation.max_attempts",
-        env: "PSP_RECONCILIATION_MAX_ATTEMPTS",
+        key: "claim.max_attempts",
+        env: "PSP_CLAIM_MAX_ATTEMPTS",
         default: "2",
         units: "attempts",
         reload: true,
-        what: "How many requests refused for their content a payment accepts before it ignores every further one and is left to be forfeited when its window closes. An attempt is a request signed by the right reply key, for an open payment, refused for its content, with a new hash; a bad signature, an unknown payment and an identical resend are not counted. A refused request gets no reply. The second attempt exists only for the rare keyset-rotation race, where the wallet built its notes on a keyset that left the live window. Fixed for a payment when its window opens. 1 to 1000; 2 by default.",
+        what: "How many claims refused for their content an owed record accepts before it ignores every further one and is left to expire when its window closes. An attempt is a claim signed by the right claim key, for an open record, refused for its content (the wrong total, a denomination the mint does not have, a repeated or already signed blind nonce), with a new hash; a bad signature, an unknown record (or one not stored on AIR yet), a claim that names a keyset that is not the current one (the previous, a retired or an unknown keyset), a claim after the window, a claim after the accepted one and an identical resend are not counted. A refused claim gets no reply. Fixed for a payment when its owed record is made. 1 to 1000; 2 by default.",
     },
     Spec {
-        key: "reconciliation.write_fee",
-        env: "PSP_RECONCILIATION_WRITE_FEE",
+        key: "claim.write_fee",
+        env: "PSP_CLAIM_WRITE_FEE",
         default: "0",
         units: "PSP units",
         reload: true,
-        what: "The cost of the one kind 15 write, which the SPI prepays on the wallet's behalf (bound to the open payment's reply key and capped by reconciliation.max_attempts). It is taken from what the request may carry, once per payment: the SPI absorbs the cost of a second attempt. /audit shows it as write_prepaid_units. Fixed for a payment when its window opens. 0 or more whole PSP units; 0 (the default) takes nothing. Only the amount is recorded today: the prepaid AIR write itself is not built (it waits on AIR).",
-    },
-    Spec {
-        key: "reconciliation.round_up_from",
-        env: "PSP_RECONCILIATION_ROUND_UP_FROM",
-        default: "9",
-        units: "cents, 1 to 10",
-        reload: true,
-        what: "The value is the cents remainder from which a credit rounds up to the next whole PSP unit: 1 means round up from 0.1, 9 (the default) from 0.9, and 10 never rounds up. A credit is in USD cents and a PSP unit is 10 cents, so a credit of 259 cents is 25 units and 9 cents over: at 9 it rounds up to 26 units and the SPI gives away 1 cent; at 10 it rounds down to 25 and the SPI keeps the 9 cents. At the default the SPI gives away at most 1 cent and keeps at most 8. /audit shows the cents kept and given away as rounding_kept_cents and rounding_given_cents. Fixed for a payment when its window opens.",
+        what: "The cost of the one kind 15 write, which the SPI prepays on the wallet's behalf (bound to the claim key and capped by claim.max_attempts). It is taken from the units the payment is owed, once per payment: the SPI absorbs the cost of a second attempt. The owed record and the answer to the claim show it as write_prepaid_units, and /audit adds it up for the claimed payments. Fixed for a payment when its price is locked. 0 or more whole PSP units; 0 (the default) takes nothing. A payment whose costs are as much as it buys is kept with nothing owed. Only the amount is recorded today: the prepaid AIR write itself is not built (it waits on AIR).",
     },
     Spec {
         key: "delivery.read_fee",
@@ -349,7 +400,7 @@ pub const SPECS: &[Spec] = &[
         default: "0",
         units: "PSP units",
         reload: true,
-        what: "The read cost the PSP prepays for each record a payer must read: the first delivery record of a purchase, and the follow-up record, the answer to an accepted reconciliation request. The first one's cost comes off the bitcoin payment before it is assessed (the purchase buys that many units less); the follow-up's comes off what a reconciliation may carry. /audit shows it as read_prepaid_units. It is meant to be very small. Fixed for a payment when its window opens. 0 or more whole PSP units; 0 (the default) takes nothing. Only the amounts are recorded today: the prepaid AIR read itself is not built (it waits on AIR).",
+        what: "The read cost the PSP prepays for each record a payer must read: the owed record, and the answer to the claim. Both come off the units the payment is owed (twice this fee, once per payment). The owed record and the answer show it as read_prepaid_units, and /audit adds it up for the claimed payments. It is meant to be very small. Fixed for a payment when its price is locked. 0 or more whole PSP units; 0 (the default) takes nothing. A payment whose costs are as much as it buys is kept with nothing owed. Only the amounts are recorded today: the prepaid AIR read itself is not built (it waits on AIR).",
     },
     Spec {
         key: "burn.enabled",
@@ -384,14 +435,6 @@ pub const SPECS: &[Spec] = &[
         what: "How old the balance figure in `burn.balance_file` may be before the mint ignores it (and reissues every paid unit). A figure dated more than a minute ahead of the clock is ignored too. 1 to 604,800 (a week). Ignored while `burn.enabled` is false.",
     },
     Spec {
-        key: "mint.max_denomination_units",
-        env: "PSP_MAX_DENOMINATION_UNITS",
-        default: "16777216",
-        units: "PSP units",
-        reload: false,
-        what: "The largest denomination (powers of two from 1). Only used when the mint's keys are first made; an existing `mint_keys.json` keeps its denominations.",
-    },
-    Spec {
         key: "rotation.activation_hours",
         env: "PSP_ROTATION_ACTIVATION_HOURS",
         default: "8760",
@@ -405,7 +448,7 @@ pub const SPECS: &[Spec] = &[
         default: "87600",
         units: "hours",
         reload: false,
-        what: "Hours between key rotations (10 years). Notes of the previous key set stay good until the next rotation; then that set and its spent list are deleted. 0 = never rotate. When rotation is on it must be at least 24: BTC claims need time to settle before a rotation (the mint refuses to start otherwise).",
+        what: "Hours between key rotations (10 years). Notes of the previous key set stay good until the next rotation; then that set and its spent list are deleted. 0 = never rotate. When rotation is on it must be at least 720 hours (30 days, the claim window): a claim must name the current keyset, so the keyset a payer claims with has to outlive the claim window (the mint refuses to start otherwise).",
     },
     Spec {
         key: "storage.mint_state",
@@ -469,21 +512,18 @@ pub struct Config {
     pub price_max_spread_bps: u64,
     pub price_timeout_secs: u64,
     pub lock_confirmations: u32,
-    pub min_confirmations: u32,
-    /// `settle.price_tolerance` in basis points (100 is 0.01).
-    pub price_tolerance_bps: u64,
-    /// `settle.payment_reconciliation_target` in basis points (1000 is 0.10).
-    pub payment_reconciliation_target_bps: u64,
-    /// `settle.reconciliation_window_days`.
-    pub reconciliation_window_days: u64,
-    /// `reconciliation.fee`, in PSP units.
-    pub reconciliation_fee: u64,
-    /// `reconciliation.max_attempts`.
-    pub reconciliation_max_attempts: u32,
-    /// `reconciliation.write_fee`, in PSP units.
-    pub reconciliation_write_fee: u64,
-    /// `reconciliation.round_up_from`, in cents.
-    pub reconciliation_round_up_from: u64,
+    /// `settle.base_confirmations`.
+    pub base_confirmations: u32,
+    /// `settle.confirmation_tiers`: (whole USD, confirmations), ascending.
+    pub confirmation_tiers: Vec<(u64, u32)>,
+    /// `settle.retention_days`.
+    pub settle_retention_days: u64,
+    /// `settle.prune_horizon_days`.
+    pub settle_prune_horizon_days: u64,
+    /// `claim.max_attempts`.
+    pub claim_max_attempts: u32,
+    /// `claim.write_fee`, in PSP units.
+    pub claim_write_fee: u64,
     /// `delivery.read_fee`, in PSP units.
     pub delivery_read_fee: u64,
     /// `burn.enabled`.
@@ -494,7 +534,6 @@ pub struct Config {
     pub burn_balance_file: String,
     /// `burn.balance_max_age_secs`.
     pub burn_balance_max_age_secs: u64,
-    pub max_denomination_units: u64,
     pub rotation_activation_hours: u64,
     pub rotation_period_hours: u64,
     /// Which AIR services keep this mint's state (setting only for now).
@@ -539,20 +578,17 @@ impl Config {
             price_max_spread_bps: price::DEFAULT_MAX_SPREAD_BPS,
             price_timeout_secs: price::DEFAULT_TIMEOUT_SECS,
             lock_confirmations: settle::LOCK_CONFIRMATIONS,
-            min_confirmations: settle::MIN_CONFIRMATIONS,
-            price_tolerance_bps: settle::PRICE_TOLERANCE_BPS as u64,
-            payment_reconciliation_target_bps: settle::PAYMENT_RECONCILIATION_TARGET_BPS as u64,
-            reconciliation_window_days: settle::RECONCILIATION_WINDOW_SECS / 86_400,
-            reconciliation_fee: 0,
-            reconciliation_max_attempts: settle::DEFAULT_MAX_ATTEMPTS,
-            reconciliation_write_fee: 0,
-            reconciliation_round_up_from: settle::DEFAULT_ROUND_UP_FROM_CENTS,
+            base_confirmations: settle::BASE_CONFIRMATIONS,
+            confirmation_tiers: settle::DEFAULT_TIERS.to_vec(),
+            settle_retention_days: settle::DEFAULT_RETENTION_DAYS,
+            settle_prune_horizon_days: settle::DEFAULT_PRUNE_HORIZON_DAYS,
+            claim_max_attempts: settle::DEFAULT_MAX_ATTEMPTS,
+            claim_write_fee: 0,
             delivery_read_fee: 0,
             burn_enabled: false,
             burn_threshold_psp: 0,
             burn_balance_file: String::new(),
             burn_balance_max_age_secs: crate::balance::DEFAULT_MAX_AGE_SECS,
-            max_denomination_units: DEFAULT_MAX_DENOMINATION_UNITS,
             rotation_activation_hours: 8760,
             rotation_period_hours: 87600,
             storage_mint_state: StoragePolicy::default(),
@@ -571,47 +607,46 @@ pub fn air_host_problem(host: &str) -> Option<&'static str> {
     sp_wire::air_request::host_problem(host)
 }
 
-/// A fraction written as text ("0.10", "0.1", "1", "0.0525"), as basis points
-/// (1000, 1000, 10000, 525). At most four digits after the point, so the value
-/// is exact; no sign, no exponent. Range is checked by `validate`.
-pub fn fraction_to_bps(key: &str, value: &str) -> Result<u64, String> {
-    let bad = || {
-        format!(
-            "{key} = `{value}` is not a fraction like 0.10 (digits only, at most four after the point, no sign)"
-        )
-    };
+/// The largest tier threshold: $1 trillion, far above anything real; it keeps the
+/// threshold in cents far from `u64::MAX`.
+pub const MAX_TIER_USD: u64 = 1_000_000_000_000;
+
+/// `settle.confirmation_tiers` from text: `10000:4,50000:5`, whole dollars and
+/// confirmations, spaces allowed around the entries. Only the form is checked
+/// here; `validate` checks the order and the ranges. An empty text is no tiers.
+pub fn parse_tiers(key: &str, value: &str) -> Result<Vec<(u64, u32)>, String> {
     let text = value.trim();
-    let (int, frac) = text.split_once('.').unwrap_or((text, ""));
-    if int.is_empty()
-        || frac.len() > 4
-        || !int.bytes().all(|b| b.is_ascii_digit())
-        || !frac.bytes().all(|b| b.is_ascii_digit())
-    {
-        return Err(bad());
+    if text.is_empty() {
+        return Ok(Vec::new());
     }
-    let int: u64 = int.parse().map_err(|_| bad())?;
-    let mut frac_bps: u64 = if frac.is_empty() {
-        0
-    } else {
-        frac.parse().map_err(|_| bad())?
-    };
-    for _ in frac.len()..4 {
-        frac_bps *= 10;
-    }
-    int.checked_mul(10_000)
-        .and_then(|n| n.checked_add(frac_bps))
-        .ok_or_else(bad)
+    text.split(',')
+        .map(|entry| {
+            let bad = || {
+                format!(
+                    "{key} = `{value}`: `{}` is not USD:confirmations (whole numbers, like 10000:4)",
+                    entry.trim()
+                )
+            };
+            let (usd, confirmations) = entry.split_once(':').ok_or_else(bad)?;
+            let digits = |t: &str| !t.trim().is_empty() && t.trim().bytes().all(|b| b.is_ascii_digit());
+            if !digits(usd) || !digits(confirmations) {
+                return Err(bad());
+            }
+            Ok((
+                usd.trim().parse().map_err(|_| bad())?,
+                confirmations.trim().parse().map_err(|_| bad())?,
+            ))
+        })
+        .collect()
 }
 
-/// Basis points as a fraction with at least two decimals: 1000 is "0.10", 525 is
-/// "0.0525", 10000 is "1.00".
-pub fn bps_to_fraction(bps: u64) -> String {
-    let (whole, rest) = (bps / 10_000, bps % 10_000);
-    let mut frac = format!("{rest:04}");
-    while frac.len() > 2 && frac.ends_with('0') {
-        frac.pop();
-    }
-    format!("{whole}.{frac}")
+/// The tiers as `parse_tiers` reads them.
+pub fn tiers_text(tiers: &[(u64, u32)]) -> String {
+    tiers
+        .iter()
+        .map(|(usd, confirmations)| format!("{usd}:{confirmations}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn whole<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
@@ -654,22 +689,17 @@ impl Config {
             "price.max_spread_bps" => self.price_max_spread_bps.to_string(),
             "price.timeout_secs" => self.price_timeout_secs.to_string(),
             "settle.lock_confirmations" => self.lock_confirmations.to_string(),
-            "settle.min_confirmations" => self.min_confirmations.to_string(),
-            "settle.price_tolerance" => bps_to_fraction(self.price_tolerance_bps),
-            "settle.payment_reconciliation_target" => {
-                bps_to_fraction(self.payment_reconciliation_target_bps)
-            }
-            "settle.reconciliation_window_days" => self.reconciliation_window_days.to_string(),
-            "reconciliation.fee" => self.reconciliation_fee.to_string(),
-            "reconciliation.max_attempts" => self.reconciliation_max_attempts.to_string(),
-            "reconciliation.write_fee" => self.reconciliation_write_fee.to_string(),
-            "reconciliation.round_up_from" => self.reconciliation_round_up_from.to_string(),
+            "settle.base_confirmations" => self.base_confirmations.to_string(),
+            "settle.confirmation_tiers" => tiers_text(&self.confirmation_tiers),
+            "settle.retention_days" => self.settle_retention_days.to_string(),
+            "settle.prune_horizon_days" => self.settle_prune_horizon_days.to_string(),
+            "claim.max_attempts" => self.claim_max_attempts.to_string(),
+            "claim.write_fee" => self.claim_write_fee.to_string(),
             "delivery.read_fee" => self.delivery_read_fee.to_string(),
             "burn.enabled" => self.burn_enabled.to_string(),
             "burn.threshold_psp" => self.burn_threshold_psp.to_string(),
             "burn.balance_file" => self.burn_balance_file.clone(),
             "burn.balance_max_age_secs" => self.burn_balance_max_age_secs.to_string(),
-            "mint.max_denomination_units" => self.max_denomination_units.to_string(),
             "rotation.activation_hours" => self.rotation_activation_hours.to_string(),
             "rotation.period_hours" => self.rotation_period_hours.to_string(),
             "storage.mint_state" => self.storage_mint_state.to_config_string(),
@@ -708,29 +738,17 @@ impl Config {
             "price.max_spread_bps" => self.price_max_spread_bps = whole(key, value)?,
             "price.timeout_secs" => self.price_timeout_secs = whole(key, value)?,
             "settle.lock_confirmations" => self.lock_confirmations = whole(key, value)?,
-            "settle.min_confirmations" => self.min_confirmations = whole(key, value)?,
-            "settle.price_tolerance" => self.price_tolerance_bps = fraction_to_bps(key, value)?,
-            "settle.payment_reconciliation_target" => {
-                self.payment_reconciliation_target_bps = fraction_to_bps(key, value)?
-            }
-            "settle.underpay_tolerance_bps" | "settle.credit_threshold_bps" => {
-                return Err(format!("{key} {RETIRED_TOLERANCES}"));
-            }
-            "settle.reconciliation_window_days" => {
-                self.reconciliation_window_days = whole(key, value)?
-            }
-            "reconciliation.fee" => self.reconciliation_fee = whole(key, value)?,
-            "reconciliation.max_attempts" => self.reconciliation_max_attempts = whole(key, value)?,
-            "reconciliation.write_fee" => self.reconciliation_write_fee = whole(key, value)?,
-            "reconciliation.round_up_from" => {
-                self.reconciliation_round_up_from = whole(key, value)?
-            }
+            "settle.base_confirmations" => self.base_confirmations = whole(key, value)?,
+            "settle.confirmation_tiers" => self.confirmation_tiers = parse_tiers(key, value)?,
+            "settle.retention_days" => self.settle_retention_days = whole(key, value)?,
+            "settle.prune_horizon_days" => self.settle_prune_horizon_days = whole(key, value)?,
+            "claim.max_attempts" => self.claim_max_attempts = whole(key, value)?,
+            "claim.write_fee" => self.claim_write_fee = whole(key, value)?,
             "delivery.read_fee" => self.delivery_read_fee = whole(key, value)?,
             "burn.enabled" => self.burn_enabled = truth(key, value)?,
             "burn.threshold_psp" => self.burn_threshold_psp = whole(key, value)?,
             "burn.balance_file" => self.burn_balance_file = value.trim().to_string(),
             "burn.balance_max_age_secs" => self.burn_balance_max_age_secs = whole(key, value)?,
-            "mint.max_denomination_units" => self.max_denomination_units = whole(key, value)?,
             "rotation.activation_hours" => self.rotation_activation_hours = whole(key, value)?,
             "rotation.period_hours" => self.rotation_period_hours = whole(key, value)?,
             "storage.mint_state" => {
@@ -741,7 +759,11 @@ impl Config {
             "air.host" => self.air_host = value.trim().to_string(),
             "air.held_reads" => self.air_held_reads = whole(key, value)?,
             "air.timeout_secs" => self.air_timeout_secs = whole(key, value)?,
-            other => return Err(format!("unknown setting `{other}`")),
+            other => {
+                return Err(
+                    removed_key(other).unwrap_or_else(|| format!("unknown setting `{other}`"))
+                );
+            }
         }
         Ok(())
     }
@@ -843,22 +865,14 @@ impl Config {
             "confirmations; a price is never locked on an unconfirmed payment",
         );
         range(
-            "settle.min_confirmations",
-            u64::from(self.min_confirmations),
+            "settle.base_confirmations",
+            u64::from(self.base_confirmations),
             u64::from(self.lock_confirmations.max(1)),
-            1000,
+            u64::from(settle::MAX_CONFIRMATIONS),
             "confirmations; at least settle.lock_confirmations, so the price is locked first",
         );
-        range(
-            "settle.reconciliation_window_days",
-            self.reconciliation_window_days,
-            1,
-            365,
-            "days",
-        );
         for (key, value) in [
-            ("reconciliation.fee", self.reconciliation_fee),
-            ("reconciliation.write_fee", self.reconciliation_write_fee),
+            ("claim.write_fee", self.claim_write_fee),
             ("delivery.read_fee", self.delivery_read_fee),
         ] {
             range(
@@ -870,18 +884,11 @@ impl Config {
             );
         }
         range(
-            "reconciliation.max_attempts",
-            u64::from(self.reconciliation_max_attempts),
+            "claim.max_attempts",
+            u64::from(self.claim_max_attempts),
             1,
             1000,
-            "attempts; at least one request must be allowed",
-        );
-        range(
-            "reconciliation.round_up_from",
-            self.reconciliation_round_up_from,
-            1,
-            10,
-            "cents; 10 never rounds up",
+            "attempts; at least one claim must be allowed",
         );
         range(
             "burn.threshold_psp",
@@ -896,13 +903,6 @@ impl Config {
             1,
             604_800,
             "seconds",
-        );
-        range(
-            "mint.max_denomination_units",
-            self.max_denomination_units,
-            1,
-            1 << 62,
-            "PSP units",
         );
         range(
             "rotation.activation_hours",
@@ -926,30 +926,14 @@ impl Config {
             "reads; the AIR server closes the session at its 257th held read",
         );
         range("air.timeout_secs", self.air_timeout_secs, 1, 600, "seconds");
-        if self.payment_reconciliation_target_bps > 10_000 {
-            problems.push(format!(
-                "settle.payment_reconciliation_target = {} is out of range: it must be a fraction from 0 to 1 (0.10 is 10%; 0 reconciles every payment that is not exact)",
-                bps_to_fraction(self.payment_reconciliation_target_bps)
-            ));
-        }
-        if self.price_tolerance_bps > 10_000 {
-            problems.push(format!(
-                "settle.price_tolerance = {} is out of range: it must be a fraction from 0 to 1 (0.01 is 1%; 0 treats only an exact payment as exact)",
-                bps_to_fraction(self.price_tolerance_bps)
-            ));
-        } else if self.price_tolerance_bps > self.payment_reconciliation_target_bps {
-            problems.push(format!(
-                "settle.price_tolerance = {} is more than settle.payment_reconciliation_target = {}: the tolerance settles a payment as if exact, so it cannot be wider than the target that handles the payments outside it. Lower the tolerance or raise the target",
-                bps_to_fraction(self.price_tolerance_bps),
-                bps_to_fraction(self.payment_reconciliation_target_bps)
-            ));
-        }
+        problems.extend(self.tier_problems());
+        problems.extend(self.prune_problems());
         if self.rotation_activation_hours > 0
             && self.rotation_period_hours > 0
             && self.rotation_period_hours < MIN_PSP_ROTATION_PERIOD_HOURS
         {
             problems.push(format!(
-                "rotation.period_hours = {} is too short: the PSP rotation period must be at least {MIN_PSP_ROTATION_PERIOD_HOURS} hours, because BTC claims need time to settle before a rotation (or 0 to turn rotation off)",
+                "rotation.period_hours = {} is too short: the PSP rotation period must be at least {MIN_PSP_ROTATION_PERIOD_HOURS} hours (30 days, the claim window), so that the keyset a payer claims with outlives the claim window (or 0 to turn rotation off)",
                 self.rotation_period_hours
             ));
         }
@@ -1030,19 +1014,64 @@ impl Config {
         }
     }
 
-    /// The fees and limits of reconciliation (`reconciliation.*` and
+    /// The prepaid costs and the limit of a claim (`claim.*` and
     /// `delivery.read_fee`).
-    pub fn fees(&self) -> settle::ReconcileTerms {
-        settle::ReconcileTerms {
-            fee_units: self.reconciliation_fee,
-            max_attempts: self.reconciliation_max_attempts,
-            write_fee_units: self.reconciliation_write_fee,
-            round_up_from_cents: self.reconciliation_round_up_from,
+    pub fn fees(&self) -> settle::ClaimFees {
+        settle::ClaimFees {
+            max_attempts: self.claim_max_attempts,
+            write_fee_units: self.claim_write_fee,
             read_fee_units: self.delivery_read_fee,
         }
     }
 
-    /// The settlement rules and the reconciliation fees together.
+    /// How long a finished payment is kept in the records, in seconds
+    /// (`settle.retention_days`). 0 keeps every record: nothing is pruned.
+    pub fn retention_secs(&self) -> u64 {
+        self.settle_retention_days.saturating_mul(86_400)
+    }
+
+    /// How long the mint remembers a pruned payment, in seconds
+    /// (`settle.prune_horizon_days`). 0 keeps every marker: the cutoff never
+    /// moves.
+    pub fn horizon_secs(&self) -> u64 {
+        self.settle_prune_horizon_days.saturating_mul(86_400)
+    }
+
+    /// What is wrong with `settle.retention_days` and `settle.prune_horizon_days`,
+    /// which are checked together: the horizon may not be shorter than twice the
+    /// retention plus the 30-day claim window, unless it is 0 (keep every marker)
+    /// or the retention is 0 (nothing is pruned, so the horizon has nothing to
+    /// cap).
+    fn prune_problems(&self) -> Vec<String> {
+        let (retention, horizon) = (self.settle_retention_days, self.settle_prune_horizon_days);
+        let mut problems = Vec::new();
+        if retention != 0
+            && !(settle::MIN_RETENTION_DAYS..=settle::MAX_RETENTION_DAYS).contains(&retention)
+        {
+            problems.push(format!(
+                "settle.retention_days = {retention} is out of range: it must be 0 (keep every record), or from {} to {} (days)",
+                settle::MIN_RETENTION_DAYS,
+                settle::MAX_RETENTION_DAYS
+            ));
+        }
+        if horizon > settle::MAX_PRUNE_HORIZON_DAYS {
+            problems.push(format!(
+                "settle.prune_horizon_days = {horizon} is out of range: it must be 0 (keep every marker), or at most {} (days)",
+                settle::MAX_PRUNE_HORIZON_DAYS
+            ));
+        } else if retention != 0
+            && horizon != 0
+            && horizon < settle::prune_horizon_floor_days(retention)
+        {
+            problems.push(format!(
+                "settle.prune_horizon_days = {horizon} is too short for settle.retention_days = {retention}: the horizon must be 0 (keep every marker) or at least 2 x settle.retention_days + 30 = {} days",
+                settle::prune_horizon_floor_days(retention)
+            ));
+        }
+        problems
+    }
+
+    /// The settlement rules and the claim fees together.
     pub fn policy(&self) -> settle::Policy {
         settle::Policy {
             terms: self.terms(),
@@ -1053,11 +1082,59 @@ impl Config {
     pub fn terms(&self) -> Terms {
         Terms {
             lock_confirmations: self.lock_confirmations,
-            min_confirmations: self.min_confirmations,
-            price_tolerance_bps: u128::from(self.price_tolerance_bps),
-            reconciliation_target_bps: u128::from(self.payment_reconciliation_target_bps),
-            reconciliation_window_secs: self.reconciliation_window_days.saturating_mul(86_400),
+            base_confirmations: self.base_confirmations,
+            tiers: self
+                .confirmation_tiers
+                .iter()
+                .map(|&(usd, confirmations)| settle::Tier {
+                    min_cents: usd.saturating_mul(100),
+                    confirmations,
+                })
+                .collect(),
         }
+    }
+
+    /// What is wrong with the tiers: one line for each, so the operator sees
+    /// everything at once.
+    fn tier_problems(&self) -> Vec<String> {
+        let key = "settle.confirmation_tiers";
+        let mut problems = Vec::new();
+        let mut previous: Option<(u64, u32)> = None;
+        for &(usd, confirmations) in &self.confirmation_tiers {
+            let entry = format!("{usd}:{confirmations}");
+            if usd == 0 || usd > MAX_TIER_USD {
+                problems.push(format!(
+                    "{key} entry {entry}: the threshold must be from 1 to {MAX_TIER_USD} whole USD"
+                ));
+            }
+            if confirmations < self.lock_confirmations || confirmations > settle::MAX_CONFIRMATIONS
+            {
+                problems.push(format!(
+                    "{key} entry {entry}: the confirmations must be from settle.lock_confirmations ({}) to {}",
+                    self.lock_confirmations,
+                    settle::MAX_CONFIRMATIONS
+                ));
+            }
+            if let Some((last_usd, last_confirmations)) = previous {
+                if usd <= last_usd {
+                    problems.push(format!(
+                        "{key} entry {entry}: the thresholds must ascend, and {usd} is not above {last_usd}"
+                    ));
+                }
+                if confirmations < last_confirmations {
+                    problems.push(format!(
+                        "{key} entry {entry}: a larger payment cannot wait for fewer confirmations than {last_confirmations}"
+                    ));
+                }
+            } else if confirmations < self.base_confirmations {
+                problems.push(format!(
+                    "{key} entry {entry}: a tier cannot wait for fewer confirmations than settle.base_confirmations ({})",
+                    self.base_confirmations
+                ));
+            }
+            previous = Some((usd, confirmations));
+        }
+        problems
     }
 
     /// What `serve` needs: the AIR server and its host, because the AIR
@@ -1197,8 +1274,8 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
                 problems.push(RETIRED_MAX_TRANSACTIONS.to_string());
                 continue;
             }
-            if key == "settle.underpay_tolerance_bps" || key == "settle.credit_threshold_bps" {
-                problems.push(format!("{key} {RETIRED_TOLERANCES}"));
+            if let Some(why) = removed_key(&key) {
+                problems.push(why);
                 continue;
             }
             if key == "air.enabled" {
@@ -1211,15 +1288,6 @@ fn parse_file(text: &str) -> Result<Vec<(String, String)>, Vec<String>> {
             }
             match value {
                 toml::Value::Integer(n) => pairs.push((key, n.to_string())),
-                // A decimal is only meaningful for the two fractions
-                // (`0.01`, `0.10`); everywhere else it is a type error, not a
-                // number to be truncated.
-                toml::Value::Float(f)
-                    if key == "settle.payment_reconciliation_target"
-                        || key == "settle.price_tolerance" =>
-                {
-                    pairs.push((key, f.to_string()))
-                }
                 toml::Value::Float(f) => {
                     problems.push(format!("{key} must be a whole number, not the decimal {f}"))
                 }
@@ -1315,16 +1383,10 @@ pub fn load_with(
         }
     }
 
-    for (var, key) in [
-        (
-            "PSP_UNDERPAY_TOLERANCE_BPS",
-            "settle.underpay_tolerance_bps",
-        ),
-        ("PSP_CREDIT_THRESHOLD_BPS", "settle.credit_threshold_bps"),
-    ] {
+    for (key, var, why) in REMOVED {
         if env(var).is_some_and(|v| !v.is_empty()) {
             problems.push(format!(
-                "environment variable {var}: {key} {RETIRED_TOLERANCES}"
+                "environment variable {var}: {key} was removed in psp-mint 0.8.0: {why}. Remove it"
             ));
         }
     }
@@ -1613,22 +1675,27 @@ mod tests {
         move |name: &str| map.get(name).cloned()
     }
 
+    /// Fails if the floor stays 24 hours, or is not tied to the 30-day claim
+    /// window (`CLAIM_WINDOW_SECS`).
     #[test]
-    fn a_psp_rotation_period_under_24_hours_refuses_to_start() {
+    fn a_psp_rotation_period_under_the_claim_window_refuses_to_start() {
         let dir = scratch("floor");
-        fs::write(dir.join(FILE_NAME), "[rotation]\nperiod_hours = 12\n").unwrap();
+        assert_eq!(MIN_PSP_ROTATION_PERIOD_HOURS, 720);
+        assert_eq!(sp_wire::psp::CLAIM_WINDOW_SECS, 720 * 3600);
+        fs::write(dir.join(FILE_NAME), "[rotation]\nperiod_hours = 719\n").unwrap();
         let p = load(&dir, &env_of(&[])).unwrap_err();
-        assert!(
-            p.iter().any(|e| e.contains("rotation.period_hours = 12")
-                && e.contains("at least 24 hours")
-                && e.contains("BTC claims need time to settle")),
-            "{p:?}"
-        );
+        let why = "rotation.period_hours = 719 is too short: the PSP rotation period must be at \
+                   least 720 hours (30 days, the claim window), so that the keyset a payer \
+                   claims with outlives the claim window (or 0 to turn rotation off)";
+        assert!(p.iter().any(|e| e == why), "{p:?}");
         fs::write(dir.join(FILE_NAME), "").unwrap();
-        let p = load(&dir, &env_of(&[("PSP_ROTATION_PERIOD_HOURS", "23")])).unwrap_err();
-        assert!(p.iter().any(|e| e.contains("at least 24 hours")), "{p:?}");
-        // 24 is fine; 0 (off) is fine; rotation off makes the period moot.
-        assert!(load(&dir, &env_of(&[("PSP_ROTATION_PERIOD_HOURS", "24")])).is_ok());
+        let p = load(&dir, &env_of(&[("PSP_ROTATION_PERIOD_HOURS", "719")])).unwrap_err();
+        assert!(p.iter().any(|e| e == why), "{p:?}");
+        // 24 was the old floor
+        let p = load(&dir, &env_of(&[("PSP_ROTATION_PERIOD_HOURS", "24")])).unwrap_err();
+        assert!(p.iter().any(|e| e.contains("at least 720 hours")), "{p:?}");
+        // 720 is fine; 0 (off) is fine; rotation off makes the period moot.
+        assert!(load(&dir, &env_of(&[("PSP_ROTATION_PERIOD_HOURS", "720")])).is_ok());
         assert!(load(&dir, &env_of(&[("PSP_ROTATION_PERIOD_HOURS", "0")])).is_ok());
         assert!(
             load(
@@ -1640,6 +1707,213 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// Fails if the default, either bound, the environment name or the file key of
+    /// `settle.retention_days` is wrong, or if 0 (keep every record) is refused.
+    #[test]
+    fn the_retention_is_90_days_by_default_0_or_30_to_3650() {
+        let dir = scratch("retention");
+        let c = load(&dir, &env_of(&[])).unwrap().config;
+        let handle = Handle::new(c.clone(), None);
+        assert_eq!(c.settle_retention_days, 90);
+        assert_eq!(c.retention_secs(), 7_776_000);
+        // the horizon at its top, so that only the retention is under test
+        for (days, ok) in [
+            ("0", true),
+            ("29", false),
+            ("30", true),
+            ("3650", true),
+            ("3651", false),
+        ] {
+            let got = load(
+                &dir,
+                &env_of(&[
+                    ("PSP_RETENTION_DAYS", days),
+                    ("PSP_PRUNE_HORIZON_DAYS", "10000"),
+                ]),
+            );
+            assert_eq!(got.is_ok(), ok, "{days}: {got:?}");
+        }
+        let p = load(
+            &dir,
+            &env_of(&[
+                ("PSP_RETENTION_DAYS", "29"),
+                ("PSP_PRUNE_HORIZON_DAYS", "10000"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            p.iter().any(|e| e
+                == "settle.retention_days = 29 is out of range: it must be 0 (keep every record), or from 30 to 3650 (days)"),
+            "{p:?}"
+        );
+        fs::write(
+            dir.join(FILE_NAME),
+            "[settle]\nretention_days = 365\nprune_horizon_days = 760\n",
+        )
+        .unwrap();
+        let loaded = load(&dir, &env_of(&[])).unwrap();
+        assert_eq!(loaded.config.settle_retention_days, 365);
+        assert_eq!(loaded.sources["settle.retention_days"], Source::File);
+        // a reload applies it from the next pass
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        assert_eq!(handle.current().settle_retention_days, 365);
+        assert!(reloaded.needs_restart.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The horizon is 210 days by default, and with a retention above 0 it may not
+    /// be under 2 x retention + 30 days, in the file, in the environment and on a
+    /// reload, which then changes nothing. Fails if the floor is not enforced
+    /// together with the retention (a retention raised alone leaves a horizon too
+    /// short), or if the message does not name both settings.
+    #[test]
+    fn the_prune_horizon_is_210_days_and_may_not_be_under_the_floor_for_the_retention() {
+        let dir = scratch("horizon");
+        let c = load(&dir, &env_of(&[])).unwrap().config;
+        assert_eq!(c.settle_prune_horizon_days, 210);
+        assert_eq!(c.horizon_secs(), 18_144_000);
+        let short = "settle.prune_horizon_days = 209 is too short for settle.retention_days = 90: \
+                     the horizon must be 0 (keep every marker) or at least 2 x \
+                     settle.retention_days + 30 = 210 days";
+        // 2 x 90 + 29 is refused, in the environment and in the file
+        let p = load(&dir, &env_of(&[("PSP_PRUNE_HORIZON_DAYS", "209")])).unwrap_err();
+        assert!(p.iter().any(|e| e == short), "{p:?}");
+        fs::write(dir.join(FILE_NAME), "[settle]\nprune_horizon_days = 209\n").unwrap();
+        let p = load(&dir, &env_of(&[])).unwrap_err();
+        assert!(p.iter().any(|e| e == short), "{p:?}");
+        // 2 x 90 + 30 is accepted
+        fs::write(dir.join(FILE_NAME), "[settle]\nprune_horizon_days = 210\n").unwrap();
+        assert!(load(&dir, &env_of(&[])).is_ok());
+        // the ceiling
+        for (days, ok) in [("10000", true), ("10001", false)] {
+            let got = load(&dir, &env_of(&[("PSP_PRUNE_HORIZON_DAYS", days)]));
+            assert_eq!(got.is_ok(), ok, "{days}: {got:?}");
+        }
+        // 3650 days of retention needs 7330, which fits under the ceiling
+        let top = [
+            ("PSP_RETENTION_DAYS", "3650"),
+            ("PSP_PRUNE_HORIZON_DAYS", "7330"),
+        ];
+        assert!(load(&dir, &env_of(&top)).is_ok());
+        let p = load(
+            &dir,
+            &env_of(&[
+                ("PSP_RETENTION_DAYS", "3650"),
+                ("PSP_PRUNE_HORIZON_DAYS", "7329"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            p.iter().any(|e| e.contains("= 7329 is too short")
+                && e.contains("settle.retention_days = 3650")
+                && e.ends_with("= 7330 days")),
+            "{p:?}"
+        );
+
+        // A reload that raises the retention past the horizon is refused whole.
+        fs::write(dir.join(FILE_NAME), "").unwrap();
+        let handle = Handle::new(c, None);
+        fs::write(dir.join(FILE_NAME), "[settle]\nretention_days = 100\n").unwrap();
+        let problems = handle.reload(&dir, &env_of(&[])).unwrap_err();
+        assert!(
+            problems.iter().any(|e| e
+                == "settle.prune_horizon_days = 210 is too short for settle.retention_days = 100: \
+                    the horizon must be 0 (keep every marker) or at least 2 x \
+                    settle.retention_days + 30 = 230 days"),
+            "{problems:?}"
+        );
+        assert_eq!(handle.current().settle_retention_days, 90);
+        assert_eq!(handle.current().settle_prune_horizon_days, 210);
+        // together they are accepted, live
+        fs::write(
+            dir.join(FILE_NAME),
+            "[settle]\nretention_days = 100\nprune_horizon_days = 230\n",
+        )
+        .unwrap();
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        assert!(reloaded.needs_restart.is_empty());
+        assert_eq!(handle.current().settle_retention_days, 100);
+        assert_eq!(handle.current().horizon_secs(), 19_872_000);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 0 keeps everything: a retention of 0 prunes no record (so any horizon is
+    /// accepted, there being nothing to cap), and a horizon of 0 keeps every
+    /// marker (so no floor applies). Fails if either 0 is refused, if a nonzero
+    /// retention is checked against the floor when the horizon is 0, or if the
+    /// horizon above 0 is not checked once the retention is back above 0.
+    #[test]
+    fn a_retention_or_a_horizon_of_0_means_keep_everything_and_reloads_live() {
+        let dir = scratch("keep-all");
+        // retention 0 with any horizon: 1 day, the default, the ceiling; not above
+        for (days, ok) in [
+            ("0", true),
+            ("1", true),
+            ("209", true),
+            ("10000", true),
+            ("10001", false),
+        ] {
+            let got = load(
+                &dir,
+                &env_of(&[
+                    ("PSP_RETENTION_DAYS", "0"),
+                    ("PSP_PRUNE_HORIZON_DAYS", days),
+                ]),
+            );
+            assert_eq!(got.is_ok(), ok, "{days}: {got:?}");
+        }
+        // horizon 0 with any retention
+        for days in ["30", "90", "3650"] {
+            let got = load(
+                &dir,
+                &env_of(&[
+                    ("PSP_RETENTION_DAYS", days),
+                    ("PSP_PRUNE_HORIZON_DAYS", "0"),
+                ]),
+            );
+            assert!(got.is_ok(), "{days}: {got:?}");
+        }
+        // a retention above 0 with a horizon under the floor is still refused
+        let p = load(
+            &dir,
+            &env_of(&[
+                ("PSP_RETENTION_DAYS", "365"),
+                ("PSP_PRUNE_HORIZON_DAYS", "759"),
+            ]),
+        )
+        .unwrap_err();
+        assert!(
+            p.iter().any(|e| e.contains("= 759 is too short")
+                && e.contains("settle.retention_days = 365")
+                && e.ends_with("= 760 days")),
+            "{p:?}"
+        );
+
+        // Live: into 0 and out of it, for each setting.
+        let handle = Handle::new(load(&dir, &env_of(&[])).unwrap().config, None);
+        fs::write(dir.join(FILE_NAME), "[settle]\nretention_days = 0\n").unwrap();
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        assert!(reloaded.needs_restart.is_empty());
+        assert_eq!(handle.current().retention_secs(), 0);
+        assert_eq!(handle.current().horizon_secs(), 18_144_000);
+        // while the retention is 0 a retention above 0 still has to fit the horizon
+        fs::write(dir.join(FILE_NAME), "[settle]\nretention_days = 365\n").unwrap();
+        assert!(handle.reload(&dir, &env_of(&[])).is_err());
+        assert_eq!(handle.current().retention_secs(), 0);
+        // out of 0, and the horizon into 0
+        fs::write(dir.join(FILE_NAME), "[settle]\nprune_horizon_days = 0\n").unwrap();
+        let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
+        assert!(reloaded.needs_restart.is_empty());
+        assert_eq!(handle.current().retention_secs(), 7_776_000);
+        assert_eq!(handle.current().horizon_secs(), 0);
+        // and out of it: the defaults
+        fs::remove_file(dir.join(FILE_NAME)).unwrap();
+        handle.reload(&dir, &env_of(&[])).unwrap();
+        assert_eq!(handle.current().retention_secs(), 7_776_000);
+        assert_eq!(handle.current().horizon_secs(), 18_144_000);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1685,14 +1959,12 @@ mod tests {
         assert_eq!(c.rpc_timeout_secs, 30);
         assert_eq!(c.terms(), Terms::default());
         assert_eq!(c.price(), price::Config::default());
-        assert_eq!(c.payment_reconciliation_target_bps, 1000);
+        assert_eq!(c.base_confirmations, 3);
+        assert_eq!(c.get("settle.base_confirmations").unwrap(), "3");
         assert_eq!(
-            c.get("settle.payment_reconciliation_target").unwrap(),
-            "0.10"
+            c.get("settle.confirmation_tiers").unwrap(),
+            "10000:4,50000:5,100000:6"
         );
-        assert_eq!(c.price_tolerance_bps, 100);
-        assert_eq!(c.get("settle.price_tolerance").unwrap(), "0.01");
-        assert_eq!(c.max_denomination_units, 16_777_216);
         for bytes in [
             c.melt_max_request_bytes,
             c.burns_max_request_bytes,
@@ -1835,51 +2107,48 @@ mod tests {
         let dir = scratch("layers");
         fs::write(
             dir.join(FILE_NAME),
-            "[settle]\nmin_confirmations = 3\npayment_reconciliation_target = 0.05\n[bitcoin]\nwallet = \"shop\"\n[reconciliation]\nfee = 3\n",
+            "[settle]\nbase_confirmations = 2\nconfirmation_tiers = \"20000:3\"\n[bitcoin]\nwallet = \"shop\"\n[claim]\nwrite_fee = 3\n",
         )
         .unwrap();
         let loaded = load(
             &dir,
             &env_of(&[
-                ("PSP_PAYMENT_RECONCILIATION_TARGET", "0.2"),
-                ("PSP_PRICE_TOLERANCE", "0.02"),
-                ("PSP_RECONCILIATION_WINDOW_DAYS", "30"),
+                ("PSP_CLAIM_MAX_ATTEMPTS", "5"),
+                ("PSP_CONFIRMATION_TIERS", "20000:3, 60000:6"),
             ]),
         )
         .unwrap();
-        assert_eq!(loaded.config.min_confirmations, 3);
-        assert_eq!(loaded.config.payment_reconciliation_target_bps, 2000);
+        assert_eq!(loaded.config.base_confirmations, 2);
         assert_eq!(loaded.config.wallet, "shop");
         // a key of another section from the file, and two more from the environment
-        assert_eq!(loaded.config.reconciliation_fee, 3);
-        assert_eq!(loaded.sources["reconciliation.fee"], Source::File);
-        assert_eq!(loaded.config.price_tolerance_bps, 200);
+        assert_eq!(loaded.config.claim_write_fee, 3);
+        assert_eq!(loaded.sources["claim.write_fee"], Source::File);
+        assert_eq!(loaded.config.claim_max_attempts, 5);
         assert_eq!(
-            loaded.sources["settle.price_tolerance"],
-            Source::Env("PSP_PRICE_TOLERANCE")
+            loaded.sources["claim.max_attempts"],
+            Source::Env("PSP_CLAIM_MAX_ATTEMPTS")
         );
-        assert_eq!(loaded.config.reconciliation_window_days, 30);
         assert_eq!(
-            loaded.sources["settle.reconciliation_window_days"],
-            Source::Env("PSP_RECONCILIATION_WINDOW_DAYS")
+            loaded.config.confirmation_tiers,
+            vec![(20_000, 3), (60_000, 6)]
         );
-        assert_eq!(loaded.sources["settle.min_confirmations"], Source::File);
         assert_eq!(
-            loaded.sources["settle.payment_reconciliation_target"],
-            Source::Env("PSP_PAYMENT_RECONCILIATION_TARGET")
+            loaded.sources["settle.confirmation_tiers"],
+            Source::Env("PSP_CONFIRMATION_TIERS")
         );
+        assert_eq!(loaded.sources["settle.base_confirmations"], Source::File);
         assert_eq!(loaded.file.as_deref(), Some(dir.join(FILE_NAME).as_path()));
         let lines = loaded.describe();
         assert_eq!(lines.len(), SPECS.len());
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("settle.min_confirmations = 3") && l.contains("(file)"))
+                .any(|l| l.contains("settle.base_confirmations = 2") && l.contains("(file)"))
         );
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("(env PSP_PAYMENT_RECONCILIATION_TARGET)"))
+                .any(|l| l.contains("(env PSP_CONFIRMATION_TIERS)"))
         );
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1901,14 +2170,14 @@ mod tests {
         let dir = scratch("bad");
         fs::write(
             dir.join(FILE_NAME),
-            "[settle]\nmin_confirmation = 3\nlock_confirmations = true\n[scan]\ninterval_secs = 1.5\nloose = 1\n",
+            "[settle]\nbase_confirmation = 3\nlock_confirmations = true\n[scan]\ninterval_secs = 1.5\nloose = 1\n",
         )
         .unwrap();
         let problems = load(&dir, &env_of(&[])).unwrap_err();
         assert!(
             problems
                 .iter()
-                .any(|p| p.contains("unknown setting `settle.min_confirmation`"))
+                .any(|p| p.contains("unknown setting `settle.base_confirmation`"))
         );
         assert!(
             problems
@@ -1951,7 +2220,6 @@ mod tests {
         c.rollover_max_items = 0;
         c.scan_interval_secs = 0;
         c.lock_confirmations = 0;
-        c.payment_reconciliation_target_bps = 10_001;
         c.price_max_spread_bps = 10_001;
         c.bind = "localhost".into();
         c.rpc_url = "127.0.0.1:18443".into();
@@ -1964,7 +2232,6 @@ mod tests {
             "rollover.max_items",
             "scan.interval_secs",
             "settle.lock_confirmations",
-            "settle.payment_reconciliation_target",
             "price.max_spread_bps",
             "server.bind",
             "bitcoin.rpc_url",
@@ -1984,37 +2251,129 @@ mod tests {
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(problems[0].contains("scan.health_intervals"));
         assert!(problems[1].contains("scan.health_grace_secs"));
-
-        // the target may be 1 (all of the request) and no more
-        let mut c = Config::defaults("/h");
-        c.set("settle.payment_reconciliation_target", "1").unwrap();
-        assert!(c.validate().is_ok());
-        c.set("settle.payment_reconciliation_target", "1.0001")
-            .unwrap();
-        let problems = c.validate().unwrap_err();
-        assert!(
-            problems[0].starts_with("settle.payment_reconciliation_target = 1.0001"),
-            "{problems:?}"
-        );
     }
 
     #[test]
-    fn settlement_needs_at_least_the_lock_confirmations() {
+    fn the_base_confirmations_are_at_least_the_lock_confirmations() {
         let mut c = Config::defaults("/h");
-        c.lock_confirmations = 3;
-        c.min_confirmations = 2;
+        c.lock_confirmations = 4;
+        c.base_confirmations = 3;
+        c.confirmation_tiers = vec![];
         let problems = c.validate().unwrap_err();
-        assert!(problems[0].starts_with("settle.min_confirmations"));
-        c.min_confirmations = 3;
+        assert!(problems[0].starts_with("settle.base_confirmations"));
+        c.base_confirmations = 4;
         assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn the_tiers_are_read_written_and_checked_as_a_table() {
+        let k = "settle.confirmation_tiers";
+        assert_eq!(parse_tiers(k, ""), Ok(vec![]));
+        assert_eq!(parse_tiers(k, " 5:3 , 20:4 "), Ok(vec![(5, 3), (20, 4)]));
+        assert_eq!(tiers_text(&[(5, 3), (20, 4)]), "5:3,20:4");
+        for bad in ["5", "5:", ":3", "5:3,", "-5:3", "5.5:3", "5:3:4", "a:b"] {
+            let err = parse_tiers(k, bad).unwrap_err();
+            assert!(err.starts_with(&format!("{k} = `{bad}`")), "{bad}: {err}");
+        }
+        let mut c = Config::defaults("/h");
+        assert!(c.validate().is_ok());
+        // each of these breaks one rule, and the mint refuses to start on it
+        for (tiers, why) in [
+            ("50000:5,10000:6", "must ascend"),
+            ("10000:6,10000:7", "must ascend"),
+            ("10000:6,50000:5", "fewer confirmations than 6"),
+            (
+                "10000:2",
+                "fewer confirmations than settle.base_confirmations (3)",
+            ),
+            ("0:4", "from 1 to"),
+            ("10000:1001", "must be from settle.lock_confirmations"),
+            ("1000000000001:4", "from 1 to"),
+        ] {
+            c.set(k, tiers).unwrap();
+            let problems = c.validate().unwrap_err();
+            assert!(
+                problems.iter().any(|p| p.contains(why)),
+                "{tiers}: {problems:?}"
+            );
+        }
+        // equal confirmations in two tiers are fine, and so is no tier at all
+        c.set(k, "10000:4,50000:4").unwrap();
+        assert!(c.validate().is_ok());
+        c.set(k, "").unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!(c.terms().highest(), 3);
+    }
+
+    #[test]
+    fn a_removed_setting_is_refused_in_the_file_and_the_environment_with_what_replaces_it() {
+        let dir = scratch("removed");
+        fs::write(
+            dir.join(FILE_NAME),
+            "[settle]\nmin_confirmations = 6\nprice_tolerance = 0.01\n[reconciliation]\nmax_attempts = 2\n",
+        )
+        .unwrap();
+        let problems = load(&dir, &env_of(&[])).unwrap_err();
+        for want in [
+            "settle.min_confirmations was removed in psp-mint 0.8.0: a payment now waits for the confirmation tier",
+            "settle.price_tolerance was removed in psp-mint 0.8.0: there is no tolerance",
+            "reconciliation.max_attempts was removed in psp-mint 0.8.0: it is now claim.max_attempts",
+        ] {
+            assert!(
+                problems.iter().any(|p| p.contains(want)),
+                "{want}: {problems:?}"
+            );
+        }
+        fs::remove_file(dir.join(FILE_NAME)).unwrap();
+        for (key, var, _) in REMOVED {
+            let problems = load(&dir, &env_of(&[(var, "1")])).unwrap_err();
+            assert!(
+                problems.iter().any(|p| p.starts_with(&format!(
+                    "environment variable {var}: {key} was removed in psp-mint 0.8.0"
+                ))),
+                "{var}: {problems:?}"
+            );
+        }
+        let mut c = Config::defaults("/h");
+        for (key, _, _) in REMOVED {
+            assert!(
+                c.set(key, "1").unwrap_err().contains("was removed"),
+                "{key}"
+            );
+            assert!(SPECS.iter().all(|s| s.key != *key), "{key} is still a spec");
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `mint.max_denomination_units` is gone: every keyset has the 64 keys 1 to
+    /// 2^63. Fails if the key in the file or `PSP_MAX_DENOMINATION_UNITS` is
+    /// accepted (whatever the value), or if it is still a setting.
+    #[test]
+    fn the_removed_max_denomination_units_is_refused_in_the_file_and_the_environment() {
+        let dir = scratch("max-denomination");
+        let why = "mint.max_denomination_units was removed in psp-mint 0.8.0: every keyset has one key per power of two, 1 to 2^63 (64 keys), as fsp-mint's: the notes no longer ride in the payment, so there is nothing to cap. Remove it";
+        fs::write(
+            dir.join(FILE_NAME),
+            "[mint]\nmax_denomination_units = 16777216\n",
+        )
+        .unwrap();
+        let problems = load(&dir, &env_of(&[])).unwrap_err();
+        assert!(problems.iter().any(|p| p.contains(why)), "{problems:?}");
+        fs::remove_file(dir.join(FILE_NAME)).unwrap();
+        let problems =
+            load(&dir, &env_of(&[("PSP_MAX_DENOMINATION_UNITS", "16777216")])).unwrap_err();
+        let want = format!("environment variable PSP_MAX_DENOMINATION_UNITS: {why}");
+        assert!(problems.contains(&want), "{problems:?}");
+        assert!(SPECS.iter().all(|s| s.key != "mint.max_denomination_units"));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn the_settings_reach_the_parts_that_use_them() {
         let mut c = Config::defaults("/h");
         c.lock_confirmations = 2;
-        c.min_confirmations = 10;
-        c.payment_reconciliation_target_bps = 2500;
+        c.base_confirmations = 4;
+        c.confirmation_tiers = vec![(500, 8), (2_000, 10)];
         c.price_timeout_secs = 4;
         c.melt_max_request_bytes = 5000;
         c.rollover_max_request_bytes = 6000;
@@ -2024,12 +2383,20 @@ mod tests {
             c.terms(),
             Terms {
                 lock_confirmations: 2,
-                min_confirmations: 10,
-                price_tolerance_bps: 100,
-                reconciliation_target_bps: 2500,
-                reconciliation_window_secs: 14 * 86_400,
+                base_confirmations: 4,
+                tiers: vec![
+                    settle::Tier {
+                        min_cents: 50_000,
+                        confirmations: 8
+                    },
+                    settle::Tier {
+                        min_cents: 200_000,
+                        confirmations: 10
+                    },
+                ],
             }
         );
+        assert_eq!(c.terms().highest(), 10);
         assert_eq!(c.price().timeout_secs, 4);
         assert_eq!(c.limits().melt_bytes, 5000);
         assert_eq!(c.limits().rollover_bytes, 6000);
@@ -2042,12 +2409,12 @@ mod tests {
         let dir = scratch("reload");
         let handle = Handle::new(load(&dir, &env_of(&[])).unwrap().config, None);
         let before = handle.current();
-        assert_eq!(before.min_confirmations, 6);
+        assert_eq!(before.base_confirmations, 3);
         assert!(!before.burn_enabled);
 
         fs::write(
             dir.join(FILE_NAME),
-            "[settle]\nmin_confirmations = 3\n[burn]\nenabled = true\nthreshold_psp = 500\n",
+            "[settle]\nbase_confirmations = 4\n[burn]\nenabled = true\nthreshold_psp = 500\n",
         )
         .unwrap();
         let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
@@ -2058,7 +2425,7 @@ mod tests {
             reloaded.needs_restart
         );
         let now = handle.current();
-        assert_eq!(now.min_confirmations, 3);
+        assert_eq!(now.base_confirmations, 4);
         assert_eq!(
             now.burn(),
             crate::rotation::BurnPolicy {
@@ -2067,7 +2434,7 @@ mod tests {
             }
         );
         for line in [
-            "  settle.min_confirmations changed from 6 to 3 confirmations",
+            "  settle.base_confirmations changed from 3 to 4 confirmations",
             "  burn.enabled changed from false to true",
             "  burn.threshold_psp changed from 0 to 500 PSP units",
         ] {
@@ -2077,24 +2444,24 @@ mod tests {
             );
         }
         // A scan or request that took its settings before still has the old ones.
-        assert_eq!(before.min_confirmations, 6);
+        assert_eq!(before.base_confirmations, 3);
 
         // A bad file changes nothing, and says what is wrong.
         fs::write(
             dir.join(FILE_NAME),
-            "[settle]\nmin_confirmations = \"many\"\n",
+            "[settle]\nbase_confirmations = \"many\"\n",
         )
         .unwrap();
         let problems = handle.reload(&dir, &env_of(&[])).unwrap_err();
         assert!(!problems.is_empty(), "{problems:?}");
-        assert_eq!(handle.current().min_confirmations, 3);
+        assert_eq!(handle.current().base_confirmations, 4);
         assert!(handle.current().burn_enabled);
 
         // Taking the file away puts the defaults back, and a second reload
         // with nothing changed says so.
         fs::remove_file(dir.join(FILE_NAME)).unwrap();
         handle.reload(&dir, &env_of(&[])).unwrap();
-        assert_eq!(handle.current().min_confirmations, 6);
+        assert_eq!(handle.current().base_confirmations, 3);
         assert!(!handle.current().burn_enabled);
         let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
         assert_eq!(reloaded.lines, vec!["  no setting changed".to_string()]);
@@ -2108,7 +2475,7 @@ mod tests {
         let handle = Handle::new(load(&dir, &env_of(&[])).unwrap().config, None);
         fs::write(
             dir.join(FILE_NAME),
-            "[server]\nbind = \"127.0.0.1:4100\"\n[bitcoin]\nwallet = \"other\"\n[rotation]\nperiod_hours = 48\n[scan]\ninterval_secs = 60\n",
+            "[server]\nbind = \"127.0.0.1:4100\"\n[bitcoin]\nwallet = \"other\"\n[rotation]\nperiod_hours = 800\n[scan]\ninterval_secs = 60\n",
         )
         .unwrap();
         let reloaded = handle.reload(&dir, &env_of(&[])).unwrap();
@@ -2120,7 +2487,7 @@ mod tests {
             vec![
                 ("server.bind", "127.0.0.1:4100".to_string()),
                 ("bitcoin.wallet", "other".to_string()),
-                ("rotation.period_hours", "48".to_string()),
+                ("rotation.period_hours", "800".to_string()),
             ]
         );
         let c = handle.current();
@@ -2132,7 +2499,7 @@ mod tests {
         for (key, from, to) in [
             ("server.bind", "127.0.0.1:3000", "127.0.0.1:4100"),
             ("bitcoin.wallet", "psp-main", "other"),
-            ("rotation.period_hours", "87600", "48"),
+            ("rotation.period_hours", "87600", "800"),
         ] {
             let line = format!(
                 "  {key} is changed in the file from {from} to {to}: it needs a restart (a brief downtime) and waits for one"
@@ -2194,7 +2561,6 @@ mod tests {
                 "server.bind",
                 "bitcoin.network",
                 "bitcoin.wallet",
-                "mint.max_denomination_units",
                 "rotation.activation_hours",
                 "rotation.period_hours",
                 "storage.mint_state",
@@ -2294,160 +2660,6 @@ mod tests {
             source.path(std::path::Path::new("/data")),
             std::path::PathBuf::from("/srv/spi-share/wallet_balance.json")
         );
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn fractions_are_read_exactly_and_written_with_at_least_two_decimals() {
-        let k = "settle.payment_reconciliation_target";
-        for (text, bps) in [
-            ("0.10", 1000),
-            ("0.1", 1000),
-            (" 0.05 ", 500),
-            ("0.0525", 525),
-            ("0.0001", 1),
-            ("0", 0),
-            ("1", 10_000),
-            ("1.0", 10_000),
-            ("2", 20_000),
-        ] {
-            assert_eq!(fraction_to_bps(k, text), Ok(bps), "{text}");
-        }
-        for bad in [
-            "",
-            ".5",
-            "-0.1",
-            "+0.1",
-            "0.12345",
-            "1e-1",
-            "ten percent",
-            "0,1",
-            "10%",
-        ] {
-            assert_eq!(
-                fraction_to_bps(k, bad),
-                Err(format!(
-                    "{k} = `{bad}` is not a fraction like 0.10 (digits only, at most four after the point, no sign)"
-                )),
-                "{bad}"
-            );
-        }
-        // past what fits in a u64 of basis points
-        assert_eq!(
-            fraction_to_bps(k, "99999999999999999999"),
-            Err(format!(
-                "{k} = `99999999999999999999` is not a fraction like 0.10 (digits only, at most four after the point, no sign)"
-            ))
-        );
-        for (bps, text) in [
-            (1000, "0.10"),
-            (500, "0.05"),
-            (525, "0.0525"),
-            (0, "0.00"),
-            (10_000, "1.00"),
-            (1, "0.0001"),
-        ] {
-            assert_eq!(bps_to_fraction(bps), text);
-            assert_eq!(fraction_to_bps(k, text), Ok(bps));
-        }
-    }
-
-    #[test]
-    fn the_tolerance_must_be_a_fraction_from_zero_to_one() {
-        let mut c = Config::defaults("/h");
-        c.payment_reconciliation_target_bps = 10_000;
-        c.set("settle.price_tolerance", "0").unwrap();
-        assert!(c.validate().is_ok());
-        c.set("settle.price_tolerance", "1").unwrap();
-        assert!(c.validate().is_ok());
-        c.set("settle.price_tolerance", "1.0001").unwrap();
-        let problems = c.validate().unwrap_err();
-        assert!(
-            problems[0].starts_with("settle.price_tolerance = 1.0001"),
-            "{problems:?}"
-        );
-        for bad in ["-0.01", "1%"] {
-            assert_eq!(
-                c.set("settle.price_tolerance", bad),
-                Err(format!(
-                    "settle.price_tolerance = `{bad}` is not a fraction like 0.10 (digits only, at most four after the point, no sign)"
-                ))
-            );
-        }
-    }
-
-    #[test]
-    fn a_tolerance_wider_than_the_target_is_refused_at_startup() {
-        let mut c = Config::defaults("/h");
-        // equal is allowed: the target then handles nothing the tolerance did not
-        c.set("settle.price_tolerance", "0.10").unwrap();
-        assert!(c.validate().is_ok());
-        c.set("settle.price_tolerance", "0.1001").unwrap();
-        let problems = c.validate().unwrap_err();
-        assert!(
-            problems[0].starts_with("settle.price_tolerance = 0.1001 is more than"),
-            "{problems:?}"
-        );
-        // lowering the target below the default tolerance is refused the same way
-        let mut c = Config::defaults("/h");
-        c.set("settle.payment_reconciliation_target", "0.005")
-            .unwrap();
-        let problems = c.validate().unwrap_err();
-        assert!(
-            problems[0].starts_with(
-                "settle.price_tolerance = 0.01 is more than settle.payment_reconciliation_target = 0.005:"
-            ),
-            "{problems:?}"
-        );
-        // and through the file, where startup sees it
-        let dir = scratch("tolerance-over-target");
-        fs::write(
-            dir.join(FILE_NAME),
-            "[settle]\nprice_tolerance = 0.05\npayment_reconciliation_target = 0.02\n",
-        )
-        .unwrap();
-        let problems = load(&dir, &env_of(&[])).unwrap_err();
-        assert!(
-            problems
-                .iter()
-                .any(|p| p.contains("settle.price_tolerance = 0.05 is more than")),
-            "{problems:?}"
-        );
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_float_in_the_file_is_read_as_the_fraction_it_looks_like() {
-        let dir = scratch("float");
-        fs::write(
-            dir.join(FILE_NAME),
-            "[settle]\npayment_reconciliation_target = 0.0525\n",
-        )
-        .unwrap();
-        let loaded = load(&dir, &env_of(&[])).unwrap();
-        assert_eq!(loaded.config.payment_reconciliation_target_bps, 525);
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn the_two_retired_tolerances_are_refused_in_the_file_and_the_environment() {
-        let dir = scratch("retired-tolerances");
-        fs::write(
-            dir.join(FILE_NAME),
-            "[settle]\ncredit_threshold_bps = 500\nunderpay_tolerance_bps = 100\n",
-        )
-        .unwrap();
-        let problems = load(&dir, &env_of(&[("PSP_CREDIT_THRESHOLD_BPS", "700")])).unwrap_err();
-        for needle in [
-            "settle.credit_threshold_bps is retired",
-            "settle.underpay_tolerance_bps is retired",
-            "PSP_CREDIT_THRESHOLD_BPS: settle.credit_threshold_bps is retired",
-        ] {
-            assert!(
-                problems.iter().any(|p| p.contains(needle)),
-                "{needle}: {problems:?}"
-            );
-        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -2656,66 +2868,32 @@ mod network_tests {
     }
 
     #[test]
-    fn the_reconciliation_window_is_set_in_days_and_ranged() {
-        let mut c = Config::defaults("/h");
-        c.set("settle.reconciliation_window_days", "30").unwrap();
-        assert_eq!(c.terms().reconciliation_window_secs, 30 * 86_400);
-        assert!(c.validate().is_ok());
-        // a decimal or a sign is not a number of days
-        for bad in ["1.5", "-1"] {
-            assert_eq!(
-                c.set("settle.reconciliation_window_days", bad),
-                Err(format!(
-                    "settle.reconciliation_window_days = `{bad}` is not a whole number (no sign, no decimals)"
-                ))
-            );
-        }
-        for bad in ["0", "366"] {
-            c.set("settle.reconciliation_window_days", bad).unwrap();
-            let problems = c.validate().unwrap_err();
-            assert!(
-                problems
-                    .iter()
-                    .any(|p| p.starts_with("settle.reconciliation_window_days")),
-                "{bad}: {problems:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_reconciliation_fees_and_limits_map_to_the_policy_and_are_ranged() {
+    fn the_claim_fees_and_limits_map_to_the_policy_and_are_ranged() {
         let mut c = Config::defaults("/h");
         assert!(c.validate().is_ok());
         let policy = c.policy();
         // no fee unless one is set: the fees stay 0 by default
-        assert_eq!(policy.fees, settle::ReconcileTerms::default());
+        assert_eq!(policy.fees, settle::ClaimFees::default());
         assert_eq!(policy.terms, c.terms());
 
-        c.set("reconciliation.fee", "3").unwrap();
-        c.set("reconciliation.max_attempts", "5").unwrap();
-        c.set("reconciliation.write_fee", "2").unwrap();
-        c.set("reconciliation.round_up_from", "5").unwrap();
+        c.set("claim.max_attempts", "5").unwrap();
+        c.set("claim.write_fee", "2").unwrap();
         c.set("delivery.read_fee", "1").unwrap();
         assert!(c.validate().is_ok());
-        let fees = c.policy().fees;
         assert_eq!(
-            (
-                fees.fee_units,
-                fees.max_attempts,
-                fees.write_fee_units,
-                fees.round_up_from_cents,
-                fees.read_fee_units
-            ),
-            (3, 5, 2, 5, 1)
+            c.policy().fees,
+            settle::ClaimFees {
+                max_attempts: 5,
+                write_fee_units: 2,
+                read_fee_units: 1
+            }
         );
 
         // out of range, or not a whole number
         for (key, bad) in [
-            ("reconciliation.max_attempts", "0"),
-            ("reconciliation.max_attempts", "1001"),
-            ("reconciliation.round_up_from", "0"),
-            ("reconciliation.round_up_from", "11"),
-            ("reconciliation.fee", "4611686018427387905"),
+            ("claim.max_attempts", "0"),
+            ("claim.max_attempts", "1001"),
+            ("claim.write_fee", "4611686018427387905"),
             ("delivery.read_fee", "4611686018427387905"),
         ] {
             let mut c = Config::defaults("/h");
@@ -2726,11 +2904,7 @@ mod network_tests {
                 "{key}={bad}: {problems:?}"
             );
         }
-        for (key, bad) in [
-            ("reconciliation.fee", "1.5"),
-            ("reconciliation.write_fee", "-1"),
-            ("reconciliation.round_up_from", "0.9"),
-        ] {
+        for (key, bad) in [("claim.write_fee", "-1"), ("claim.max_attempts", "1.5")] {
             assert_eq!(
                 c.set(key, bad),
                 Err(format!(

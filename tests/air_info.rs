@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use mint_core::state::AppState;
 use mint_types::{Amount, BlindNonce, MintInput, MintOutput, Nonce, Note, transaction_sighash};
 use psp_mint::air_listener::{self, NEXT_FILE, Serve, Settings};
-use psp_mint::records::SharedRecords;
 use psp_mint::rotation::{RolloverRequest, RolloverResponse, RotationResponse};
 use psp_mint::server::{Health, KeysetsResponse, Limits, SharedRotating};
 use rand::rngs::OsRng;
@@ -514,7 +513,8 @@ fn the_listener_without_a_counter_probes_from_zero_and_skips_answered_slots() {
 struct RealMint {
     state: Arc<AppState>,
     rot: SharedRotating,
-    records: SharedRecords,
+    /// The records and the mint's DID, as the listener's `serve` holds them.
+    desk: psp_mint::server::ClaimDesk,
     health: Arc<Health>,
     limits: Limits,
 }
@@ -529,7 +529,10 @@ fn real_mint_with(dir: &Path, limits: Limits) -> RealMint {
     RealMint {
         state: mint.state,
         rot: mint.rot,
-        records: mint.records,
+        desk: psp_mint::server::ClaimDesk {
+            records: mint.records,
+            psp: mint.did,
+        },
         health: mint.health,
         limits,
     }
@@ -537,15 +540,15 @@ fn real_mint_with(dir: &Path, limits: Limits) -> RealMint {
 
 impl RealMint {
     fn serve(&self) -> Arc<Serve> {
-        let (state, rot, records, health, limits) = (
+        let (state, rot, desk, health, limits) = (
             Arc::clone(&self.state),
             Arc::clone(&self.rot),
-            Arc::clone(&self.records),
+            self.desk.clone(),
             Arc::clone(&self.health),
             self.limits,
         );
         Arc::new(move |kind, body: &[u8]| {
-            psp_mint::server::air_served_with(&state, &rot, &records, &health, &limits, kind, body)
+            psp_mint::server::air_served_with(&state, &rot, &desk, &health, &limits, kind, body)
         })
     }
 
@@ -555,7 +558,7 @@ impl RealMint {
         psp_mint::server::air_served_with(
             &self.state,
             &self.rot,
-            &self.records,
+            &self.desk,
             &self.health,
             &self.limits,
             kind,

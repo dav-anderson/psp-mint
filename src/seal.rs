@@ -37,11 +37,10 @@ pub const KEY_FILENAME: &str = "mint_did_key.json";
 /// Open the payload of every payment that has one.
 ///
 /// - A payment whose data opens gets the plaintext as its payload.
-/// - A payment whose data does not open is not for this mint. It is dropped, not
-///   rejected: no record is made, no price is fetched and nothing is reported as
-///   an error. Cleartext payloads from before encryption are dropped the same way.
+/// - A payment whose data does not open is not for this mint. It is dropped: no record is made, no price is fetched and nothing is reported as an
+///   error. Cleartext payloads from before encryption are dropped the same way.
 /// - A payment with no payload (no data output, or more than one) is kept as it
-///   is, so that it is rejected as before.
+///   is, so that `settle` keeps it with nothing owed.
 ///
 /// Returns the payments to carry on with and how many were dropped.
 pub fn open_payloads(secret: &SecretKey, found: Vec<Received>) -> (Vec<Received>, usize) {
@@ -123,6 +122,7 @@ mod tests {
             confirmations: 1,
             value_sats: 5_000,
             payload,
+            block_time: Some(1_800_000_000),
         }
     }
 
