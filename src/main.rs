@@ -359,6 +359,37 @@ impl Process {
         // AIR clear them, `/melt` records them); an unreadable file stops serve here.
         let melts: server::SharedMelts = Arc::clone(rot.melts()?);
 
+        // The key set stream: the live key sets are published on AIR, so that every
+        // wallet can see the same keys. A thread of its own, so that neither the scan
+        // nor a slow AIR server holds it up.
+        let stream_stop = Arc::new(Stop::new());
+        let stream = thread::Builder::new().name("stream".into()).spawn({
+            let rot = Arc::clone(&rot);
+            let stop = Arc::clone(&stream_stop);
+            let mut streamer = sp_wire::air_request::stream::KeysetPublisher::new(
+                air.server.clone(),
+                air.timeout_secs,
+                &did,
+            );
+            move || {
+                loop {
+                    let wait = match stream_pass(&mut streamer, &rot) {
+                        Ok(()) => sp_wire::air_request::stream::TICK_SECS,
+                        Err(e) => {
+                            eprintln!(
+                                "key set stream: not published, will retry in {} s: {e}",
+                                sp_wire::air_request::stream::RETRY_SECS
+                            );
+                            sp_wire::air_request::stream::RETRY_SECS
+                        }
+                    };
+                    if stop.wait(Duration::from_secs(wait)) {
+                        return;
+                    }
+                }
+            }
+        })?;
+
         // The AIR listener answers wallets' requests, on a thread of its own.
         let air_thread = start_air_listener(
             air,
@@ -555,6 +586,10 @@ impl Process {
         if scan.join().is_err() {
             eprintln!("psp-mint: the scan thread had panicked");
         }
+        stream_stop.fire();
+        if stream.join().is_err() {
+            eprintln!("psp-mint: the key set stream thread had panicked");
+        }
         air_thread.stop();
         shutdown.notify_one();
         if !api_done {
@@ -692,6 +727,30 @@ fn serve(settings: Settings) -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
     }
+}
+
+/// One pass of the key set stream: publish the key sets that are live now if the
+/// stream does not hold them yet.
+fn stream_pass(
+    streamer: &mut sp_wire::air_request::stream::KeysetPublisher,
+    rot: &server::SharedRotating,
+) -> Result<(), String> {
+    let live = {
+        let rotor = rot
+            .rotor
+            .lock()
+            .map_err(|_| "the rotor lock is poisoned".to_string())?;
+        psp_mint::stream::live_records(&rotor)?
+    };
+    if let Some(done) = streamer.pass(&live)?
+        && !done.written.is_empty()
+    {
+        println!(
+            "key set stream: wrote record(s) {:?}; the stream has {} record(s)",
+            done.written, done.end
+        );
+    }
+    Ok(())
 }
 
 /// The AIR listener's thread, with the way to stop it.

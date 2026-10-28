@@ -18,4 +18,5 @@ pub mod service;
 pub mod settle;
 pub mod snapshot;
 pub mod stop;
+pub mod stream;
 pub mod version;
